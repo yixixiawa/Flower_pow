@@ -26,7 +26,7 @@
 既没跑完、又要重新交代一遍。额度消耗是**用户自己的账**，
 不该由代码替他做「什么时候算够了」的判断。
 
-唯一保留的是两道死循环检测（拦的**不是次数而是无进展**）：
+唯一保留的是死循环检测（拦的**不是次数而是无进展**），共三道：
 
 * ``LOOP_REPEAT_LIMIT``：同一工具 + 同一参数连续重复 3 次。
 * ``LOOP_SKELETON_LIMIT``：同一外部工具 + 同一套选项（忽略取值）连续
@@ -36,6 +36,12 @@
   骨架把取值抹掉，这类循环 4 次现形。阈值比精确重复宽一档，
   且只对 ``external_tool`` 启用——``http_request`` 换 payload、
   ``sqli_probe`` 换参数都是正常渗透动作，骨架化会误伤真实工作。
+* ``http_request`` **语义指纹**（``_FILLER_KEY`` / ``_FILLER_VAL`` +
+  ``_normalize_http_args``）：query 里 1~3 个纯字母参数名、值恒为 1 的
+  ``xx=1`` 填充参数，在指纹计算前剔除。真实事故：JSONP 探测每轮追加
+  一个假参数（jt=1 → ju=1 → jv=1……连打二十几发，响应全是 200/2B/{}），
+  每次都是"新指纹"，精确重复拦不住——归一化后这类排列组合在指纹层面
+  就是同一次调用，照样走上面的软纠偏 + 硬拒绝链路。
 
 两者触发后先**注入收尾指令**让模型给结论（软纠偏）：确有进展时模型交代一句仍可继续。
 
@@ -52,7 +58,9 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from core.tools import ToolRunner
 from llm import prompt as P
@@ -67,16 +75,23 @@ LOOP_REPEAT_LIMIT = 3
 # 排列组合碰运气，而不是在推进任务。
 LOOP_SKELETON_LIMIT = 4
 
+# http_request 的「填充参数」形态：1~3 个纯字母的参数名 + 值恒为 1。
+# 模型往 URL 里堆这种参数（jt=1、ju=1……）想碰运气——每次追加一个
+# 都是"新指纹"，精确重复检测拦不住。归一化剔除后，同一端点的排列
+# 组合在指纹层面坍缩成同一次调用，走既有的软纠偏 + 硬拒绝链路。
+_FILLER_KEY = re.compile(r"^[a-z]{1,3}$")
+_FILLER_VAL = re.compile(r"^1$")
+
 
 def _refusal_text(name: str, args: dict[str, Any]) -> str:
     """硬拒绝时回给模型的工具结果。
 
     措辞必须交代三件事：**为什么拒**（同样的请求同样的失败，重试不会有新信息）、
     **什么仍然允许**（换参数/换路径/换方法/换工具随便来）、
-    **退路是什么**（基于已有证据给结论）。只说"拒绝"不说出路，
+    **    退路是什么**（基于已有证据给结论）。只说"拒绝"不说出路，
     模型多半会换个说法再试一次，等于没拦。
     """
-    return (
+    text = (
         "[执行被拒绝] 这个调用（"
         + _describe(name, args)
         + "）刚刚已经**原样**执行过多次，每次返回的结果完全相同，已被判定为无进展死循环，"
@@ -87,6 +102,13 @@ def _refusal_text(name: str, args: dict[str, Any]) -> str:
         "② 换一个工具换角度验证；③ 若已无新角度，基于已有信息直接给出结论，"
         "探不到就明确说「当前证据不足以判定」，不要编造。"
     )
+    if name == "http_request":
+        text += (
+            "\n补充说明：本次请求在剔除 xx=1 之类无意义填充参数"
+            "（1~3 个纯字母的参数名、值恒为 1）之后，与之前已被拒绝的请求完全相同——"
+            "填充参数不构成新的探测手法，堆再多也不会改变服务端行为。"
+        )
+    return text
 
 
 class Agent:
@@ -159,6 +181,11 @@ class Agent:
         先把 ``"http://t/"`` 折成 ``"http://t"`` 再 dumps，
         否则 JSON 编码会把引号转义成 ``\\"``，字符串级的正则匹配不到。
         """
+        if name == "http_request":
+            # 传**副本**：归一化只影响指纹，真正发出去的请求保持模型
+            # 原样——检测层无权替模型改写请求内容。
+            args = self._normalize_http_args(name, dict(args))
+
         def _norm(v: Any) -> Any:
             if isinstance(v, str):
                 # 去掉 URL 末尾斜杠：`http://a/` 与 `http://a` 对目标是同一次请求
@@ -176,6 +203,38 @@ class Agent:
         except (TypeError, ValueError):
             norm = str(args)
         return f"{name}|{norm}"
+
+    def _normalize_http_args(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        """http_request 专用：剔除 query 里「短参数名 + 值恒为 1」的填充参数。
+
+        只对 http_request 生效——其他工具的参数名有语义（``sqli_probe`` 的
+        ``point``、``read_file`` 的 ``start_line``），削了就变味，不得改动。
+        url 非法或不含 scheme（``://``）时原样返回，不做任何修改。
+
+        解析用 ``urlparse`` / ``parse_qsl``，剔除后剩余参数**排序**再
+        ``urlencode`` / ``urlunparse`` 重组回 ``args["url"]``——排序是让
+        参数顺序不同、语义相同的两次调用也命中同一指纹。
+        """
+        if name != "http_request":
+            return args
+        url = args.get("url")
+        if not isinstance(url, str) or "://" not in url:
+            return args
+        try:
+            parts = urlparse(url)
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+            kept = [
+                (k, v)
+                for k, v in pairs
+                if not (_FILLER_KEY.match(k) and _FILLER_VAL.match(v))
+            ]
+            kept.sort()
+            if kept == pairs:
+                return args
+            args["url"] = urlunparse(parts._replace(query=urlencode(kept)))
+        except ValueError:
+            return args
+        return args
 
     def _looping(self, fingerprint: str) -> bool:
         """记录指纹并判断是否陷入无进展重复。"""

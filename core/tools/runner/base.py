@@ -19,11 +19,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from core.state import Asset, Finding, Severity
 from core.tools.args import normalize_args
@@ -33,6 +35,12 @@ from core.tools.probe import Probe
 
 MAX_TOOL_OUTPUT = 6000      # 回灌给模型的单个工具结果上限（字符）
 _HARD_TIMEOUT = 600         # 外部进程硬上限（秒）
+
+# 同一端点（http_request 的 url path）连续多少次返回**完全相同**的响应
+# 信号，就判定这条路已榨干。与 agent.py 的指纹检测分工：那边拦
+# "请求长得一样"（阈值 3 次，提示换参数），这边拦"响应毫无变化"
+# （阈值 5 次，提示换端点）——两边互补，不会重复拦截。
+ENDPOINT_SIGNAL_LIMIT = 5
 
 # http_request 工具结果里正文预览的字符上限。
 # 与 core/rawmsg.py 的 _RESULT_BODY_PREVIEW 是同一件事的两端：
@@ -99,6 +107,10 @@ class _ToolRunnerBase:
         # 把当时那份响应自动附到发现的 PoC 上——否则手工登记的发现
         # 在报告里只有请求没有响应，交付方无从复现。
         self._recent_http: list[dict[str, Any]] = []
+        # 端点响应无变化检测（http_request 专用）：endpoint path →
+        # 上一发的响应信号指纹 / 连击次数。信号变了连击就断。
+        self._endpoint_signal: dict[str, str] = {}
+        self._endpoint_streak: dict[str, int] = {}
 
 
 
@@ -135,6 +147,41 @@ class _ToolRunnerBase:
                 f"如确需使用，让用户改 config.yaml 的 scan.readonly: false 或设 POCS_READONLY=false 后重启。"
             )
         return None
+
+    def _check_endpoint_signal(self, args: dict[str, Any], text: str) -> None:
+        """http_request 的「端点响应无变化」检测。命中直接 raise ToolBlocked。
+
+        以 ``urlparse(url).path``（不含 query）为 endpoint key，对返回文本
+        算 md5 作信号指纹：同端点指纹相同则连击 +1，不同则重置为 1。
+        连击到 ``ENDPOINT_SIGNAL_LIMIT`` 抛 :class:`ToolBlocked`——由
+        ``execute`` 里既有的 ``except ToolBlocked`` 转【已拦截】文本回灌。
+
+        与 agent.py 的指纹检测分工：那边拦"请求长得一样"（参数填充，
+        请求根本不发出），这边拦"端点怎么打都一个样"（请求照发、
+        拿到第 5 个相同响应才拦）。信号包含状态码与正文，响应但凡有
+        实质变化连击就断，不会误伤正常渗透。
+        """
+        url = str(args.get("url") or "")
+        if "://" not in url:
+            return
+        endpoint = urlparse(url).path or "/"
+        sig = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if self._endpoint_signal.get(endpoint) == sig:
+            self._endpoint_streak[endpoint] = self._endpoint_streak.get(endpoint, 1) + 1
+        else:
+            self._endpoint_signal[endpoint] = sig
+            self._endpoint_streak[endpoint] = 1
+        if self._endpoint_streak[endpoint] >= ENDPOINT_SIGNAL_LIMIT:
+            # 拦完即清零：模型换手法回来再打同一端点，从 1 重新计
+            self._endpoint_signal.pop(endpoint, None)
+            self._endpoint_streak.pop(endpoint, None)
+            raise ToolBlocked(
+                f"端点 {endpoint} 连续 {ENDPOINT_SIGNAL_LIMIT} 次响应信号完全相同"
+                "（状态码/正文长度/正文均一致），这条探测路线已经榨干，"
+                "继续请求不会带来任何新信息。必须换端点或换探测手法"
+                "（改路径、改 HTTP 方法、改 payload 结构），或基于已有证据直接给结论；"
+                "确实探不到就明确说「当前证据不足以判定」，不要编造。"
+            )
 
 
     # ── 入口 ──────────────────────────────────────────────────────
@@ -205,6 +252,19 @@ class _ToolRunnerBase:
                 "chars": len(text),
             }
         )
+
+        # 端点响应无变化检测（http_request 专用）：请求**真的发出去了**、
+        # 拿到第 5 个完全相同的响应才拦——这不是"不发"，是"叫停"。
+        # 异常就地转【已拦截】文本（与上面 except ToolBlocked 同一转换），
+        # 刚记的那条调用记录同步改成 blocked，/status 统计不失真。
+        if status == "ok" and name == "http_request":
+            try:
+                self._check_endpoint_signal(args, text)
+            except ToolBlocked as exc:
+                text = f"【已拦截】{exc}"
+                status = "blocked"
+                self.calls[-1]["status"] = status
+                self.calls[-1]["chars"] = len(text)
         return text
 
 
