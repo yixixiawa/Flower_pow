@@ -1,0 +1,30 @@
+# 任意文件上传
+# 类别：file_op　等级：严重
+#
+# 由 detectors/exploit.py 执行，**三重门控**缺一不可：
+#   1. scan.readonly 必须为 false（上传会往目标写文件）
+#   2. scan.file_upload_probe_enabled 必须为 true
+#   3. 接口本身看起来是上传/写入类接口
+# 任一条不满足就跳过，且会在报告 notes 里写明跳过原因。
+#
+# 上传的是一个内容为纯文本标记的 .php 文件——用 .php 是为了验证
+# "可执行后缀是否被拦截"，文件内容不含任何代码，也不会被尝试执行。
+id: file-upload-arbitrary
+name: 任意文件上传
+category: file_op
+severity: critical
+description: >-
+  上传接口接受了可执行后缀（.php）文件并返回可访问路径，取回时文件内容被原样返回。
+  未验证服务端是否会解析执行——那需要真实落马，不在自动化探测的边界内。
+remediation: >-
+  文件后缀用白名单（不要用黑名单）；重命名存储且不放在可执行目录；
+  校验 Content-Type 与文件头；上传目录关闭脚本解析权限。
+tags:
+- upload
+- file-op
+- one-shot
+intrusive: true
+request:
+  method: POST
+  paths: ['']
+match: []

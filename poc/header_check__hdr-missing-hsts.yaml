@@ -1,0 +1,28 @@
+# 缺少 Strict-Transport-Security
+# 类别：响应头安全配置检查
+# 等级：低危　适用技术：通用
+#
+# 注意：HSTS 只在 HTTPS 下有意义。纯 HTTP 目标上本项无意义——
+# 检测器会在目标非 https 时跳过（见 detectors/http_detector.py）。
+id: hdr-missing-hsts
+name: 缺少 Strict-Transport-Security
+category: header_check
+severity: low
+description: >-
+  缺失 HSTS 时，用户首次访问仍可被 SSL Strip 降级劫持：
+  攻击者在链路上把 HTTPS 降级为 HTTP 即可中间人读取凭据。
+remediation: >-
+  响应头增加 Strict-Transport-Security: max-age=31536000; includeSubDomains。
+tags:
+- header
+- https
+- hsts
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status: [200, 301, 302, 401, 403]
+match:
+- op: missing
+  target: header
+  header: strict-transport-security

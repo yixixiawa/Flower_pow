@@ -1,0 +1,61 @@
+# 本文件由 `.venv/Scripts/python.exe -m pip freeze` 导出并人工分类而来。
+# 重新生成方法：
+#     .venv/Scripts/python.exe -m pip freeze > requirements.txt
+#
+# 设计取舍：向量检索用纯 Python 的 hashing trick 实现（kb/indexer.py），
+# 因此不需要 numpy / chromadb / qdrant 这一整棵依赖树。
+# 直接依赖仅 6 个，其余均为其传递依赖。
+
+# ---- 直接依赖（代码中直接 import）----
+httpx==0.28.1            # HTTP 客户端（异步）
+openai==3.24.0            # OpenAI 兼容 SDK（DeepSeek / OpenAI / vLLM）
+typer==0.27.3             # CLI
+rich==15.0.0              # 终端表格与面板
+pydantic==2.13.5          # 配置校验
+PyYAML==6.0.3             # POC YAML 解析与配置读取
+
+# ---- 传递依赖：httpx ----
+httpcore==1.0.9
+httpcore2==2.13.1
+# 注意：httpx2 是 openai>=3.24 的真实依赖，不是 httpx 的升级版，
+# 两个包要同时存在（httpx2 供 openai 内部用，httpx 供本项目用）。
+httpx2==2.13.1
+anyio==4.15.1
+certifi==2026.7.22
+colorama==0.4.6
+h11==0.16.0
+idna==3.20
+sniffio==1.3.1
+truststore==0.10.4
+
+# ---- 传递依赖：openai ----
+annotated-doc==0.0.5
+jiter==0.17.0
+#annotated-types==0.8.0
+#pydantic_core==2.46.5
+#typing-inspection==0.4.4
+#typing_extensions==4.16.0
+
+# ---- 传递依赖：typer / rich ----
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+markupsafe==3.0.4
+mdurl==0.1.2
+Pygments==2.21.0
+shellingham==1.5.4
+#typing_extensions==4.16.0
+
+# ---- 传递依赖：pydantic ----
+annotated-types==0.8.0
+pydantic_core==2.46.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+
+# ---- 可选增强（装了就用，不装自动降级）----
+#   nmap        —— 端口扫描改用 nmap -sV 拿服务指纹
+#   dirsearch   —— 路径爆破改用 dirsearch 大字典
+#   pytest      —— 见 requirements-dev.txt
+# 两者都不在 PATH 时使用内置实现，功能不中断。
+
+# ---- 测试依赖单独放requirements-dev.txt ----
+# iniconfig / packaging / pluggy / pytest

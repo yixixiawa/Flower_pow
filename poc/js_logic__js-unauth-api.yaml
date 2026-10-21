@@ -1,0 +1,24 @@
+# JS 中提取的接口未鉴权可访问
+# 类别：js_logic　等级：高危
+#
+# 由 detectors/js_logic.py 执行：先从 JS 里抽出接口路径，再对每个接口
+# 打**一次**免凭证 GET，看能不能拿到真实业务数据（判定用 api_authz.biz_ok，
+# 不看状态码——很多站点鉴权失败也是 200）。
+id: js-unauth-api
+name: JS 中提取的接口未鉴权可访问
+category: js_logic
+severity: high
+description: >-
+  前端 JS 里暴露的接口路径，不带任何凭证即可读到真实业务数据。
+  这些接口往往不在接口文档里，纯靠目录爆破也扫不到。
+remediation: >-
+  为接口补上鉴权守卫；前端 JS 里暴露的接口路径不能作为
+  "没人知道就不用鉴权"的理由——反编译 bundle 是零成本的。
+tags:
+- js-logic
+- unauthenticated
+- one-shot
+request:
+  method: GET
+  paths: ['']
+match: []

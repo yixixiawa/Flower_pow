@@ -1,0 +1,36 @@
+# 前端框架指纹
+# 类别：指纹识别类：用于建立目标画像，本身不作为漏洞发现
+# 等级：信息　适用技术：通用
+id: fp-frontend
+name: 前端框架指纹
+category: fingerprint
+severity: info
+description: 识别 Vue / React / jQuery / Angular 等前端框架。
+tags:
+- fingerprint
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status:
+  - 200
+  - 301
+  - 302
+match:
+- patterns:
+  - vue
+  - react
+  - angular
+  - jquery
+  - bootstrap
+  - next.js
+  - nuxt
+  - svelte
+  soft_404:
+  - 404 not found
+  - 页面不存在
+  - page not found
+  - not found</title>
+  - no such file
+  - 找不到该页面
+  - error 404

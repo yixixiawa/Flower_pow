@@ -1,0 +1,35 @@
+# 备份配置文件暴露
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：高危　适用技术：通用
+id: path-config-bak
+name: 备份配置文件暴露
+category: path_probe
+severity: high
+description: config.php.bak / web.config.bak / application.yml 等备份文件常含数据库凭据。
+remediation: 清理生产环境备份文件，部署流程加入「禁止上传备份」校验。
+always_run: true      # 通用基线：与技术栈无关，任何Web 目标都必查
+tags:
+- disclosure
+- backup
+request:
+  method: GET
+  paths:
+  - web.config.bak
+  - config.php.bak
+  - application.yml.bak
+  - config.php~
+  - .config.php.swp
+  - wp-config.php.bak
+  - database.yml
+  - settings.py
+  - config.inc.php
+  expect_status:
+  - 200
+match:
+- patterns:
+  - db
+  - password
+  - host
+  - jdbc
+  - root
+  - secret

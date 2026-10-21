@@ -1,0 +1,23 @@
+# 前端调试/后门开关未关闭
+# 类别：js_logic　等级：中危
+#
+# 由 detectors/js_logic.py 执行。典型命中：
+# bypassAuth: true、skipAuth: true、__DEBUG__: true、isMock: true、testMode: 1
+id: js-debug-switch
+name: 前端调试/后门开关未关闭
+category: js_logic
+severity: medium
+description: >-
+  生产构建里残留调试/后门开关。bypassAuth、mock 类开关一旦生效，
+  等于全局鉴权失效或返回假数据。
+remediation: >-
+  生产构建必须剔除调试开关；把 debug / mock 相关分支做成编译期常量，
+  由构建工具（tree-shaking + DefinePlugin）彻底删除。
+tags:
+- js-logic
+- debug
+- misconfig
+request:
+  method: GET
+  paths: ['']
+match: []

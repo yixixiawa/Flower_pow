@@ -1,0 +1,42 @@
+# 自定义外部工具清单
+# ==================
+# 装了新工具但 starter.py tools 显示"未安装"？在这里登记，不用改 Python 源码。
+#
+# 生效方式：改完直接跑下一条命令即可（探测每次都重新读这个文件，无需重启）。
+#     python starter.py tools
+#
+# 四条规则：
+# 1. key 用小写字母/数字/下划线，同名会**覆盖**内置清单里的同名项。
+# 2. bins 填命令行文件名（不是目录）。程序用 shutil.which 在 PATH 里找它，
+#    所以只支持能在终端直接敲起来的 CLI；IDA / Burp 这类 GUI 工具填了也没用。
+# 3. flags 是**允许模型使用的选项白名单**，不在列表里的参数会被执行层拒绝。
+#    留空 = 一个选项都不许传。写之前想清楚：这个开关等于交出多大权限。
+#    例：--script= 能加载任意文件，就绝不能写进来。
+# 4. **先确认你登记的那个命令真的是你想的那个工具**。同名不同物非常常见：
+#      - `httpx` 有两个毫无关系的实现——ProjectDiscovery 的渗透工具，
+#        和 Python httpx 库附带的命令行包装器（很多机器上都有）。
+#        误登记会让模型拿到一个名字像扫描器、实际只会打 HTTP 请求的东西。
+#      - `curl` / `wget` 在 Unix 与 Windows 上行为不同。
+#    确认办法：先在终端敲 `工具名 -version` 看输出对不对，
+#    再决定是否登记（登记后 tools 命令的"版本"列也会显示它，方便核对）。
+
+tools:
+  # 示例：ProjectDiscovery nuclei（模板扫描，注意用 -version 而非 --version）
+  # - key: nuclei-pd
+  #   name: nuclei-pd
+  #   bins: [nuclei, nuclei.exe]
+  #   category: 模板扫描
+  #   desc: 社区模板引擎，跑只读模板。
+  #   flags: [-u, -tags, -severity, -silent, -no-color, -duc, -rl, -c, -timeout]
+  #   version_args: [-version]
+  #   timeout: 300
+  #   note: 写文件类选项（-o/-me/-je）不要加进 flags。
+  #
+  # 示例：自研脚本（本地绝对路径也能写进 bins）
+  # - key: my-fuzzer
+  #   name: my-fuzzer
+  #   bins: [D:/tools/my-fuzzer.exe]
+  #   category: 自研
+  #   desc: 我自己写的参数模糊测试脚本。
+  #   flags: [-u, -w, -t]
+  #   version_args: [-h]

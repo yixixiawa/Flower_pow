@@ -1,0 +1,25 @@
+# 接口响应体回传敏感字段
+# 类别：api_authz　等级：中危
+#
+# 典型：用户对象里带 passwordHash / salt / 内部密钥。
+# 这类问题几乎都源于「直接把数据库实体当响应返回」，
+# 而不是逐个接口手工拼字段，所以修复要在序列化层统一做。
+id: api-sensitive-field
+name: 接口响应体回传敏感字段
+category: api_authz
+severity: medium
+description: >-
+  接口响应中包含密码哈希、密钥等不应出网的凭据材料。
+  一旦响应被日志、代理或 XSS 捕获，攻击者可离线还原弱口令。
+remediation: >-
+  在序列化层统一剔除 passwordHash / salt / secret 等字段
+  （NestJS 用 @Exclude() 或独立 Response DTO），不依赖逐接口手工过滤。
+tags:
+- api
+- disclosure
+- credential
+always_run: true
+request:
+  method: GET
+  paths: ['']
+match: []

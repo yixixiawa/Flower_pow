@@ -1,0 +1,28 @@
+# 源码映射文件暴露 (.map)
+# 类别：特定扩展名文件探测
+# 等级：中危　适用技术：通用
+id: path-source-code
+name: 源码映射文件暴露 (.map)
+category: file_ext
+severity: medium
+description: 前端 source map 可还原完整源码，包含内网地址、接口路径与未发布逻辑。
+remediation: 生产构建关闭 source map 输出，或不将其部署到公网目录。
+always_run: true      # 通用基线：与技术栈无关，任何Web 目标都必查
+tags:
+- disclosure
+- frontend
+request:
+  method: GET
+  paths:
+  - app.js.map
+  - main.js.map
+  - bundle.js.map
+  - static/js/main.js.map
+  - assets/index.js.map
+  expect_status:
+  - 200
+match:
+- patterns:
+  - '"version"'
+  - '"sources"'
+  - '"mappings"'

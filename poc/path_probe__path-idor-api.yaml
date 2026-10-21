@@ -1,0 +1,36 @@
+# 常见 API 端点探测
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：信息　适用技术：通用
+id: path-idor-api
+name: 常见 API 端点探测
+category: path_probe
+severity: info
+description: 枚举常见 REST API 前缀与文档端点，为接口越权测试提供目标。
+remediation: 对接口逐项做鉴权校验，避免仅依赖前端隐藏。
+tags:
+- recon
+- api
+request:
+  method: GET
+  paths:
+  - api/
+  - api/v1/
+  - api/v2/
+  - v1/
+  - v2/
+  - rest/
+  - graphql
+  - openapi.json
+  - swagger.json
+  expect_status:
+  - 200
+  - 401
+  - 403
+match:
+- patterns:
+  - api
+  - swagger
+  - openapi
+  - graphql
+  - endpoints
+  - version

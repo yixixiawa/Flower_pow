@@ -1,0 +1,28 @@
+# 命令执行 / 服务端模板注入（echo 标记回显）
+# 类别：rce　等级：严重
+#
+# 由 detectors/exploit.py 执行，每个接口只尝试一次。
+#
+# payload 只用 echo 类**无副作用**命令与模板字符串拼接：
+#   ;echo FPxxxx | $(echo FPxxxx) | &echo FPxxxx&     命令注入
+#   {{"__"~"xxxx"~"__"}} / ${"__"+"xxxx"+"__"}        模板注入
+# 证明"命令/表达式被执行"即可，不落马、不反弹 shell、不改动任何文件。
+id: rce-cmd-echo
+name: 命令执行 / 服务端模板注入
+category: rce
+severity: critical
+description: >-
+  向接口参数注入 echo 标记或模板表达式，响应中出现了该标记（或算术表达式被求值），
+  说明用户输入进入了 shell 命令或模板渲染上下文。
+remediation: >-
+  禁止把用户输入拼进 shell 命令或模板表达式；改用白名单映射或安全的 API；
+  模板渲染不接受用户可控模板；容器以非 root 运行并限制出网。
+tags:
+- rce
+- ssti
+- command-injection
+- one-shot
+request:
+  method: GET
+  paths: ['']
+match: []

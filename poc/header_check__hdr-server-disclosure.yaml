@@ -1,0 +1,38 @@
+# Server / 版本信息泄露
+# 类别：响应头安全配置检查
+# 等级：信息　适用技术：通用
+#
+# 只有当 Server / X-Powered-By 暴露了精确版本号时才算问题。
+# value_regex 用正则匹配 "数字.数字" 形式的版本号，避免把 "nginx" 也报成泄露。
+id: hdr-server-disclosure
+name: Server / 版本信息泄露
+category: header_check
+severity: info
+description: >-
+  响应头暴露精确版本号，便于攻击者直接匹配该版本的已知漏洞，
+  大幅降低利用门槛。
+remediation: >-
+  关闭 Server / X-Powered-By 等版本标识；
+  Apache 用 ServerTokens Prod，nginx 用 server_tokens off。
+always_run: true      # 通用基线：与技术栈无关，任何Web 目标都必查
+tags:
+- header
+- disclosure
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status: [200, 301, 302, 401, 403]
+match:
+# OR 语义：Server 或 X-Powered-By 任一泄露版本号即命中（写在第一条规则上）。
+# 注意：默认是 AND 语义——若不写 any_of，两条规则必须同时成立才命中，
+# 而只暴露 Server 的目标会因此被漏报。
+- op: contains
+  target: header
+  header: server
+  value_regex: '\d+\.\d+'
+  any_of: true
+- op: contains
+  target: header
+  header: x-powered-by
+  value_regex: '\d+\.\d+'

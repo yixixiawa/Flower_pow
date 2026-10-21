@@ -1,0 +1,29 @@
+# 环境配置文件泄露 (.env)
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：严重　适用技术：通用
+id: path-env
+name: 环境配置文件泄露 (.env)
+category: path_probe
+severity: critical
+description: .env 常包含数据库口令、第三方 API Key、JWT _SECRET，一旦泄露可直接接管系统。
+remediation: 将 .env 移出 Web 根目录，加入 .gitignore，并轮换已泄露的密钥。
+always_run: true      # 通用基线：与技术栈无关，任何Web 目标都必查
+tags:
+- disclosure
+- secret
+request:
+  method: GET
+  paths:
+  - .env
+  - .env.local
+  - .env.production
+  - config/.env
+  expect_status:
+  - 200
+match:
+- patterns:
+  - '='
+  - key
+  - secret
+  - password
+  - token

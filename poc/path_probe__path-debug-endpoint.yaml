@@ -1,0 +1,37 @@
+# 调试 / 监控端点暴露
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：中危　适用技术：通用
+id: path-debug-endpoint
+name: 调试 / 监控端点暴露
+category: path_probe
+severity: medium
+description: Spring Boot Actuator、Node debug、Django debug 页等调试端点可能泄露堆栈、环境变量甚至 RCE。
+remediation: 生产环境关闭调试端点；Actuator 仅允许内网访问并强制认证。
+cve:
+- CVE-2021-21985
+tags:
+- exposure
+- debug
+request:
+  method: GET
+  paths:
+  - actuator/env
+  - actuator/health
+  - actuator/heapdump
+  - actuator/mappings
+  - server-status
+  - .env.local
+  - debug/
+  - _debug/
+  - elmah.axd
+  expect_status:
+  - 200
+match:
+- patterns:
+  - actuator
+  - jvm
+  - property
+  - system
+  - status
+  - python
+  - traceback

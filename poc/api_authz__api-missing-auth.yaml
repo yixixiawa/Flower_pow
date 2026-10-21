@@ -1,0 +1,29 @@
+# 接口缺失鉴权（未授权访问）
+# 类别：api_authz　等级：高危
+#
+# 判定逻辑比看上去复杂 —— 这是实测踩出来的坑：
+# 很多站点（含 NestJS 系）所有响应 HTTP 状态码恒为 200，
+# 鉴权失败只是 {"code":401}。若只看状态码，会把一切都误判成"可访问"，
+# 产生海量假阳性。所以检测器里用「HTTP 200 且业务码属于成功 且响应含实际数据」
+# 三重判定，见 detectors/api_authz.py::biz_ok。
+#
+# 触发方式：只发 GET（只读），绝不因探测而改动业务数据。
+id: api-missing-auth
+name: 接口未授权可访问
+category: api_authz
+severity: high
+description: >-
+  接口文档声明了需要鉴权，但不带任何凭证即可读到真实业务数据。
+  攻击者无需账号就能获取系统内的资源列表、用户资料或配置信息。
+remediation: >-
+  为接口补上鉴权守卫（NestJS 用 @UseGuards(JwtAuthGuard) 或全局守卫），
+  并确保全局守卫对新增路由自动生效，而不是逐条手工声明。
+tags:
+- api
+- authz
+- unauthenticated
+always_run: true
+request:
+  method: GET
+  paths: ['']
+match: []

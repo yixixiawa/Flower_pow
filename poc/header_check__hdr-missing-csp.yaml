@@ -1,0 +1,29 @@
+# 缺少 Content-Security-Policy
+# 类别：响应头安全配置检查
+# 等级：低危　适用技术：通用
+#
+# header_check 类不看响应体，只判定响应头。规则语义：
+#   op: missing + target: header + header: X  → 响应里没有 X 头即命中
+id: hdr-missing-csp
+name: 缺少 Content-Security-Policy
+category: header_check
+severity: low
+description: >-
+  缺失 CSP 会显著放大 XSS 的危害。攻击者注入脚本后缺少 CSP 约束，
+  可自由外传 Cookie、加载任意外部脚本。
+remediation: >-
+  配置 Content-Security-Policy，限制脚本来源为可信域：
+  default-src 'self'; script-src 'self' 'nonce-{随机值}'。
+tags:
+- header
+- xss
+- csp
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status: [200, 301, 302, 401, 403]
+match:
+- op: missing
+  target: header
+  header: content-security-policy

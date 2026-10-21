@@ -1,0 +1,38 @@
+# Cookie 缺少 HttpOnly / Secure
+# 类别：响应头安全配置检查
+# 等级：中危　适用技术：通用
+#
+# 用 absent + value_regex 表达"头存在但缺少必要属性"：
+#   op: absent → 头存在，但不含 value_regex 指定的正则即命中
+# 这里要同时检查 httponly 和 secure，故拆成两条规则（全部满足才算命中）。
+id: hdr-missing-httponly
+name: Cookie 缺少 HttpOnly / Secure
+category: header_check
+severity: medium
+description: >-
+  Set-Cookie 未设 HttpOnly 时，一旦存在 XSS 即可 document.cookie 直接窃取会话；
+  未设 Secure 时会话 Cookie 可被明文传输，在公共 WiFi 下可被嗅探。
+remediation: 会话 Cookie 统一设置 HttpOnly; Secure; SameSite=Lax 或 Strict。
+tags:
+- header
+- cookie
+- xss
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status: [200, 301, 302, 401, 403]
+match:
+# OR 语义：HttpOnly 或 Secure 任一缺失即命中（写在每条规则上）。
+# 危害不同但都属于同一问题，拆成两条 POC 会让报告出现重复条目。
+# 注意：默认是 AND 语义——若不写any_of，两条规则必须同时成立才命中，
+# 而实际上"缺 HttpOnly 且缺 Secure"比"缺其一"更罕见，会导致漏报。
+- op: absent
+  target: header
+  header: set-cookie
+  value_regex: httponly
+  any_of: true
+- op: absent
+  target: header
+  header: set-cookie
+  value_regex: secure

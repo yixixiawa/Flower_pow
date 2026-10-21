@@ -1,0 +1,29 @@
+# 接口越权访问（IDOR）
+# 类别：api_authz　等级：高危
+#
+# 探测方式：带着自己的凭证，把资源 id 换成不属于自己的 UUID，
+# 若仍能读到数据，说明服务端未做归属校验。
+#
+# 为什么用随机 UUID 而不是枚举真实 id：
+# 一是没有他人真实 id，二是**随机 id 若还能返回数据，反而更能证明
+# 服务端压根没校验归属**（连不存在的资源都返回了内容）。
+id: api-idor
+name: 接口越权读取他人资源（IDOR）
+category: api_authz
+severity: high
+description: >-
+  替换资源标识后仍能读取到数据，说明接口未校验资源归属。
+  攻击者可遍历 id 拉取全站用户资料、订单、素材等数据。
+remediation: >-
+  所有按 id 取资源的查询都必须带上归属条件（如 where owner_id = 当前用户），
+  不得以"前端不会传别人的 id"为假设。
+tags:
+- api
+- authz
+- idor
+- horizontal-privilege
+always_run: true
+request:
+  method: GET
+  paths: ['']
+match: []

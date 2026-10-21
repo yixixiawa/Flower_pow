@@ -1,0 +1,26 @@
+# 前端权限判断（可被篡改）
+# 类别：js_logic　等级：高危
+#
+# 由 detectors/js_logic.py 执行：抓页面 JS 内容做静态分析。
+# 典型命中：role === 'admin'、userType == 'root'、localStorage.setItem('role', ...)
+#
+# 这类"漏洞"不会在任何后端请求里体现——它只成立于前端代码里，
+# 必须读 JS 才找得到。这也是为什么本项目要做 JS 内容审计而不是只打接口。
+id: js-client-authz
+name: 前端权限判断（可被篡改）
+category: js_logic
+severity: high
+description: >-
+  权限/角色判断写在前端代码里（或存在浏览器本地存储中），攻击者改一个变量
+  或一条 localStorage 记录即可提权。真正的鉴权必须在服务端完成。
+remediation: >-
+  权限判断必须在服务端做；前端只做 UI 显隐。角色信息由服务端依据 token 解析，
+  不要信任任何前端传来的 role / isAdmin 字段。
+tags:
+- js-logic
+- authz
+- frontend
+request:
+  method: GET
+  paths: ['']
+match: []

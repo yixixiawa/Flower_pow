@@ -1,0 +1,28 @@
+# CORS 宽松配置
+# 类别：响应头安全配置检查
+# 等级：中危　适用技术：通用
+#
+# ACAO 为 * 或 null（后者常见于反射 Origin 的实现出错）时，
+# 任意站点都能跨域读取接口数据。value_regex 同时覆盖这两种情况。
+id: hdr-cors-wildcard
+name: CORS 宽松配置
+category: header_check
+severity: medium
+description: >-
+  Access-Control-Allow-Origin 为 * 或 null 时，任意站点可跨域读取接口数据；
+  若同时允许携带凭据（Allow-Credentials: true），等同于把接口完全开放给第三方站点。
+remediation: >-
+  改为白名单校验 Origin（严格匹配受信域名），并按需配合 Allow-Credentials。
+tags:
+- header
+- cors
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status: [200, 301, 302, 401, 403]
+match:
+- op: contains
+  target: header
+  header: access-control-allow-origin
+  value_regex: '^\s*(\*|null)\s*$'

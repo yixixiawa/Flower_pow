@@ -1,0 +1,41 @@
+# API 网关 / 中间件指纹
+# 类别：指纹识别类：用于建立目标画像，本身不作为漏洞发现
+# 等级：信息　适用技术：通用
+id: fp-middleware
+name: API 网关 / 中间件指纹
+category: fingerprint
+severity: info
+description: 识别网关与常见管理后台。
+tags:
+- fingerprint
+request:
+  method: GET
+  paths:
+  - ''
+  expect_status:
+  - 200
+  - 301
+  - 302
+  - 401
+  - 403
+match:
+- patterns:
+  - swagger
+  - openapi
+  - graphql
+  - kong
+  - apisix
+  - nacos
+  - eureka
+  - adminer
+  - phpmyadmin
+  - swagger-ui
+  - knife4j
+  soft_404:
+  - 404 not found
+  - 页面不存在
+  - page not found
+  - not found</title>
+  - no such file
+  - 找不到该页面
+  - error 404

@@ -1,0 +1,49 @@
+[project]
+name = "flower-pow"
+version = "3.0.0"
+description = "AI Agent driven Web vulnerability scanner: subdomain discovery -> recon -> RAG recall -> tool calls -> triage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# 刻意保持最小依赖集：向量检索用纯Python 的 hashing trick + BM25 实现
+# （kb/indexer.py），因此不需要 numpy / chromadb / qdrant 依赖树。
+dependencies = [
+    "httpx>=0.27.0",
+    "openai>=1.66.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.4.0"]
+
+[project.scripts]
+flower-pow = "flower_pow:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 顶层是单文件入口 flower_pow.py，因此不能用 packages=["flower_pow"]（会误打包整个目录）
+include = [
+    "flower_pow.py",
+    "core/**/*.py",
+    "collectors/**/*.py",
+    "detectors/**/*.py",
+    "kb/**/*.py",
+    "llm/**/*.py",
+    "output/**/*.py",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "data", "output", ".backup"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]

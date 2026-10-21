@@ -1,0 +1,38 @@
+# 管理后台入口暴露
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：信息　适用技术：通用
+id: path-admin-panel
+name: 管理后台入口暴露
+category: path_probe
+severity: info
+description: 识别常见管理后台路径，为后续弱口令/越权测试提供入口。
+remediation: 限制管理后台访问来源 IP，或改为 VPN / 双因素认证后方可访问。
+tags:
+- recon
+- admin
+request:
+  method: GET
+  paths:
+  - admin/
+  - administrator/
+  - manager/html
+  - wp-admin/
+  - phpmyadmin/
+  - adminer.php
+  - console/
+  - jenkins/
+  - nacos/
+  - actuator/
+  - swagger-ui.html
+  - api-docs
+  expect_status:
+  - 200
+  - 401
+  - 403
+match:
+- patterns:
+  - login
+  - sign in
+  - 登录
+  - password
+  - 管理

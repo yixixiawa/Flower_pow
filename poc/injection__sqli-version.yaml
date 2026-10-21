@@ -1,0 +1,33 @@
+# SQL 注入（只取数据库版本号）
+# 类别：injection　等级：严重
+#
+# 由 detectors/exploit.py 的专用探针执行，不参与 HttpDetector 的静态路径探测
+# （它需要"按接口填参数 + 命中即停"的动态逻辑，静态路径探测跑它没有意义）。
+#
+# 关键边界：**只取版本号，不拖库**。
+# 报错型 payload 让数据库把 VERSION() 吐在错误信息里，拿到即收手——
+# 不做联合查询猜列数、不做时间盲注拖数据、不读表结构、不写文件。
+# 版本号足够写进报告、足够让开发方复现，但不触碰任何业务数据。
+#
+# 另一条边界：**每个接口只尝试一次**。命中就停，没命中就跳过，
+# 请求出错/被 WAF 拦截则跳过该接口，累计出错达 probe_error_abort 次
+# 就自动跳过该类型的剩余扫描。
+id: sqli-version
+name: SQL 注入（已取得数据库版本号）
+category: injection
+severity: critical
+description: >-
+  注入 payload 触发数据库报错并回显版本号（MySQL / SQL Server / PostgreSQL /
+  Oracle / SQLite），说明注入链完整可用。本次探测只取版本号，未读取任何业务数据。
+remediation: >-
+  全部 SQL 改用参数化查询 / 预编译语句；关闭生产环境的数据库错误回显；
+  对输入做白名单校验。能取得版本号即证明注入可用，属最高优先级修复项。
+tags:
+- injection
+- sqli
+- one-shot
+- version-only
+request:
+  method: GET
+  paths: ['']
+match: []

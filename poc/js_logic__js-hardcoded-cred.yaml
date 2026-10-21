@@ -1,0 +1,23 @@
+# 前端硬编码凭据
+# 类别：js_logic　等级：高危
+#
+# 由 detectors/js_logic.py 执行，复用 collectors/js_analyze 的密钥模式
+# （AK/SK、JWT、私钥、数据库连接串、URL 里的 basic auth 等）。
+id: js-hardcoded-cred
+name: 前端硬编码凭据
+category: js_logic
+severity: high
+description: >-
+  前端 JS 里出现硬编码的长期凭据（云 AK/SK、JWT、私钥、数据库口令、
+  带 basic auth 的 URL）。任何人打开浏览器开发者工具都能拿到。
+remediation: >-
+  立即吊销并轮换该凭据；前端不能携带任何长期有效的密钥。
+  需要第三方调用的能力一律走服务端代理。
+tags:
+- js-logic
+- secret
+- credential
+request:
+  method: GET
+  paths: ['']
+match: []

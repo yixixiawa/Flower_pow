@@ -1,0 +1,111 @@
+# ============================================================================
+# 入库策略：只有「源码 + 契约」进仓库。
+#   进：*.py / poc/*.yaml / config.yaml / requirements.txt / pyproject.toml
+#   进：README.md（唯一的说明文档）、.env.example（只有键名，无值）
+#   出：一切运行产物、记忆日志、扫描报告、凭据
+# ============================================================================
+
+# ---- 扫描产物与报告（含目标资产信息、漏洞证据、请求响应原文）------------
+output/
+reports/
+# 目录名随调用点变化，凡「报告类」目录一律排除
+**/reports/
+*_report/
+*_reports/
+
+# ---- 运行时派生物：可随时重建，无需版本控制 ----
+# data/ 下只保留 tools.local.yaml（自定义工具清单，是配置不是产物）；
+# 其余子目录全是索引 / 会话快照 / 情报缓存 / 侦察中间产物。
+data/sessions/
+data/vector_db/
+data/intel/
+data/recon/
+data/wordlists/
+data/*.json
+# 临时数据库与索引文件（可能被引到任意子目录）
+*.db
+*.sqlite3
+*.index
+
+# ---- Agent 记忆与工作日志 ----
+# 每次会话都在变，且记录中常含目标域名 / 路径 / 漏洞细节，
+# 属于本地过程数据，不应随仓库分发给团队。
+.workbuddy/
+.claude/
+.cursor/
+*.memory.json
+
+# ---- 密钥与授权文件 ----
+# 注意：.env.example 必须入库（只有键名，没有值），
+# 故不能写成 .env* 通配，否则新人拿不到键名清单。
+.env
+.env.*
+!.env.example
+*.lic
+
+# ---- 凭据残留：任何形态的 token / 密钥落盘都禁止入库 ----
+# data/recon/token.txt 曾存放真实目标的可用 JWT，是最容易「顺手 commit 出去」
+# 的一类文件（它不在 .gitignore 里，就等着被人 git add .）
+*.pem
+*.key
+**/token.txt
+**/token.json
+**/*_token.txt
+**/cookies.txt
+**/.netrc
+id_rsa*
+
+# ---- 调试日志（可能含 URL、请求参数、响应片段）----
+*.log
+
+# ---- 验证码图片（登录流程自动截取）----
+captcha*.png
+
+# ---- 编辑器与 IDE ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Python ----
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# ---- 测试与类型检查缓存 ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---- 临时文件 ----
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+/tmp/
+temp/
+
+# ---- 旧版包备份（v2.0 改造前的归档）----
+.backup/
+
+# ============================================================================
+# 白名单兜底：即使上面漏了规则，根目录也不接受散落的文档类文件。
+# 项目说明只维护README.md 一份，其余 *.md 一律视为过程笔记。
+# 说明：README.md 本身通过 !README.md 显式保留。
+# ============================================================================
+/*.md
+!/README.md

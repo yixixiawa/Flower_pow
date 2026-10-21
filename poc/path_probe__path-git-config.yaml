@@ -1,0 +1,28 @@
+# Git 仓库信息泄露 (.git/config)
+# 类别：敏感路径探测：配置文件、后台、调试端点
+# 等级：高危　适用技术：通用
+id: path-git-config
+name: Git 仓库信息泄露 (.git/config)
+category: path_probe
+severity: high
+description: 目标暴露 .git/config，可完整还原源码，进而审计硬编码凭据与业务逻辑。
+remediation: 在 Web 服务器侧屏蔽 .git / .svn / .hg 等版本控制目录访问。
+references:
+- CVE-2013-0199
+always_run: true      # 通用基线：与技术栈无关，任何Web 目标都必查
+tags:
+- disclosure
+- git
+request:
+  method: GET
+  paths:
+  - .git/config
+  - .git/HEAD
+  - .git/index
+  expect_status:
+  - 200
+match:
+- patterns:
+  - '[core]'
+  - repositoryformatversion
+  - 'ref: refs/'
