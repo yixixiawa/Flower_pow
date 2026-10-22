@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
+from urllib.parse import urlparse
 
 from core.state import Category, Evidence, Finding, Severity
 
@@ -27,6 +29,64 @@ class EvidenceMixin:
     # 这里的 20KB 是防呆——防的是模型把整份数据库 dump 塞进一条发现，
     # 把会话快照撑到加载不动。正常内容永远碰不到它。
     _MANUAL_FIELD_CAP = 20000
+
+    @staticmethod
+    def _scope_host(url: str) -> str:
+        """从 URL 或裸主机里取出主机名；取不到返回空串。
+
+        模型登记时``matched_at`` 常常只写主机（``1.2.3.4:8080``）或
+        ``http://a.com/x``，两种形态都要认，所以没 scheme 时补一个再解析。
+        """
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = f"http://{raw}"
+        try:
+            host = urlparse(raw).hostname or ""
+        except ValueError:
+            return ""
+        return host.strip().lower()
+
+    def _check_target_scope(self, session, matched_at: str) -> str:
+        """校验"登记的漏洞"是否属于"当前会话的目标"，串线则返回拦截文案。
+
+        只拦**形态不一致**的明显串线：目标是域名却登记 IP，或目标是 IP
+        却登记域名。同形态不同主机（子域名、多主机业务）一律放行——
+        那是正常业务形态，拦了会误伤。
+        """
+        target = getattr(session, "target", "") or ""
+        target_host = self._scope_host(target)
+        match_host = self._scope_host(matched_at)
+        if not target_host or not match_host:
+            return ""
+
+        try:
+            is_target_ip = bool(ipaddress.ip_address(target_host))
+        except ValueError:
+            is_target_ip = False
+        try:
+            is_match_ip = bool(ipaddress.ip_address(match_host))
+        except ValueError:
+            is_match_ip = False
+
+        if is_match_ip == is_target_ip:
+            return ""
+
+        if is_target_ip:
+            return (
+                f"【已拦截】当前会话的目标是 IP（{target_host}），"
+                f"你登记的却是域名（{match_host}）。"
+                "为防止报告串线，请先使用 /target 切换到该域名后再登记，"
+                "或把matched_at 改回当前目标。"
+            )
+        return (
+            f"【已拦截】你尝试在一个域名为目标（{target_host}）的会话中，"
+            f"登记 IP（{match_host}）的漏洞。"
+            "为了防止报告串线，请先使用 "
+            f"/target http://{match_host} 切换目标后再登记，"
+            "或把 matched_at 改回当前目标。"
+        )
 
     async def _h_record_finding(
         self,
@@ -82,6 +142,16 @@ class EvidenceMixin:
         expected = unescape_md(expected).strip()
         payload_raw = unescape_md(payload).strip()
         response_raw = unescape_md(response).strip()
+
+        # ── 目标归属校验：防止"漫天乱飞后回主域名登记" ───────────
+        # 模型很容易跑去测了别的 IP（顺手扫到的邻居、SSRF 里反射出来的
+        # 内部地址、别的目标），回来却用当前目标的主域名登记。于是报告里
+        # 出现一条"某域名上的漏洞"，而证据实际来自另一个系统——串线。
+        # 这里只拦**形态不一致**（域名 vs IP）的明显串线；同形态不同主机
+        # 不拦（子域名/多主机业务很常见，拦了会误伤正常流程）。
+        scope_msg = self._check_target_scope(session, matched_at)
+        if scope_msg:
+            return scope_msg
 
         if not name.strip():
             return "登记失败：name 不能为空"

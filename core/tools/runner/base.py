@@ -139,6 +139,28 @@ class _ToolRunnerBase:
         self._host_signal: dict[str, str] = {}
         self._host_streak: dict[str, int] = {}
 
+    def reset_target_scope(self) -> None:
+        """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
+
+        这些缓存都是上一个被测对象的残留：
+
+        * ``_recent_http``：最近几次 HTTP 响应快照。留着的话，换目标后
+          登记发现时会把**上一个目标**的响应当成新目标的贴进报告——
+          这是报告串线最隐蔽的一条路径（URL 恰好对得上时）。
+        * ``_endpoint_signal`` / ``_endpoint_streak``：端点响应无变化
+          检测的信号与连击次数。换目标后它们对新手目标毫无意义，
+          还会让新目标的第一次探测就撞上"连击 5 次"的误拦。
+        * ``_host_signal`` / ``_host_streak``：主机级兜底，同理。
+
+        注意**不动** ``_det_cache``（探测器缓存）：它按工具+参数索引，
+        与目标无关，清了只会白白多跑一遍探测。
+        """
+        self._recent_http.clear()
+        self._endpoint_signal.clear()
+        self._endpoint_streak.clear()
+        self._host_signal.clear()
+        self._host_streak.clear()
+
 
 
     # ── 基础设施 ──────────────────────────────────────────────────

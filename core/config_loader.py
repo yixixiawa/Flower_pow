@@ -56,7 +56,7 @@ class ScanConfig(BaseModel):
     # 自动"公开性核验"：命中漏洞后回源站根目录取证，判定为站点自己公开的
     # 资源（公开演示站、公开资料目录、站点自己挂了链接）就自动判为误报。
     # 判定分档，**只有证据够强的才自动排除**，弱的只提示人工确认。
-    # 关掉则完全不回源，纯粹人工用 /fp 处理。
+    # 关掉则完全不回源，纯粹交由人工在报告里复核。
     auto_dismiss_public: bool = Field(default=True)
     # 允许智能体增删改**本地产物文件**（只关在 output_dir 内，扩展名白名单，
     # 详见 core/fsops.py）。注意这与 readonly 无关：readonly 管的是"对目标"

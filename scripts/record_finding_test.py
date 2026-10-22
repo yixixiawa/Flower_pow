@@ -13,6 +13,7 @@
   6. 流式默认 max_tokens 被放大到 STREAM_MIN_TOKENS
   7. 流式 finish_reason=length 被识别并 yield error
   8. 系统提示包含「必须登记」纪律
+  9. 目标归属拦截：域名会话里登记 IP（及反向）被拦，同形态放行
 
 运行：.venv/Scripts/python.exe scripts/test_record_finding.py
 """
@@ -219,6 +220,49 @@ async def main() -> int:
     check("等于没测" in P.AGENT_SYSTEM, "点明不登记的后果")
     check("export_report" in P.AGENT_SYSTEM, "说明报告来自 findings 列表")
     check("不要把完整报告直接打在对话里" in P.AGENT_SYSTEM, "禁止把报告打在对话里")
+
+    print("\n场景9 目标归属拦截（防「测了别的 IP 却用主域名登记」）")
+    n_before = len(session.result.findings)
+    # 会话目标是域名，却登记一个 IP —— 典型串线（SSRF 反射出的内网地址、
+    # 顺手扫到的邻居站），必须拦下
+    blocked = await runner.execute("record_finding", {
+        "name": "内网某服务未授权", "severity": "high",
+        "matched_at": "http://10.0.0.5:8080/admin",
+        "evidence": "直接返回管理面板", "payload": "GET /admin",
+        "category": "idor",
+    }, session)
+    check("已拦截" in blocked, f"域名会话里登记 IP 被拦：{blocked[:60]}")
+    check("/target" in blocked, "拦截文案提示先切换目标")
+    check(len(session.result.findings) == n_before, "被拦的没有入库")
+
+    # 目标本身就是 IP 时，登记域名同样要拦（反过来的串线）
+    ip_session = Session(target="http://10.0.0.5:8080")
+    blocked2 = await runner.execute("record_finding", {
+        "name": "某域名越权", "severity": "high",
+        "matched_at": "http://other.example.com/admin",
+        "evidence": "越权读取", "payload": "GET /admin",
+        "category": "idor",
+    }, ip_session)
+    check("已拦截" in blocked2, f"IP 会话里登记域名被拦：{blocked2[:60]}")
+    check(len(ip_session.result.findings) == 0, "被拦的没有入库")
+
+    # 同形态不同主机（子域名 / 多主机业务）必须放行——那是正常业务形态
+    sub = await runner.execute("record_finding", {
+        "name": "子域越权", "severity": "high",
+        "matched_at": "http://api.juice.test/admin",
+        "evidence": "越权读取", "payload": "GET /admin",
+        "category": "idor",
+    }, session)
+    check("已登记" in sub, f"同形态不同主机放行：{sub[:60]}")
+
+    # 裸主机（没 scheme）也要能识别形态
+    bare = await runner.execute("record_finding", {
+        "name": "裸 IP 登记", "severity": "high",
+        "matched_at": "10.0.0.5:8080/admin",
+        "evidence": "直连内网", "payload": "GET /admin",
+        "category": "idor",
+    }, session)
+    check("已拦截" in bare, f"裸 IP 形态也能识别：{bare[:60]}")
 
     print(f"\n{ok}/{total} 通过")
     return 0 if ok == total else 1

@@ -103,11 +103,14 @@ def main() -> int:
             self.cfg = type("C", (), {"data_dir": str(base)})()
 
         _save = None  # 占位，下面绑定真实实现
+        _sessions_dir = None  # 占位，下面绑定真实实现
 
     from core.repl import Repl
 
     rep = _Rep(Session(target=""))
     rep._save = Repl._save.__get__(rep)
+    # _save 依赖 _sessions_dir（快照根目录单点定义），假对象也要绑上
+    rep._sessions_dir = Repl._sessions_dir.__get__(rep)
     out = rep._save()
     check(out is None, f"空会话 _save 返回 None，实={out!r}")
     check(not any(base.iterdir()), "空会话一个目录都没留下")
@@ -115,6 +118,7 @@ def main() -> int:
     # 有内容就正常落盘
     rep2 = _Rep(Session(target="http://x.test"))
     rep2._save = Repl._save.__get__(rep2)
+    rep2._sessions_dir = Repl._sessions_dir.__get__(rep2)
     p = rep2._save()
     check(p is not None and p.is_file(), f"有目标则正常落盘，实={p}")
 

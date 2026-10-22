@@ -51,7 +51,8 @@ def main() -> int:
     check(new == "/report md", f"/report m -> /report md，实={new!r}")
     check(cands == ["md"], "参数候选正确")
     check(c.complete("/assets e")[0] == "/assets endpoint", "资产类型前缀补全")
-    check(c.complete("/login a")[0] == "/login admin@juice-sh.op", "邮箱前缀补全")
+    check(c.complete("/target http://a")[0] == "/target http://a.example.com/x",
+          "URL 前缀补全")
     check(c.complete("/title 1")[0] == "/title 1", "编号幂等")
 
     print("\n场景3 多候选与空格保留")
@@ -64,9 +65,9 @@ def main() -> int:
     new3, cands3, _ = c.complete("/agent ")
     check(new3 == "/agent o", f"on/off 公共前缀 o，实={new3!r}")
 
-    print("\n场景4 空格数量（参数本身可能含空格，如邮箱不含但路径含）")
-    new4, _, _ = c.complete("/login admin")
-    check(new4 == "/login admin@juice-sh.op", f"含空格账号补全，实={new4!r}")
+    print("\n场景4 空格数量（参数本身可能含空格，如 URL 路径含空格）")
+    new4, _, _ = c.complete("/target http://a")
+    check(new4 == "/target http://a.example.com/x", f"含空格参数补全，实={new4!r}")
 
     print("\n场景5 交互层在非TTY 下优雅降级")
     # 管道输入时必须退回 input()，否则会读到 EOF 直接崩

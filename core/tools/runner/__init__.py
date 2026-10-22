@@ -65,7 +65,7 @@ class ToolRunner(
 
     各职责见同级模块；本类只把它们拼在一起，不新增任何实现。
     ``ToolRunner.dismiss`` / ``ToolRunner.resolve_finding`` 是类方法，
-    供 ``/fp`` 与 CLI 直接复用同一套发现寻址逻辑。
+    供 CLI 与其它调用方直接复用同一套发现寻址逻辑。
     """
 
 

@@ -17,87 +17,13 @@ from core.repl.consts import _REPORT_NOTE_PREFIX
 
 
 class _SessionMixin:
-    async def _fp(self, raw: str) -> None:
-        """``/fp`` —— 误报排除（人用的入口）。
+    def _sessions_dir(self) -> Path:
+        """会话快照根目录（``data/sessions``）。
 
-        逻辑直接复用 ``ToolRunner.dismiss``——那是模型、/fp、CLI 三条入口的
-        共同实现。各写一遍的话，"模型能排除、命令行不能"或"排除范围不一致"
-        这类问题迟早出现，而且极难发现（每条入口单看都自洽）。
+        单点定义：``/reset`` 要删快照、``/resume`` 要读快照、``_save`` 要写
+        快照，四处都用同一个路径，散着写迟早有一处写歪。
         """
-        parts = raw.split(maxsplit=2)
-        args = parts[1:]
-        if not args or args[0].lower() in ("list", "ls", ""):
-            self._findings(show_dismissed=True)
-            self._fp_show_exclusions()
-            return
-
-        sub = args[0].lower()
-        if sub in ("auto", "public"):
-            # 回源站根目录核验公开性，够强就自动排除。
-            # 本方法必须是 async 的：命令分发本身在事件循环里，
-            # 用 run_until_complete 会直接抛 "This event loop is already running"。
-            from core.tools import ToolRunner
-
-            print("正在回源站根目录核验公开性……")
-            out = await ToolRunner(
-                self.cfg, self.probes or {}, "."
-            ).check_public(self.session, ref="all")
-            print(out)
-            self._save()
-            self._refresh_completer()
-            return
-
-        undo = sub == "undo"
-        purge = sub == "del"
-        scope = "poc" if sub == "poc" else "finding"
-
-        if undo or purge:
-            ref = args[1] if len(args) > 1 else ""
-            reason = ""
-        elif sub == "poc":
-            ref = args[1] if len(args) > 1 else ""          # /fp poc <编号> <原因>
-            reason = args[2] if len(args) > 2 else ""
-        else:
-            ref = args[0]                                     # /fp <编号|poc_id> <原因…>
-            reason = args[1] if len(args) > 1 else ""
-
-        if not ref:
-            print(
-                "用法：/fp <编号> <原因>　｜　/fp undo <编号>　｜　"
-                "/fp del <编号>　｜　/fp poc <编号> <原因>"
-            )
-            return
-        if not (undo or purge) and not reason.strip():
-            print(
-                "缺少排除原因。报告里会列出「误报排除的复核记录」，"
-                "没有依据的排除等于不可复核。\n"
-                "用法：/fp <编号> <原因>　例如：/fp 3 公开演示站点，内容本就公开"
-            )
-            return
-
-        from core.tools import ToolRunner
-
-        out = ToolRunner.dismiss(
-            self.session, ref=ref, reason=reason,
-            undo=undo, purge=purge, scope=scope,
-        )
-        print(out)
-        if not out.startswith("排除失败"):
-            self._save()
-            self._refresh_completer()
-
-    def _fp_show_exclusions(self) -> None:
-        from core import exclusions
-
-        items = exclusions.entries(self.session.target)
-        if not items:
-            return
-        print(f"\n本目标的排除清单（{len(items)} 条，重扫自动套用）：")
-        for e in items[:20]:
-            where = "该 POC 全部命中" if not e.get("matched_at") else str(e["matched_at"])[:80]
-            print(f"  · {e.get('poc_id')}　{where}")
-            if e.get("reason"):
-                print(f"    原因：{str(e['reason'])[:70]}")
+        return Path(self.cfg.data_dir) / "sessions"
 
     def _turns(self) -> None:
         if not self.session.turns:
@@ -184,7 +110,7 @@ class _SessionMixin:
         用户此刻正在挑要恢复哪一个，正是把噪音清掉的时机。清理结果只报一句
         汇总，不逐条刷屏。
         """
-        base = Path(self.cfg.data_dir) / "sessions"
+        base = self._sessions_dir()
         gone = purge_empty_sessions(base)
         if gone:
             print(f"（已清理 {len(gone)} 个空会话：{'、'.join(gone[:3])}…）"
@@ -220,7 +146,7 @@ class _SessionMixin:
             print(f"   已恢复对话历史 {len(prev.history)} 条（切到 Agent 模式后生效）")
         # 凭证与 token 刻意不落盘（快照可能被分享出去），所以恢复后要重新登录
         if prev.result.assets and not prev.credentials.get("token"):
-            print("   提示：凭证不写入快照，需要重新 /login 才能做带凭证的测试")
+            print("   提示：凭证不写入快照，需要重新取得凭证（Agent 模式下用 login 工具）才能做带凭证的测试")
         # 恢复后顺手回填：老快照里手工登记的发现常常只有请求没有响应
         # （旧版 record_finding 的锅），而当时的真实响应还在 history 里。
         # 补上之后 /report 导出的 PoC 段才完整。
@@ -261,7 +187,7 @@ class _SessionMixin:
 
     def _clean_sessions(self) -> None:
         """``/clean``：删掉所有空会话目录（含历史遗留的）。"""
-        base = Path(self.cfg.data_dir) / "sessions"
+        base = self._sessions_dir()
         gone = purge_empty_sessions(base)
         if not gone:
             print("没有空会话需要清理。")
@@ -274,7 +200,7 @@ class _SessionMixin:
 
     def _sessions(self) -> None:
         """列出可恢复的会话。"""
-        items = list_sessions(Path(self.cfg.data_dir) / "sessions", limit=10)
+        items = list_sessions(self._sessions_dir(), limit=10)
         if not items:
             print("（没有可恢复的会话）")
             return
@@ -314,6 +240,6 @@ class _SessionMixin:
             self.session.sync_history(self.agent.history)
         if self.session.is_empty():
             return None
-        return self.session.save(Path(self.cfg.data_dir) / "sessions")
+        return self.session.save(self._sessions_dir())
 
 

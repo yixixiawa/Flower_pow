@@ -147,21 +147,11 @@ class _LoopMixin:
         if low in ("/findings", "/f"):
             self._findings()
             return True
-        if low.startswith("/fp") or low.startswith("/dismiss"):
-            await self._fp(raw)
-            return True
         if low in ("/turns", "/history"):
             self._turns()
             return True
         if low in ("/model", "/business"):
             self._model()
-            return True
-        if low.startswith("/login"):
-            parts = raw.split(maxsplit=2)
-            if len(parts) < 3:
-                print("用法：/login <账号> <密码>")
-                return True
-            await self._login(parts[1], parts[2])
             return True
         if low.startswith("/phase"):
             parts = raw.split()
@@ -241,11 +231,7 @@ class _LoopMixin:
             await self._autopilot()
             return True
         if low in ("/reset", "/clear"):
-            if self.agent_on:
-                self.agent.reset()
-                print("Agent 对话历史已清空（资产与发现保留）")
-            else:
-                print("当前不是 Agent 模式")
+            self._reset(raw)
             return True
 
         # ── 自然语言 ──────────────────────────────────────────────

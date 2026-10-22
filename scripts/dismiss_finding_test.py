@@ -14,7 +14,7 @@ findings 一旦入库就只能看着。典型误报是「公开演示站点」�
   7. 工具注册与 handler 行为（无原因被拒、编号越界、undo、purge）
   8. 撤销必须连持久化清单一起删（否则重扫又标回来）
   9. 知识库不摄取已排除项
- 10. REPL 命令注册（/fp）与编号稳定性（排除后编号不平移）
+ 10. REPL 命令下线（/fp、/login）与编号稳定性（排除后编号不平移）
 
 运行：.venv/Scripts/python.exe scripts/test_dismiss_finding.py
 """
@@ -303,15 +303,22 @@ def main() -> int:
     )
     check(rep2.accepted == 1, f"有效发现照常沉淀，实 accepted={rep2.accepted}")
 
-    print("\n场景11 REPL 命令注册")
+    print("\n场景11 REPL 命令下线与误报排除入口收敛")
     from core.repl import COMMANDS
 
-    check("/fp" in COMMANDS, "/fp 在命令表里（补全与 /help 共用同一份）")
-    import core.repl as _repl
-
-    src = module_source("core.repl")
-    check("ToolRunner.dismiss(" in src,
-          "/fp 复用 ToolRunner.dismiss（人与模型同一套语义，不各写一遍）")
+    # /fp 与 /login 已下线：误报排除交给 Agent 工具，凭证交给 Agent 的login 工具，
+    # REPL 不再是第二个入口——两个入口语义各写一遍必然走偏。
+    check("/fp" not in COMMANDS, "/fp 已从命令表下线")
+    check("/login" not in COMMANDS, "/login 已从命令表下线")
+    check("/reset" in COMMANDS, "/reset 仍在命令表里")
+    names = [b.name for b in BUILTINS]
+    check("dismiss_finding" in names, "误报排除改由 Agent 工具 dismiss_finding 承担")
+    check("check_public_finding" in names, "公开性核验仍在 Agent 工具里")
+    rsrc = module_source("core.repl")
+    check("def _fp" not in rsrc and "def _login" not in rsrc,
+          "REPL 里没有残留的 _fp / _login 实现")
+    check("def dismiss(" in module_source("core.tools.runner.report"),
+          "误报排除仍只有 ToolRunner.dismiss 一处实现（模型/CLI 共用）")
 
     print(f"\n{ok}/{total} 通过")
     return 0 if ok == total else 1

@@ -120,7 +120,7 @@ class _ReconMixin:
         if n_pub:
             result.notes.append(
                 f"公开性核验：{n_pub} 条命中判定为站点自己公开的资源，已自动排除为误报"
-                f"（见报告「已排除的发现（误报复核）」附录，可用 /fp undo 撤销）"
+                f"（见报告「已排除的发现（误报复核）」附录，可让 Agent 用 dismiss_finding 撤销）"
             )
         result.phases["public_check"] = time.perf_counter() - t0
         if verbose and (n_pub or n_suspect):

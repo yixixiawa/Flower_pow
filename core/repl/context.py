@@ -36,7 +36,6 @@ class _ContextMixin:
             "report": ["md", "html", "json", "all"],
             "assets": ["port", "path", "api", "endpoint", "secret", "internal", "js"],
             "findings": ["critical", "high", "medium", "low", "info", "all"],
-            "fp": ["auto", "list", "undo", "del", "poc"],
             # 常见轮数，外加 0（不限）
             "poll": ["5", "8", "12", "20", "0"],
             "phase": ["recon", "model", "exploit", "iterate"],

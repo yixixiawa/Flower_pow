@@ -372,7 +372,10 @@ def main() -> int:
           "扫描流水线接上了公开性核验")
     check("auto_dismiss_public" in src, "核验受配置开关控制")
     rsrc = module_source("core.repl")
-    check("/fp auto" in rsrc or '"auto"' in rsrc, "REPL 有 /fp auto")
+    check("/fp" not in rsrc, "REPL 不再有 /fp（误报排除统一走 Agent 工具）")
+    trsrc = module_source("core.tools.runner.report")
+    check("def check_public(" in trsrc, "公开性核验仍只有 ToolRunner.check_public 一处实现")
+    check("apply" in trsrc, "check_public 保留 apply 开关（只报告不改动）")
     fsrc = cli_source()
     check("--auto" in fsrc, "CLI 有 --auto")
 

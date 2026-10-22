@@ -17,14 +17,17 @@ from __future__ import annotations
 import re
 import unicodedata
 
-CMDS = ["/help", "/status", "/report", "/resume", "/quit", "/login",
+# 补全夹具用的一组命令名与参数候选。
+# 注意：``/login`` 与 ``/fp`` 已从真实命令表下线，这里也不再用它们做样本——
+# 夹具里留着一条现实里不存在的命令，测试就成了自证的假通过。
+CMDS = ["/help", "/status", "/report", "/resume", "/quit", "/target",
         "/agent", "/assets", "/title", "/chats"]
 ARGS = {
     "report": ["md", "html", "json", "all"],
     "assets": ["port", "path", "api", "endpoint"],
     "phase": ["recon", "model", "exploit", "iterate"],
     "agent": ["on", "off"],
-    "login": ["admin@juice-sh.op", "user@example.com"],
+    "target": ["http://a.example.com/x", "http://b.example.com/y"],
     "title": ["1", "2", "3"],
 }
 

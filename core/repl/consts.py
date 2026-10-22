@@ -14,7 +14,7 @@ from core.session import (
 
 
 COMMANDS = [
-    "/help", "/status", "/assets", "/findings", "/fp", "/login", "/model",
+    "/help", "/status", "/assets", "/findings", "/model",
     "/title", "/chats", "/reset", "/report", "/sessions", "/resume",
     "/backfill", "/clean", "/agent", "/target", "/tools", "/key", "/turns",
     "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/quit",
@@ -42,17 +42,11 @@ Tab 补全：命令名与参数都能补全。补命令连按两次 Tab 看候�
   /status       当前状态概览
   /assets [类型] 资产清单（port|path|api|endpoint|secret|internal|js）
   /findings     发现列表（按严重度，带编号）
-  /fp <编号> <原因>  把某条发现判为误报并从报告中排除（可撤销，跨会话生效）
-                 /fp             = 列出发现与已排除项
-                 /fp auto        = **回源站根目录核验公开性**，站点自己公开的自动排除
-                 /fp undo <编号>  = 撤销排除
-                 /fp del <编号>   = 彻底删除（不留复核痕迹）
-                 /fp poc <编号> <原因> = 该 POC 在本目标整体排除
-  /login 账号 密码   设置凭证并登录（走通业务流需要）
   /model        查看当前业务模型
   /chats        对话索引：每轮对话的标题与用到的工具
   /title <编号> <标题>    手工改某轮对话的标题
-  /reset        清空 Agent 对话历史（资产与发现保留）
+  /reset        **彻底重置**：销毁当前所有数据（目标/资产/发现/凭证/对话
+                历史/盘上快照），换一把全新的椅子
   /report [格式] 导出报告（md/html/json/all）
   /sessions     列出可恢复的会话
   /resume [id]  载入会话（不给 id 则取最近一次），连对话历史一起恢复
@@ -61,7 +55,8 @@ Tab 补全：命令名与参数都能补全。补命令连按两次 Tab 看候�
 
 模式与配置：
   /agent [on|off]   切换 AI Agent / 剧本模式
-  /target [URL]     设定或查看目标
+  /target [URL]     设定或查看目标（**换成别的目标会自动清空上一目标的
+                    全部资产与发现**，防报告串线）
   /tools            列出本机可调用工具与版本
   /key              重新设置 API Key（写入 .env）
   /turns            历史轮次

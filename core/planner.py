@@ -260,7 +260,7 @@ class Planner:
                     self.log(f"   [!] 登录未成功：{res.notes[:1]}")
                     return
             else:
-                t.notes.append("未提供测试凭证，跳过登录（用 /login 补上）")
+                t.notes.append("未提供测试凭证，跳过登录（Agent 模式下用 login 工具补上）")
                 self.log("   未提供凭证，仅做静态建模")
                 return
 
@@ -477,10 +477,10 @@ class Planner:
             api = [a for a in session.result.assets if a.kind == "api"]
             if api:
                 out.append(f"接口清单已就绪（{len(api)} 个操作），可进入业务建模")
-            out.append("提供测试凭证（/login 用户 密码）以便走通完整业务流")
+            out.append("提供测试凭证（Agent 模式下用 login 工具）以便走通完整业务流")
         elif session.phase is Phase.MODEL:
             if not session.credentials.get("token"):
-                out.append("未取得凭证，建议先 /login 再进入渗透测试")
+                out.append("未取得凭证，建议先取得凭证（Agent 模式下用 login 工具）再进入渗透测试")
             out.append("进入渗透测试（/next）")
         elif session.phase is Phase.EXPLOIT:
             out.append("基于发现做迭代深挖（/next）")

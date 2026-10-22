@@ -199,9 +199,9 @@ python -m flower_pow engines                  # 不想依赖 cwd
 /agent [on|off]  切换 Agent / 剧本模式        /target [URL]  设定或查看目标
 /tools           列出本机可调用工具            /key           重新设置 API Key（写入 .env）
 /status          状态概概                      /assets [类型] 资产清单
-/findings [等级] 发现列表                      /login 账号 密码 设置凭证并登录
-/model           业务模型                      /reset         清空对话历史（保留资产与发现）
-/report [格式]   导出报告                      /resume [id]   载入会话（不带 id 取最近一次）
+/findings [等级] 发现列表                      /reset         **彻底重置**（销毁目标/资产/发现/凭证/对话历史/盘上快照）
+/model           业务模型                      /report [格式] 导出报告
+/resume [id]     载入会话（不带 id 取最近一次，连对话历史一起恢复）
 /backfill        从会话历史回填发现的原始报文（老报告只有请求没响应时用）
 /phase 名称      剧本模式切阶段（recon|model|exploit|iterate）
 /next / /run     剧本模式推进阶段 / 当前阶段再跑一轮
@@ -213,6 +213,14 @@ Alt+Shift        同上（输入框里按下即触发，不必敲命令）
 /quit            退出（自动保存；**空会话不保存**）
 ```
 
+**换目标会清空一切**：`/target` 设成**与当前不同**的目标时，上一目标的资产、
+发现、凭证、对话历史与 runner 运行期缓存会被整体清空——报告串线的根源大多
+在这里。同一目标重复设定不动数据。
+
+**`/reset` 是"砸了换把新的"**：不管当前处于什么状态，一律丢弃旧 `Session`、
+换一把全新的空会话、删掉盘上快照。换句话说它不做"清对话历史、保留资产"这种
+半吊子——要清就清干净。
+
 **行编辑**：`←/→` 在已输入内容里移动光标、`Home/End`、`Delete`、
 `Ctrl+←/→` 按词跳、`Ctrl+A/E` 行首行尾、`Ctrl+U/K` 清空/删到行尾、
 `↑/↓` 翻历史、`Tab` 补全。终端表现异常时设 `FLOWER_POW_PLAIN_INPUT=1` 退回原生 `input()`。
@@ -222,7 +230,8 @@ Alt+Shift        同上（输入框里按下即触发，不必敲命令）
 
 状态落在 `data/sessions/<id>/session.json`，随时 `--resume` 断点续跑。
   
-**凭证与 token 不写入快照**（快照可能被分享），恢复后需重新 `/login`。
+**凭证与 token 不写入快照**（快照可能被分享），恢复后需重新取得凭证
+（Agent 模式下用 `login` 工具）。
 
 #### 会话恢复：连对话历史一起恢复
 
@@ -291,7 +300,7 @@ data/sessions/
 落盘前对 `history` 统一脱敏（`core/session/redact.py: redact_messages`）：对话历史里
 往往混着工具返回的原始响应，直接存等于把 Cookie / Token 写进可能被分享的快照。
 脱敏只在**写盘时**做，内存里的历史保持原值，否则 Agent 会拿着 `***` 去干活。
-凭证与 token 仍然不落盘，恢复后需重新 `/login`。
+凭证与 token 仍然不落盘，恢复后需重新取得凭证（Agent 模式下用 `login` 工具）。
 
 ### 3.1.1 报告里的 POC 执行过程
 
@@ -335,7 +344,6 @@ data/sessions/
 | `/resume <Tab>` | 实际扫描 `data/sessions/` 得到会话 id |
 | `/title <Tab>` | 当前已有的对话编号 |
 | `/assets <Tab>` | 资产类型（port/path/api/endpoint/…） |
-| `/login <Tab>` | 历史用过的账号 |
 | `/target <Tab>` | 当前目标及其常见路径 |
 
 **为什么自己实现**：`readline` 是 POSIX 模块，**Windows 官方 Python 发行版不提供**
@@ -553,6 +561,13 @@ record_finding(name, severity, matched_at, evidence, remediation, category)
 一句话：**`evidence` 说"为什么"，`payload`/`response` 给"是什么"**。三者混在一起，
 报告里就会出现"`<<< 响应:` 下面是一段中文说明"这种最糟糕的形态。
 
+**目标归属校验（防串线）**：登记时若 `matched_at` 的主机与当前会话目标
+**形态不一致**（目标是域名却登记 IP，或目标是 IP 却登记域名），登记会被直接
+拦下并提示先 `/target` 切换目标。原因很实在：模型经常顺手测了别的地址
+（SSRF 反射出的内网 IP、扫到的邻居站），回来却用主域名登记——于是报告里出现
+一条"某域名上的漏洞"，而证据其实来自另一个系统。同形态不同主机（子域名、
+多主机业务）一律放行，那是正常业务形态。
+
 ### 4.1.2 `max_tokens`：静默截断是长文本的头号敌人
 
 OpenAI 兼容接口达到 `max_tokens` 时**不报错**，只把 `finish_reason` 置为
@@ -569,25 +584,28 @@ OpenAI 兼容接口达到 `max_tokens` 时**不报错**，只把 `finish_reason`
 流式报错文案会直接告诉模型「分批处理（例如一次只分析 3-5 个目标）」，
 而不是让它继续在半截内容上往下编。
 
-### 4.1.3 误报怎么删（`dismiss_finding` / `/fp` / `findings`）
+### 4.1.3 误报怎么删（`dismiss_finding` / `findings`）
 
 报告里混进误报是常态，而自动探针**判断不了**其中最主要的一类——**公开演示站点**。
 `demo.ikuai8.com` 这类站点本来就建给人看，「泄露」出来的配置、默认账号、
 接口文档属于**设计如此**，不是漏洞。探针看到"敏感信息"照报不误。
 
-三条入口，同一套实现（`ToolRunner.dismiss`）：
+两条入口，同一套实现（`ToolRunner.dismiss`）：
 
 | 入口 | 用法 |
 |------|------|
-| 会话内 / 命令行 | `/fp 3 公开演示站点，内容本就公开`　`/fp undo 3`　`/fp del 3`　`/fp poc 3 <原因>` |
 | CLI（历史会话） | `flower_pow findings 3 -r "公开演示站点"`　`--excluded` 看清单　`--json` 脚本消费 |
-| 模型 | `dismiss_finding(ref="3", reason="…")` |
+| 模型 | `dismiss_finding(ref="3", reason="…")`　`dismiss_finding(ref="3", undo=true)` |
+
+> 以前会话内还有一条 `/fp` 命令，现在**已下线**：误报排除的语义（编号怎么算、
+> 撤销怎么做、要不要落排除清单）只留一份实现，多一个入口就多一处会走偏的地方。
+> 会话里要排除误报，直接跟模型说"第 3 条是公开演示站，排除它"即可。
 
 **默认是"标记"而不是"删除"**，这是刻意的：
 
 | | 报告里 | 复核痕迹 | 撤销 |
 |---|---|---|---|
-| 默认（标记） | 不进风险统计与发现详情，出现在文末**「已排除的发现（误报复核）」**附录 | 保留（谁/何时/为什么） | `/fp undo` |
+| 默认（标记） | 不进风险统计与发现详情，出现在文末**「已排除的发现（误报复核）」**附录 | 保留（谁/何时/为什么） | `dismiss_finding(ref=…, undo=true)` |
 | `purge`（彻底删） | 完全不出现 | 不保留 | 不可 |
 
 > 硬删会连带丢掉"上次报的 XX 怎么没了"的解释。客户一定会问这句话，
@@ -614,8 +632,9 @@ OpenAI 兼容接口达到 `max_tokens` 时**不报错**，只把 `finish_reason`
 
 ```bash
 python flower_pow.py findings --auto      # 对已保存会话跑一轮
-/fp auto                                  # 会话内跑一轮
 ```
+
+会话内则由模型调用 `check_public_finding(ref="all")` 跑一轮。
 模型侧是内置工具 `check_public_finding`（`ref="all"` 批量）；`scan` 流水线在研判
 之后自动跑一轮（`scan.auto_dismiss_public`，默认开）。
 
@@ -649,7 +668,7 @@ python flower_pow.py findings --auto      # 对已保存会话跑一轮
 - **证据按 host 缓存**。几十条发现共用一份上下文，不会"每条都回源"把目标打一遍。
 
 被自动排除的项同样进报告的**「误报复核」附录**（写明取证结果），可用
-`/fp undo` 撤销。想完全关掉自动判定：`POCS_AUTO_DISMISS_PUBLIC=false`。
+`dismiss_finding(ref=…, undo=true)` 撤销。想完全关掉自动判定：`POCS_AUTO_DISMISS_PUBLIC=false`。
 
 ### 4.1.5 文件增删改：报告是「就地维护」的，不是每次生成一份
 
@@ -1735,6 +1754,10 @@ scripts/
 ├── naming_test.py        ★ 命名测试：报告名 report_<日期>_<主域名> / 主域名裁剪（含 co.uk）
                           / 同主域不同子站加后缀区分 / 会话名取首轮标题
 ├── empty_session_test.py ★ 空会话清理测试：判空从严 / 不落盘 / 清扫 / 点名恢复拦截
+├── target_scope_test.py ★ 目标作用域测试：**/reset 彻底销毁**（新 Session / 删盘上快照 /
+│                         agent.session 重绑 / 规划器清空）/ **/target 换目标全清**
+│                         （资产·发现·指纹·凭证·轮次·业务模型·runner 缓存）/ 同目标不动 /
+│                         目标规范化 / 无 Agent 无快照也不崩
 ├── subdomain_extract_test.py ★ 子域枚举测试：注册域抽取（多段后缀最长匹配 / 裸 host:port）
 │                              / 记录清洗 / 单源失败降级 / **多源聚合换源**（crt.sh 502 仍出结果）
 │                              / 每个源的正文级错误（额度用尽 / 结构变化 / 404）/ 排列组合不堆叠
@@ -1812,7 +1835,7 @@ POCS_PROXY_AUTODETECT=true         # 未显式配置时，自动探测本机代�
 
 # 公开性核验（详见 §4.1.4）：命中漏洞后回源站根目录取证，
 # 站点自己公开的资源（公开演示站 / 公开资料目录 / 站点自己挂了链接）自动判误报。
-# 关掉则纯人工用 /fp 处理。
+# 关掉则纯人工在报告里复核。
 POCS_AUTO_DISMISS_PUBLIC=true
 
 # 文件增删改（详见 §4.1.5）：只关在 output_dir 内、扩展名白名单。
