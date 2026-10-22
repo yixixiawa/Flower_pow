@@ -1,10 +1,22 @@
 """交互读取：Windows 用 ``msvcrt`` 读单键，POSIX 走 termios 裸模式。
 
 拿到控制台走 Windows 分支；拿不到就退化成 ``input()`` 单行模式
-（``FLOWER_POW_PLAIN_INPUT`` 可强制）。"""
+（``FLOWER_POW_PLAIN_INPUT`` 可强制）。
+
+中文输入的正确性
+----------------
+Windows 主路径走 ``msvcrt.getwch()``（宽字符，IME 合成期不返回、
+提交时返回完整 wchar，天然不拆字节）。POSIX 裸模式路径**按字节读
+stdin 再交给 IncrementalDecoder 拼整字符**（:func:`_read_one_char`）——
+多字节字符的字节可能分多次到达（raw 模式下终端不保证一次给全），
+字符接口在半字符就位时拿到什么完全取决于流的内部状态；显式按字节
+喂解码器、解码器不吐字符就继续读下一字节，从机制上保证中文按完整
+字符进入 buf。两者共同的前提是 stdin 编码正确——cp936 错配下的
+统一修复见 ``cli/boot.py: _reconfigure_console_utf8``。"""
 
 from __future__ import annotations
 
+import codecs
 import sys
 import time
 from core.completer.width import _prev_word
@@ -30,6 +42,47 @@ from core.completer.candidate import Completer
 
 
 # ── 交互读取 ────────────────────────────────────────────────────
+
+
+# stdin 的增量解码器：跨调用保持，半字符字节在解码器里缓存，
+# 下一次读到剩余字节时才吐出完整字符。**不能每次读都新建**——
+# 新建等于把上次残留的半字符丢掉，正是「中文首字节丢失」的成因。
+_char_decoder: codecs.IncrementalDecoder | None = None
+
+
+def _read_one_char() -> str:
+    """从 stdin 读一个**完整字符**：字节级读 + IncrementalDecoder。
+
+    为什么不直接用 ``sys.stdin.read(1)``：raw 模式下多字节字符的字节
+    可能分多次到达，字符接口何时拼齐取决于流内部状态；显式按字节读、
+    喂给解码器、它不吐字符就继续读下一字节，中文/emoji 永远按完整
+    字符返回，不会出现"一个中文字被拆成两段插进输入区"。
+
+    EOF 返回空串（与 ``read(1)`` 的契约一致，调用方靠这个判结束）。
+    stdin 被换成非二进制流（测试替身）时退回字符接口。
+    """
+    global _char_decoder
+    buf = getattr(sys.stdin, "buffer", None)
+    if buf is None:
+        return sys.stdin.read(1)
+    if _char_decoder is None:
+        enc = getattr(sys.stdin, "encoding", None) or "utf-8"
+        # errors="replace"：半字符永远等得到下一字节；真遇到坏字节
+        # 也不该让整个 REPL 崩，换成 U+FFFD 让模型/用户看到即可。
+        _char_decoder = codecs.getincrementaldecoder(enc)(errors="replace")
+    while True:
+        b = buf.read(1)
+        if not b:
+            return ""
+        ch = _char_decoder.decode(b)
+        if ch:
+            return ch
+
+
+def _reset_char_decoder() -> None:
+    """清掉增量解码器状态（换流/测试之间调用，防止跨流串味）。"""
+    global _char_decoder
+    _char_decoder = None
 
 
 class PromptReader:
@@ -269,7 +322,7 @@ class PromptReader:
         """
         seq = ""
         for _ in range(8):
-            c = sys.stdin.read(1)
+            c = _read_one_char()
             if not c:
                 break
             seq += c
@@ -295,7 +348,7 @@ class PromptReader:
             self._stream.write(prompt)
             self._stream.flush()
             while True:
-                ch = sys.stdin.read(1)
+                ch = _read_one_char()
                 if ch in ("\r", "\n"):
                     _finish_line(self._stream, prompt, buf, pos, cur_row=crow)
                     return buf

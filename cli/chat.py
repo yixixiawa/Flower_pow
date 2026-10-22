@@ -17,6 +17,7 @@ from cli.app import err
 from cli.boot import _cfg
 from cli.boot import _apply_model
 from cli.boot import _print_model_warnings
+from cli.boot import _reconfigure_console_utf8
 
 
 # ── chat：交互式测试会话 ──────────────────────────────────────────
@@ -65,6 +66,11 @@ def chat(
     """
     from core.repl import run_repl
     from core.session import Phase, Session, latest_session, purge_empty_sessions
+
+    # chat 自己调 run_repl、不经过 boot._run_default，所以编码修复要在
+    # 这里单独做一次——否则 `flower_pow.py chat` 进来的会话，中文输入
+    # 和上传审核的 input() 还是会踩 cp936 错配（幂等，非交互自动跳过）。
+    _reconfigure_console_utf8()
 
     cfg = _cfg(config)
     _apply_model(cfg, model, deep_model)

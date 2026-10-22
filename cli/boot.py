@@ -18,6 +18,32 @@ def _cfg(path: str | None = None) -> Config:
     return load_config(path)
 
 
+def _reconfigure_console_utf8() -> None:
+    """交互场景下把 stdin/stdout 固定成 UTF-8（幂等，非交互直接跳过）。
+
+    Windows 中文机器上 Python 默认给 stdin/stdout 分配 cp936（GBK），
+    而新版控制台/终端实际跑 UTF-8——编码错配时中文按错误编码解码，
+    症状就是「首字节丢失、要打两次才生效」。在这里修而不是在各读取
+    点修，是因为三条输入路径**共享同一个 sys.stdin**：PromptReader
+    （msvcrt getwch / POSIX 裸模式）、上传审核的 ``input()``
+    （cli/probe.py、core/repl/history.py）、密码框 getpass
+    （chat.py 的 typer.prompt(hide_input=True)）。入口统一 reconfigure
+    一次三条全受益，不会出现"修了主输入、审核路径照样丢字节"。
+
+    只在 isatty 时动手：管道/CI 场景 stdout 编码由调用方决定，
+    强行改 UTF-8 会破坏管道契约（重定向到文件时按 UTF-8 写才是
+    可预期的）。try/except 兜住 AttributeError（老 Python 没有
+    reconfigure）与 OSError（流已被包装/关闭），静默跳过不影响运行。
+    """
+    if not (sys.stdin and sys.stdin.isatty()):
+        return
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
+
 # ── 无参数入口：初始化 → 体检 → 要 Key → 进对话 ─────────────────────
 
 
@@ -62,6 +88,10 @@ def _run_default(
     from core.bootstrap import run_bootstrap
     from core.repl import run_repl
     from core.session import Session
+
+    # 先修编码再碰 stdin：后面 bootstrap 索要 Key、REPL 读中文输入、
+    # 上传审核 input() 全都依赖这一步（详见函数注释里的三路径说明）。
+    _reconfigure_console_utf8()
 
     cfg = _cfg(config)
     interactive = bool(sys.stdin and sys.stdin.isatty())
