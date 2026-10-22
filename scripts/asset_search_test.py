@@ -17,12 +17,13 @@ import httpx
 
 from collectors import asset_search as AS
 
-PASS = 0
+PASS = TOTAL = 0
 _ALL_KEYS = ("QUAKE_KEY", "FOFA_EMAIL", "FOFA_KEY", "HUNTER_KEY", "ZOOMEYE_KEY")
 
 
 def check(cond: bool, msg: str, detail: str = "") -> None:
-    global PASS
+    global PASS, TOTAL
+    TOTAL += 1
     if cond:
         PASS += 1
         print(f"  OK   {msg}")
@@ -163,7 +164,7 @@ def main() -> int:
           "失败的平台不影响成功的平台", str(assets))
     check(errs and any("quake" in e for e in errs), "失败平台进 errors", str(errs))
 
-    print(f"\n结果：{PASS} 项断言全过")
+    print(f"\n结果：{PASS}/{TOTAL} 通过")
     return 0
 
 

@@ -22,11 +22,12 @@ from core.tools.runner.base import (
     ToolBlocked,
 )
 
-PASS = 0
+PASS = TOTAL = 0
 
 
 def check(cond: bool, msg: str, detail: str = "") -> None:
-    global PASS
+    global PASS, TOTAL
+    TOTAL += 1
     if cond:
         PASS += 1
         print(f"  OK   {msg}")
@@ -119,7 +120,7 @@ def main() -> int:
     check(r._host_streak.get("b.com") == 1 and r._host_streak.get("a.com") >= 1,
           "换主机从 1 重计", str(r._host_streak))
 
-    print(f"\n结果：{PASS} 项断言全过")
+    print(f"\n结果：{PASS}/{TOTAL} 通过")
     return 0
 
 

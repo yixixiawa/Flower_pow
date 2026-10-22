@@ -17,11 +17,12 @@ from core.session import Session
 from core.tools import ToolRunner
 from core.tools.args import normalize_args
 
-PASS = 0
+PASS = TOTAL = 0
 
 
 def check(cond: bool, msg: str, detail: str = "") -> None:
-    global PASS
+    global PASS, TOTAL
+    TOTAL += 1
     if cond:
         PASS += 1
         print(f"  OK   {msg}")
@@ -93,7 +94,7 @@ def main() -> int:
         "read_file", {"path": "app.js", "start_line": 1, "max_lines": 5}, sess))
     check("不要逐页翻" in outp and 'grep="' in outp, "尾部提示引导用 grep 定位")
 
-    print(f"\n结果：{PASS} 项断言全过")
+    print(f"\n结果：{PASS}/{TOTAL} 通过")
     return 0
 
 

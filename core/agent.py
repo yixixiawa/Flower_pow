@@ -424,11 +424,14 @@ class Agent:
                         "明确说明「当前证据不足以判定」，不要编造。"
                     )
                 self.history.append({"role": "user", "content": hint})
-            # 不直接 return：给模型最后一次机会输出结论，
-            # 它要么给文本（正常结束），要么不再调工具。
-            self._call_fingerprints.clear()
-            self._skeletons.clear()
-            continue
+                # 不直接 return：给模型最后一次机会输出结论，
+                # 它要么给文本（正常结束），要么不再调工具。
+                # 清零必须留在本块内：挪到块外等于每轮都重置计数，
+                # 精确重复检测永远凑不满 LOOP_REPEAT_LIMIT（真事故：
+                # 删 max_steps 时重排缩进，把这两行挪出了 if，守卫整体失效）。
+                self._call_fingerprints.clear()
+                self._skeletons.clear()
+                continue
 
     # ── 上下文管理 ────────────────────────────────────────────────
 

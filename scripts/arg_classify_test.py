@@ -15,11 +15,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.tools.pathscan import _NOISE_EXACT
 from core.tools.runner.base import _classify_arg
 
-PASS = 0
+PASS = TOTAL = 0
 
 
 def check(cond: bool, msg: str, detail: str = "") -> None:
-    global PASS
+    global PASS, TOTAL
+    TOTAL += 1
     if cond:
         PASS += 1
         print(f"  OK   {msg}")
@@ -62,7 +63,7 @@ def main() -> int:
     check(not dupes, f"无重复字面量（实={dupes}）")
     check(len(_NOISE_EXACT) == len(set(_NOISE_EXACT)), "运行时集合本身无重复")
 
-    print(f"\n结果：{PASS} 项断言全过")
+    print(f"\n结果：{PASS}/{TOTAL} 通过")
     return 0
 
 

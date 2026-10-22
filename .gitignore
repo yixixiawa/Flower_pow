@@ -6,7 +6,17 @@
 # ============================================================================
 
 # ---- 扫描产物与报告（含目标资产信息、漏洞证据、请求响应原文）------------
-output/
+# output/ 里源码与产物混居：output/__init__.py、output/evidence.py、
+# output/report/*.py 是**报告写入器源码**，必须入库；其余全是产物。
+# 曾用整目录 output/ 排除，把源码一并误伤——paths/markdown/json/html
+# 四个模块从未进过版本库（新克隆直接 ImportError，历轮改动只活在本地磁盘）。
+# 且父目录被排除后无法用 !  negation 救回子目录（git 不遍历被排除的目录），
+# 只能改成"默认全排除、只放行 .py"的形态规则。
+output/*
+!output/*.py
+!output/report/
+output/report/*
+!output/report/*.py
 reports/
 # 目录名随调用点变化，凡「报告类」目录一律排除
 **/reports/
