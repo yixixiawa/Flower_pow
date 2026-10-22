@@ -505,8 +505,8 @@ Windows 控制台需要先开 `ENABLE_VIRTUAL_TERMINAL_PROCESSING` 才认这些�
 明确要求重试同一请求是合法的，不能带着上一轮的拒绝状态。
 
 **大输出不是死路。** 外部工具结果超过 6000 字符时，完整内容自动保存到
-`output/tool-output/` 下的文件，截断提示会告诉模型用 `read_file` 翻页读它——
-模型不需要、也不应该靠反复试输出选项去看被截断的部分。
+`output/tool-output/` 下的文件，截断提示会告诉模型用 `read_file` 的 **grep 定位
+模式**去找关键行——模型不需要、也不应该靠反复试输出选项去看被截断的部分。
 
 **单轮不再有硬性步数上限。** 早先用 `max_steps=12` 硬截断，模型连续调工具推进任务时会被中途切断，用户看到的是半截结论，还得再敲一句「继续」。现在循环由「模型不再要求调工具」自然终止，只有检测到无进展重复才收尾。
 
@@ -658,7 +658,8 @@ python flower_pow.py findings --auto      # 对已保存会话跑一轮
 "接着上一份改"，只能整篇重写。所以补两件事：
 
 **① 导出默认就地覆盖同一份文件**（`export_report(fmt, overwrite=True)`）。
-三种格式共用同一个文件名主干，反复导出不再堆副本。要留档时传 `overwrite=false`。
+三种格式收进**以报告主干命名的同一个文件夹**（`output/report_<日期>_<主域名>/`），
+反复导出不再堆副本。要留档时传 `overwrite=false`（另存为 `_2` 文件夹）。
 覆盖是可见的——返回里逐条标 `[新建]` / `[覆盖]`。
 
 `fmt` 只认 `md / html / json / all`：**传错格式名会当场报错并列出合法值，绝不
@@ -673,7 +674,7 @@ python flower_pow.py findings --auto      # 对已保存会话跑一轮
 | 工具 | 用途 |
 |------|------|
 | `list_files` | 看产物目录里有什么、哪份最新 |
-| `read_file` | 读原文（支持 `start_line`/`max_lines` 分段读长报告） |
+| `read_file` | 读原文。**两种模式**：`grep="关键字"` 定位模式（一次返回所有命中行 ±上下文，分析 JS/HTML/JSON 大文件用这个，**别逐页翻**）；`start_line`/`max_lines` 翻页模式（最后手段） |
 | `write_file` | 新建 / 覆盖（写自定义说明、附录、清单） |
 | **`edit_file`** | **就地替换某一段**——只动你指的那段，其余一字未动 |
 | `delete_file` | 删单个文件 |
@@ -836,7 +837,7 @@ conda 家族），本机从 525 条收敛到 265 条，剩下的都是正常工�
 | 分组   | 工具                                                                                        |
 | ---- | ----------------------------------------------------------------------------------------- |
 | 编排   | `set_target`（设定会话目标）、`session_state`                                                      |
-| 侦察   | `http_request`、`recon_fingerprint`、`recon_ports`、`recon_paths`、`recon_js`、`recon_openapi`、`recon_subdomains`、`js_audit` |
+| 侦察   | `http_request`、`recon_fingerprint`、`recon_ports`、`recon_paths`、`recon_js`、`recon_openapi`、`recon_subdomains`、`js_audit`、**`search_assets`（网络空间测绘统一入口：Quake/FOFA/Hunter/ZoomEye 按 key 自动路由、结果合并去重，Agent 只看到这一个工具，平台扩展无感）** |
 | 检索   | `rag_search`、`poc_list`、`cve_intel`                                                       |
 | 业务   | `login`（自动定位登录端点与字段，能还原纯文本 SVG 验证码）                                                       |
 | 验证   | `authz_probe`（未授权/IDOR/敏感字段三类批量探测）、`sqli_probe`、`exploit_probe`、`run_pipeline`（跑完整流水线）                                 |
@@ -1683,23 +1684,41 @@ output/
 │   │                  （naming·paths·notes·json·markdown·evidence·html）
 └── evidence.py        原始请求响应落盘，供复现
 
-产出文件命名：report_<日期>_<主域名>.{md,html,json}
-                     例：report_20261012_ftitle.studio.md
+产出文件命名：output/report_<日期>_<主域名>/**文件夹**，三种格式收在里面
+                     例：report_20261012_ftitle.studio/report_20261012_ftitle.studio.md
+                         （同目录下另有 .html + .json）
                      日期在前、主域名在后（去掉子域：www.ftitle.studio → ftitle.studio）；
                      三种格式共用同一主干，报告与 JSON 快照能对上号
                      默认就地覆盖同一份（改一轮导一次不再堆 _2/_3 副本）；
                      同主域但**不同子站**会自动加子域后缀区分，不静默合并
 
 scripts/
-├── run_tests.py       ★ 全量回归入口：python scripts/run_tests.py 一把跑完下面 23 个
+├── run_tests.py       ★ 全量回归入口：python scripts/run_tests.py 一把跑完下面 28 个
 │                      *_test.py（固定重定向 stdin + 单脚本超时 + 汇总项数）
+├── wrap_up.py         ★ 收尾提交：一轮改动的 git add . + git commit，标题写清
+│                      **改了哪些功能点与方法**。内置三门禁（编译 + 密钥扫描 +
+│                      全量回归，任一不过即中止、不做 add），add 之后审计
+│                      「未跟踪/被忽略的 .py」——本仓库真实事故：output/report/
+│                      源码曾被 output/ 整目录规则误伤，git add . 看似全收、
+│                      实则从未入库。--quick 跳回归 / --force 跳门禁 / --dry-run 预演
 ├── secret_scan.py     ★ 凭据泄漏自检：JWT / DeepSeek Key / 阿里云 AK / AWS AK /
 │                      私钥 / 硬编码 Bearer（配CI 前置，见 §13）
 ├── dirsearch_throttle_test.py  ★ dirsearch 降速逻辑端到端测试（假 dirsearch 四场景）
 ├── agent_loop_test.py         ★ Agent 主循环测试：260 步不被截断 / 死循环检测 / 防误杀 /
                                **换壳死循环（curl -w 连打）骨架检测** / 固执模型硬拒绝
+├── endpoint_signal_test.py    ★ 端点响应无变化检测：结构化三元组信号
+                               （状态码/正文大小/正文 hash，**剔除 elapsed_ms**，
+                               否则"完全相同"永远不成立）/ 端点级阈值 5 /
+                               **主机级阈值 15 兜底**（防每 5 次换 path 绕检）/
+                               响应有变连击即断 / 换主机不继承
+├── arg_classify_test.py       ★ 参数归类行为锁定：_classify_arg 合并
+                               _looks_like_target/_looks_like_path 后语义不变
+                               （URL / 纯主机 / 盘符 / 含分隔符 / 已知扩展名）
 ├── output_spill_test.py       ★ 大输出落盘测试：external_tool 截断自动存完整文件 /
                                折行不丢字符 / 内置工具不派生 spill / 落盘失败退化不崩
+├── read_grep_test.py          ★ read_file 定位模式：grep 正则（忽略大小写）/ 命中行
+                               ±上下文 / 最多 20 处防刷屏 / **context=0 不吞成 3** /
+                               翻页尾部引导"先 grep 别逐页翻"
 ├── session_resume_test.py     ★ 会话恢复测试：历史往返 / v1 兼容 / 脱敏 / list_sessions
 ├── knowledge_test.py★ 知识库沉淀测试：df 幂等 / 三道门控 / 去重 / 淘汰 / 隔离
 ├── report_test.py        ★ 报告生成测试：占位语拦截 / 截断识别 / 详情段不丢
@@ -1723,6 +1742,9 @@ scripts/
 ├── js_analyze_test.py    ★ JS 提取测试：路径结构判别（无业务前缀白名单）/ 压缩别名调用 +
 │                           baseURL 拼接 / import 上下文排除 / 模块图边解析 / 接口排序沉底 /
 │                           **端到端验证懒加载 chunk 真被下载**（本地起 HTTP 服务）/ 4KB 截断回归
+├── asset_search_test.py  ★ 统一资产搜索：Quake/FOFA/Hunter/ZoomEye 四平台
+│                          MockTransport 真实响应结构 / 按 key 启用路由 / 跨平台去重 /
+│                          **单平台失败降级不崩流水线** / 无 key 时提示配哪个变量
 ├── proxy_test.py         ★ 代理测试：环境变量/注册表探测 / 内网强制直连 / no_proxy 匹配 / 无网络依赖
 ├── dismiss_finding_test.py ★ 误报排除测试：字段往返与旧快照 / 统计只看有效 / 报告复核附录 /
                           排除清单持久化与坏文件容错 / 入库自动套用 / handler 与撤销 / 编号不平移
