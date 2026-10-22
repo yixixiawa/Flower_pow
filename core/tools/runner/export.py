@@ -77,7 +77,8 @@ class ExportMixin:
             size = p.stat().st_size if p.exists() else 0
             lines.append(f"  [{mark}] {p}（{size} 字节）")
         lines.append(
-            "  三种格式共用同一个文件名主干，反复导出不会堆出 _2/_3 副本。"
+            "  三种格式已收入同一文件夹（report_<日期>_<主域名>/），"
+            "共用同一个文件名主干，反复导出不会堆出 _2/_3 副本。"
             f"{'' if overwrite else '（本次 overwrite=false，同名时会另存新文件）'}"
         )
         if overwritten and overwrite:

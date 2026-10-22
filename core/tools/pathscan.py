@@ -68,9 +68,9 @@ _NOISE_EXACT = {
     "stat", "stdbuf", "stty", "sum", "sync", "tac", "tail", "tee", "test",
     "touch", "tr", "truncate", "tsort", "uname", "unexpand", "uniq", "unlink",
     "unset", "wc", "which", "whoami", "xargs", "yes", "base32", "base64",
-    "b2sum", "cksum", "sha256sum", "zstd", "lz4", "xz", "bzip2", "gzip",
+    "b2sum", "zstd", "lz4", "xz", "bzip2", "gzip",
     "git", "git-*", "less", "more", "nano", "vim", "vi", "diff", "cmp",
-    "hexdump", "xxd", "od", "strings", "objdump", "readelf", "nm",
+    "hexdump", "xxd", "strings", "objdump", "readelf", "nm",
     "bzip2recover", "lzfse", "lzop", "zstdcat",
 }
 

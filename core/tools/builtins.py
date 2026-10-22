@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from core.tools.consts import MAX_READ_LINES
+
 
 # ── 内置能力（纯 Python，包装本项目已有模块）─────────────────────────
 
@@ -123,6 +125,35 @@ BUILTINS: list[BuiltinTool] = [
                 },
             }
         ),
+    ),
+    BuiltinTool(
+        name="search_assets",
+        group="侦察",
+        desc=(
+            "从网络空间测绘平台搜索目标相关资产（IP/域名/URL/端口/标题）。"
+            "**不需要指定平台**——系统按已配置的凭据自动路由到 Quake/FOFA/"
+            "Hunter/ZoomEye 并合并去重。用来扩大攻击面：找主站之外的子域、"
+            "历史解析 IP、同 CDN 邻居、被遗忘的测试/后台系统。"
+            "检索词用平台语法效果最好（如 domain=\"example.com\"、"
+            "app=\"Apache-Tomcat\"），自然语言也会原样传给平台。"
+        ),
+        params=_obj(
+            {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "检索语句。推荐平台语法：domain=\"example.com\" / "
+                        "app=\"Apache-Tomcat\" / title=\"后台\"；"
+                        "也接受纯关键词。留空则用会话目标域名"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多返回并入库多少条（默认 50，上限 200）",
+                },
+            },
+        ),
+        heavy=True,
     ),
     BuiltinTool(
         name="recon_openapi",
@@ -409,9 +440,9 @@ BUILTINS: list[BuiltinTool] = [
             "把当前会话的发现导出为报告文件（Markdown / HTML / JSON）。"
             "**导出前先用 record_finding 登记所有手工验证的漏洞**，"
             "否则报告里只有自动探针登记的那几条。"
-            "默认**就地覆盖**同名文件（report_<日期>_<主域名>.md/html/json，"
-            "如 report_20261012_ftitle.studio.md），"
-            "所以反复导出不会堆出一串 _2/_3 副本；"
+            "三种格式收入**同一个文件夹** report_<日期>_<主域名>/"
+            "（如 output/report_20261012_ftitle.studio/report_20261012_ftitle.studio.md），"
+            "默认**就地覆盖**同名文件，所以反复导出不会堆出一串 _2/_3 副本；"
             "只想改其中一小段时，用 edit_file 就地改，不必整篇重导。"
         ),
         params=_obj(
@@ -452,14 +483,31 @@ BUILTINS: list[BuiltinTool] = [
         name="read_file",
         group="文件",
         desc=(
-            "读取产物目录里的文本文件（可带偏移，便于分段读长报告）。"
+            "读取产物目录里的文本文件。**两种模式**：\n"
+            "① 定位模式（推荐）：传 grep='关键字'，一次返回所有命中行 + 上下文，"
+            "**不要从头逐页翻**——找函数名/字段名/URL 用这个。\n"
+            "② 翻页模式：只传 start_line + max_lines 分段读（最后手段）。\n"
             "**只能读 output/ 之内**——凭据、配置、源码都在外面，读不到。"
         ),
         params=_obj(
             {
                 "path": {"type": "string", "description": "相对 output 的文件路径"},
-                "start_line": {"type": "integer", "description": "从第几行开始（1 起，默认 1）"},
-                "max_lines": {"type": "integer", "description": "最多读几行（默认全部，上限 400）"},
+                "grep": {
+                    "type": "string",
+                    "description": (
+                        "按内容定位（正则，忽略大小写）。**分析 JS/HTML/JSON 大文件时优先用这个**，"
+                        "例如 grep='postData' 直接找到函数体，不要 start_line 逐页翻。"
+                    ),
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "grep 命中行前后各显示几行（默认 3）",
+                },
+                "start_line": {"type": "integer", "description": "翻页模式：从第几行开始（1 起，默认 1）"},
+                "max_lines": {
+                    "type": "integer",
+                    "description": f"翻页模式：最多读几行（默认全部，上限 {MAX_READ_LINES}）",
+                },
             },
             ["path"],
         ),

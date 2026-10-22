@@ -240,7 +240,9 @@ class EvidenceMixin:
             out.append(
                 "  ⚠ 本条**没有原始响应报文**：报告 PoC 段只有请求，对方无法比对。"
                 "登记时把 http_request 返回的响应整段传给 response 参数"
-                "（未传时会尝试用最近一次同 URL 的响应，这次没匹配上）。"
+                "（未传时会尝试用最近一次同 URL 的响应，这次没匹配上；"
+                "如刚请求过，把 http_request 的**完整 URL**（含 query）"
+                "原样复制到 matched_at 再登记一次）。"
             )
         out += [
             f"  当前会话共 {len(session.result.findings)} 项发现。",

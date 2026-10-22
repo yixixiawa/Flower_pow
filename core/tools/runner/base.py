@@ -41,6 +41,11 @@ _HARD_TIMEOUT = 600         # 外部进程硬上限（秒）
 # "请求长得一样"（阈值 3 次，提示换参数），这边拦"响应毫无变化"
 # （阈值 5 次，提示换端点）——两边互补，不会重复拦截。
 ENDPOINT_SIGNAL_LIMIT = 5
+# 主机级兜底：同一 netloc 连续多少次拿到**逐字节相同**的响应信号。
+# 端点级按 path 计，模型每 5 次换一个 path 就能清零绕开；主机级把
+# "换 path 绕检测"也圈进来。阈值放到 15：同一主机 15 次响应完全一致
+# 不可能是正常渗透（真实扫描响应千差万别），只可能是无进展打转。
+HOST_SIGNAL_LIMIT = 15
 
 # http_request 工具结果里正文预览的字符上限。
 # 与 core/rawmsg.py 的 _RESULT_BODY_PREVIEW 是同一件事的两端：
@@ -66,18 +71,37 @@ _STATUS_MARKERS: dict[str, str] = {
 }
 
 
-def _looks_like_path(a: str) -> bool:
-    """判断一个取值像不像文件路径（而不是模板 id / 关键词）。
+def _classify_arg(a: str) -> str:
+    """把一个非选项参数归类为 ``target`` / ``path`` / ``other``。
 
-    ``nuclei -t`` 既要看单模板文件，也接受模板 id，两者只能靠形态区分。
+    以前这里是两个函数（``_looks_like_target`` 在 external.py、
+    ``_looks_like_path`` 在这里），判断标准有重叠、答案还不互斥——
+    ``http://x/y`` 两个都说是，读者要在两个文件之间跳才能理解
+    "这个值到底是什么"。合并成一处分界，调用点按结果分支。
+
+    判定顺序**刻意与旧 ``_validate_argv`` 的分支顺序一致**（先 target
+    后 path），所以行为逐字节不变：
+
+    * ``target`` —— 带 scheme 的 URL，或纯 IP/域名（含点、无路径分隔符与空格）；
+    * ``path``   —— 其余像文件路径的（路径前缀 / 盘符 / 含分隔符 / 已知扩展名）；
+    * ``other``  —— 模板 id、关键词之类的自由文本。
     """
     if not a:
-        return False
-    if a.startswith(("/", "\\", "./", "../", "~")) or re.match(r"^[A-Za-z]:[\\/]", a):
-        return True
-    if "\\" in a or "/" in a:
-        return True
-    return bool(_PATH_EXT_RE.search(a))
+        return "other"
+    if "://" in a:
+        return "target"
+    if "." in a and "/" not in a and "\\" not in a and " " not in a:
+        return "target"
+    if (
+        a.startswith(("/", "\\", "./", "../", "~"))
+        or re.match(r"^[A-Za-z]:[\\/]", a)
+        or "\\" in a
+        or "/" in a
+    ):
+        return "path"
+    if _PATH_EXT_RE.search(a):
+        return "path"
+    return "other"
 
 
 class ToolBlocked(Exception):
@@ -111,6 +135,9 @@ class _ToolRunnerBase:
         # 上一发的响应信号指纹 / 连击次数。信号变了连击就断。
         self._endpoint_signal: dict[str, str] = {}
         self._endpoint_streak: dict[str, int] = {}
+        # 主机级兜底（netloc）：拦"每 5 次换一个 path 绕端点检测"。
+        self._host_signal: dict[str, str] = {}
+        self._host_streak: dict[str, int] = {}
 
 
 
@@ -148,31 +175,46 @@ class _ToolRunnerBase:
             )
         return None
 
-    def _check_endpoint_signal(self, args: dict[str, Any], text: str) -> None:
-        """http_request 的「端点响应无变化」检测。命中直接 raise ToolBlocked。
+    def _response_signal(self, status_code: Any, body_size: Any, body_text: str) -> str:
+        """响应信号：状态码 + 正文大小 + 正文指纹。
 
-        以 ``urlparse(url).path``（不含 query）为 endpoint key，对返回文本
-        算 md5 作信号指纹：同端点指纹相同则连击 +1，不同则重置为 1。
-        连击到 ``ENDPOINT_SIGNAL_LIMIT`` 抛 :class:`ToolBlocked`——由
-        ``execute`` 里既有的 ``except ToolBlocked`` 转【已拦截】文本回灌。
-
-        与 agent.py 的指纹检测分工：那边拦"请求长得一样"（参数填充，
-        请求根本不发出），这边拦"端点怎么打都一个样"（请求照发、
-        拿到第 5 个相同响应才拦）。信号包含状态码与正文，响应但凡有
-        实质变化连击就断，不会误伤正常渗透。
+        **刻意不含 elapsed_ms**：耗时每次请求都不同，把它算进信号，
+        md5 永远不相同，"响应完全相同"的判定永远不成立（真实教训：
+        18 连发每次耗时都在 200~300ms 之间抖动，端点检测一次都没触发）。
+        body_text 用正文预览即可——同样的响应预览必然一致。
         """
-        url = str(args.get("url") or "")
-        if "://" not in url:
+        digest = hashlib.md5((body_text or "").encode("utf-8")).hexdigest()
+        return f"{status_code}|{body_size}|{digest}"
+
+    def _check_endpoint_signal(
+        self, url: str, status_code: Any, body_size: Any, body_text: str
+    ) -> None:
+        """http_request 的「响应无变化」检测。命中直接 raise ToolBlocked。
+
+        两级判定：
+
+        * **端点级**（``urlparse(url).path``）：同端点信号相同则连击 +1，
+          到 ``ENDPOINT_SIGNAL_LIMIT`` 拦——"这个路径怎么打都一个样"。
+        * **主机级**（``netloc``）：同主机信号相同则连击 +1，到
+          ``HOST_SIGNAL_LIMIT`` 拦——拦"每 5 次换一个 path 绕端点检测"。
+          阈值放宽到 15：15 次响应逐字节相同不可能是正常扫描。
+
+        拦完即清零：模型换手法回来再打，从 1 重新计。信号里但凡有实质
+        变化（状态码/正文大小/正文内容任一不同）连击就断，不误伤正常渗透。
+        """
+        if "://" not in (url or ""):
             return
-        endpoint = urlparse(url).path or "/"
-        sig = hashlib.md5(text.encode("utf-8")).hexdigest()
+        parts = urlparse(url)
+        endpoint = parts.path or "/"
+        host = parts.netloc or ""
+        sig = self._response_signal(status_code, body_size, body_text)
+
         if self._endpoint_signal.get(endpoint) == sig:
             self._endpoint_streak[endpoint] = self._endpoint_streak.get(endpoint, 1) + 1
         else:
             self._endpoint_signal[endpoint] = sig
             self._endpoint_streak[endpoint] = 1
         if self._endpoint_streak[endpoint] >= ENDPOINT_SIGNAL_LIMIT:
-            # 拦完即清零：模型换手法回来再打同一端点，从 1 重新计
             self._endpoint_signal.pop(endpoint, None)
             self._endpoint_streak.pop(endpoint, None)
             raise ToolBlocked(
@@ -182,6 +224,22 @@ class _ToolRunnerBase:
                 "（改路径、改 HTTP 方法、改 payload 结构），或基于已有证据直接给结论；"
                 "确实探不到就明确说「当前证据不足以判定」，不要编造。"
             )
+
+        if host:
+            if self._host_signal.get(host) == sig:
+                self._host_streak[host] = self._host_streak.get(host, 1) + 1
+            else:
+                self._host_signal[host] = sig
+                self._host_streak[host] = 1
+            if self._host_streak[host] >= HOST_SIGNAL_LIMIT:
+                self._host_signal.pop(host, None)
+                self._host_streak.pop(host, None)
+                raise ToolBlocked(
+                    f"主机 {host} 连续 {HOST_SIGNAL_LIMIT} 次响应信号完全相同"
+                    "（状态码/正文长度/正文均一致）——包括中途更换 path 的请求。"
+                    "这说明在该主机上的探测已经没有产出，继续打只是空转。"
+                    "必须换主机、换探测手法，或基于已有证据直接给结论。"
+                )
 
 
     # ── 入口 ──────────────────────────────────────────────────────
@@ -236,7 +294,7 @@ class _ToolRunnerBase:
                 # 不落盘——否则 read_file 读 spill 文件又被截断再 spill，无限派生垃圾文件。
                 text = text[:MAX_TOOL_OUTPUT] + (
                     f"\n…（结果过长已截断，共 {len(text)} 字符。"
-                    f"如是 read_file：用 start_line 翻页、max_lines 调小；"
+                    f"如是 read_file：用 grep=\"关键字\" 定位，或 start_line 翻页、max_lines 调小；"
                     f"其他工具：缩小范围重试。）"
                 )
         # 键名同时给 "tool" 与 "name"：前者是记录里本来的叫法，后者是
@@ -252,19 +310,6 @@ class _ToolRunnerBase:
                 "chars": len(text),
             }
         )
-
-        # 端点响应无变化检测（http_request 专用）：请求**真的发出去了**、
-        # 拿到第 5 个完全相同的响应才拦——这不是"不发"，是"叫停"。
-        # 异常就地转【已拦截】文本（与上面 except ToolBlocked 同一转换），
-        # 刚记的那条调用记录同步改成 blocked，/status 统计不失真。
-        if status == "ok" and name == "http_request":
-            try:
-                self._check_endpoint_signal(args, text)
-            except ToolBlocked as exc:
-                text = f"【已拦截】{exc}"
-                status = "blocked"
-                self.calls[-1]["status"] = status
-                self.calls[-1]["chars"] = len(text)
         return text
 
 
@@ -310,10 +355,12 @@ class _ToolRunnerBase:
         rel = f"{self._SPILL_DIR}/{path.name}"
         return (
             f"{head}\n…（结果过长已截断，共 {total} 字符。"
-            f"**完整输出已保存到 {rel}**——用 read_file 分段查看剩余部分："
-            f"read_file(path=\"{rel}\", start_line=起始行, max_lines=行数)。"
-            f"单行较长，max_lines 给 5 左右、配合 start_line 翻页即可。"
-            f"不要再用命令行输出选项（如 curl -w）碰运气，文件里什么都有。）"
+            f"**完整输出已保存到 {rel}**。\n"
+            f"⚠ **不要从头逐页通读**——先用 read_file(path=\"{rel}\", grep=\"你要找的函数名/关键字\") "
+            f"一次定位目标，再读命中行附近即可。例如分析 JS 时直接 "
+            f"read_file(path=\"{rel}\", grep=\"postData\")。\n"
+            f"确实需要通读时（极少）才用 start_line + max_lines 分段翻页。"
+            f"不要用命令行输出选项（如 curl -w）碰运气，文件里什么都有。）"
         )
 
 

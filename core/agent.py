@@ -98,7 +98,7 @@ def _refusal_text(name: str, args: dict[str, Any]) -> str:
         "本次不再发出请求。同一个请求打同一个目标，失败原因（如 WAF 拦截 418/403、"
         "目标无响应、路径不存在）不会因为重试第 N 次而改变——再试只会浪费额度，"
         "不会带来新信息。\n"
-        "你可以：① 换参数 / 换路径 / 换 HTTP 方法 / 换 User-Agent（这些都会正常执行）；"
+        "你可以：① 换参数 / 换路径 / 换 HTTP 方法（这些都会正常执行）；"
         "② 换一个工具换角度验证；③ 若已无新角度，基于已有信息直接给出结论，"
         "探不到就明确说「当前证据不足以判定」，不要编造。"
     )
@@ -122,7 +122,6 @@ class Agent:
         tools: list[dict[str, Any]],
         llm,
         probes: list | None = None,
-        max_steps: int | None = None,
         on_text: Callable[[str], None] | None = None,
         on_event: Callable[[str], None] | None = None,
     ) -> None:
@@ -132,9 +131,8 @@ class Agent:
         self.tools = tools
         self.llm = llm
         self.probes = probes or []
-        # 单轮工具调用次数**无上限**。``max_steps`` 仅保留为向后兼容的入参，
-        # 显式传值时按用户设定生效；默认 None = 不限制。
-        self.max_steps = max_steps
+        # 单轮工具调用次数**无上限**（文档与代码一致，不再有半死的
+        # max_steps 形参——"文档说已移除、代码里还留着"比没有更糟）。
         self.on_text = on_text or (lambda s: print(s, end="", flush=True))
         self.on_event = on_event or (lambda s: print(s))
         self.history: list[dict[str, Any]] = []
@@ -426,20 +424,11 @@ class Agent:
                         "明确说明「当前证据不足以判定」，不要编造。"
                     )
                 self.history.append({"role": "user", "content": hint})
-                # 不直接 return：给模型最后一次机会输出结论，
-                # 它要么给文本（正常结束），要么不再调工具。
-                self._call_fingerprints.clear()
-                self._skeletons.clear()
-                continue
-
-            # 仅当调用方**显式**指定了 max_steps 才生效；默认 None = 不限次数。
-            # 不设默认兜底：保守上限会打断真实的多轮任务，而额度是用户自己的账。
-            if self.max_steps is not None and step >= self.max_steps:
-                self.on_event(
-                    f"\n[!] 已达调用方设定的 max_steps={self.max_steps}，停止本轮。"
-                    f"如需继续请再发一条指令。"
-                )
-                return final
+            # 不直接 return：给模型最后一次机会输出结论，
+            # 它要么给文本（正常结束），要么不再调工具。
+            self._call_fingerprints.clear()
+            self._skeletons.clear()
+            continue
 
     # ── 上下文管理 ────────────────────────────────────────────────
 

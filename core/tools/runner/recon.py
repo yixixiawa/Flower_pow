@@ -34,6 +34,14 @@ class ReconMixin:
             return f"请求失败：{ev.error}"
         # 记下这次真实报文：模型随后登记手工发现时，报告 PoC 段才有响应可贴
         self._remember_exchange(ev)
+        # 响应无变化检测：**在拼装返回文本之前**，用结构化信号
+        # (status_code, body_size, body_hash) 判定——不能对完整返回文本
+        # 做 md5，那里面混着 elapsed_ms，每次请求耗时都不同，"完全相同"
+        # 永远不成立（真实教训：18 连发端点检测一次都没触发）。
+        # 命中抛 ToolBlocked，由 execute 既有的 except 转【已拦截】回灌。
+        self._check_endpoint_signal(
+            target, ev.status_code, ev.body_size, ev.body_excerpt or ""
+        )
         hdrs = "\n".join(
             f"  {k}: {v}"
             for k, v in list(ev.response_headers.items())

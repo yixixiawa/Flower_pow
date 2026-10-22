@@ -19,7 +19,7 @@ from typing import Any
 
 from core.tools.external import ExternalTool, all_external_tools
 from core.tools.probe import Probe
-from core.tools.runner.base import _FILE_FLAGS, _HARD_TIMEOUT, _NUMERIC_RE, _looks_like_path
+from core.tools.runner.base import _classify_arg, _FILE_FLAGS, _HARD_TIMEOUT, _NUMERIC_RE
 
 
 class ExternalMixin:
@@ -79,7 +79,7 @@ class ExternalMixin:
 
             # 非选项参数：可能是选项取值、文件路径，或扫描目标
             if flag_seen in _FILE_FLAGS:
-                if flag_seen == "-t" and not _looks_like_path(a):
+                if flag_seen == "-t" and _classify_arg(a) != "path":
                     # nuclei 的 -t 也接受模板 id（如 cve-2021-44228），不是路径
                     argv.append(a)
                     flag_seen = ""
@@ -101,9 +101,10 @@ class ExternalMixin:
                 flag_seen = ""
                 continue
 
-            if self._looks_like_target(a):
+            kind = _classify_arg(a)
+            if kind == "target":
                 scoped_targets.append(a)
-            elif _looks_like_path(a) and not self._path_inside_root(a):
+            elif kind == "path" and not self._path_inside_root(a):
                 # 无 shell 也不代表可以随便读文件：绝对路径（/etc/passwd、C:\...）
                 # 一律拒绝，避免被当成"某个选项忘了加白名单"的漏口。
                 return [], f"不允许引用项目目录之外的文件：{a}"
@@ -126,13 +127,6 @@ class ExternalMixin:
         except OSError:
             return False
         return inside and p.is_file()
-
-    @staticmethod
-    def _looks_like_target(a: str) -> bool:
-        if "://" in a:
-            return True
-        # 纯 IP / 域名：含点、不含路径分隔符或空格
-        return "." in a and "/" not in a and "\\" not in a and " " not in a
 
     def _build_argv(self, spec: ExternalTool, args: list[str]) -> tuple[list[str], str]:
         return self._validate_argv(spec, args)

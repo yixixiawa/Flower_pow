@@ -144,7 +144,10 @@ def main() -> int:
           f"实={out[:80]!r}")
     check("[覆盖]" not in out, "overwrite=false 不出现 [覆盖]")
     names = sorted(p.name for p in d3.iterdir())
-    check(any("_2." in n for n in names), "overwrite=false 产生了 _2 副本")
+    # 报告现在收入各自的文件夹（report_<日期>_<域名>/），_2 副本体现为
+    # 文件夹名带 _2 后缀，文件仍在各自文件夹内、同名。
+    check(any(n.endswith("_2") for n in names),
+          f"overwrite=false 产生了 _2 文件夹副本，实={names}")
 
     print("场景4 overwrite=false 时三格式主干一致（含错位场景）")
     # 错位场景：只导出 md（overwrite=false）→ _2.md；再导出 all，
@@ -158,14 +161,16 @@ def main() -> int:
     asyncio.run(r4.execute("export_report", {"fmt": "all", "overwrite": False}, s4))
     stems: dict[str, set[str]] = {}
     for p in d4.iterdir():
-        stems.setdefault(p.stem, set()).add(p.suffix)
+        if not p.is_dir():
+            continue
+        stems.setdefault(p.name, set()).update(q.suffix for q in p.iterdir())
     full = [s for s, exts in stems.items() if exts == {".json", ".md", ".html"}]
     check(len(full) >= 2, f"至少两组主干三格式齐全（实={sorted(stems)}）")
     lonely = [
         (s, exts) for s, exts in stems.items()
         if exts != {".json", ".md", ".html"} and s != full[0]
     ]
-    # 除了最初的整组和手动单导的 _2.md，不允许出现"半组"
+    # 除了最初的整组和手动单导的 _2 组，不允许出现"半组"
     semi = [s for s, exts in lonely if exts & {".json", ".html"}]
     check(not semi, f"没有 json/html 落单的错位主干（实={semi}）")
 
@@ -178,7 +183,7 @@ def main() -> int:
         asyncio.run(r5.execute("export_report", {"fmt": "all"}, s5))
     heads = [n for n in s5.result.notes if "交互式会话" in n]
     check(len(heads) == 1, f"导出 3 次后会话头只有 1 条（实={len(heads)}）")
-    md = next(d5.glob("*.md")).read_text(encoding="utf-8")
+    md = next(d5.glob("*/*.md")).read_text(encoding="utf-8")
     check("\x00" not in md, "报告里没有哨兵字符")
     check("交互式会话" in md, "会话头出现在报告的[执行说明]里")
     check("重复" not in md.split("执行说明")[-1] or "重复 1 次" not in md,

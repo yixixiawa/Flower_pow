@@ -178,8 +178,8 @@ async def main() -> int:
     print("\n场景6 单轮无次数上限")
     check(not hasattr(__import__("core.agent", fromlist=["x"]), "HARD_STEP_CAP"),
           "HARD_STEP_CAP 常量已彻底移除")
-    check(inspect.signature(Agent.__init__).parameters["max_steps"].default is None,
-          "max_steps 默认为 None（不限制）")
+    check("max_steps" not in inspect.signature(Agent.__init__).parameters,
+          "max_steps 形参已移除（文档说没有，代码就不该留半死参数）")
     # 260 次调用（远超旧上限 200）必须能跑完
     script = [[txt(f"步骤 {i}"), tc("http_probe", '{"url":"http://t/%d"}' % i, f"c{i}")]
               for i in range(260)]
