@@ -1109,20 +1109,25 @@ $ python flower_pow.py proxy --target http://192.168.10.128:8899/
   决策               : 走代理 http://127.0.0.1:54426
 ```
 
-**默认语义：所有目标都走代理——包括内网与本机。**
+**默认语义：所有目标都走代理——包括内网与本机，且不越权替 Clash 做分流。**
 
 | 目标类型 | 走不走代理 | 为什么 |
 | --- | --- | --- |
 | 公网域名 | ✅ 走 | 这正是 Burp/Clash 要拦的流量 |
-| 内网 IP（`10.` / `172.16-31.` / `192.168.`） | ✅ 走 | **默认也走**——挂了代理就是想看全部流量，内网也不例外 |
+| 内网 IP（`10.` / `172.16-31.` / `192.168.`） | ✅ 走 | **不拦截**——隐藏与路由交给 Clash 节点决定 |
 | 回环 / `localhost` / `*.local` / `*.internal` | ✅ 走 | 同上 |
 | 端口扫描 | ✅ 走 | 经 SOCKS5 / HTTP CONNECT 隧道转发（见下） |
 
-> **为什么改成"内网也走"？** 旧版把"内网一律直连"写死成硬规则，
-> 结果挂了 Clash mixed 端口也抓不到内网流量——代理等于白挂，
-> Burp 里空空如也。现在直连只由两个**显式**开关决定：
-> `scan.proxy_local_direct`（内网直连）与 `scan.no_proxy`（例外表）。
-> 想要旧行为，把 `proxy_local_direct` 打开即可。
+> **为什么"内网也走"、并且不替 Clash 做分流决策？**
+> 旧版把"内网一律直连"写死成硬规则，结果挂了 Clash mixed 端口也抓不到
+> 内网流量——真实 IP 直接暴露给目标方，代理等于白挂。
+> 现在本机代码只负责"把请求送进代理"，**怎么出网由 Clash 节点决定**。
+>
+> **Windows 的 `ProxyOverride` 分流表也被丢弃了。** 那张表塞满内网 IP
+> （`10.*;172.16.*;192.168.*;<local>`），是给**浏览器/系统应用**用的规则；
+> 拿它当"直连例外"会让扫描内网目标时静默直连、真实 IP 暴露——
+> 恰恰是要消灭的行为。唯一的直连出口是 `scan.no_proxy`——
+> **你自己写进配置的显式声明**，属于有意为之而非副作用。
 
 **端口扫描怎么走代理？** 端口扫描是裸 TCP（`asyncio.open_connection`），
 HTTP 代理只转发 HTTP 语义的请求——**但 SOCKS5 的 CONNECT 命令可以，
@@ -1140,11 +1145,15 @@ SOCKS5 客户端（不依赖 `socksio`），按顺序尝试：
 **配置**（`config.yaml` 的 `scan` 段）：
 
 ```yaml
-proxy: null                # 显式指定，如 http://127.0.0.1:7897
-no_proxy: []               # 直连例外（唯一显式出口）：域名后缀 / CIDR / 192.168.* 通配
-proxy_local_direct: false  # true = 内网/本机强制直连（恢复旧行为）
-proxy_autodetect: true     # 自动探测；false 时只认 proxy 字段（回到旧版行为）
+proxy: null                # 显式指定，如 http://127.0.0.1:7897；留空则自动探测
+no_proxy: []               # 唯一直连出口（你自己写）：域名后缀 / CIDR / 192.168.* 通配
+proxy_autodetect: true     # 自动探测（环境变量 > Windows 系统代理）；false 时只认 proxy 字段
 ```
+
+`proxy` 留空 + `proxy_autodetect: true` = 完全交给系统：
+自动读取 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量，
+读不到再读 Windows 注册表的 `ProxyEnable` / `ProxyServer`——
+也就是 Clash 配好就不用管，本机自动接上。
 
 优先级：**显式配置 > 环境变量 > 系统代理**。你在 `config.yaml` 或
 `POCS_PROXY` 里写死的东西永远最高——它代表"我就是要走这个"，不做自动化覆盖。
@@ -1851,7 +1860,6 @@ POCS_DATA_DIR=./data
 # 代理（详见 §4.6）
 # POCS_PROXY=http://127.0.0.1:8080   # 显式指定：优先级最高，不再自动探测
 # POCS_NO_PROXY=corp.internal,10.0.0.0/8   # 直连名单（逗号或分号分隔）
-POCS_PROXY_LOCAL_DIRECT=false       # true = 内网/本机强制直连（默认全部走代理）
 POCS_PROXY_AUTODETECT=true         # 未显式配置时，自动探测本机代理
 
 # 公开性核验（详见 §4.1.4）：命中漏洞后回源站根目录取证，

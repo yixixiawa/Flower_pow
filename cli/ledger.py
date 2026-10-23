@@ -280,11 +280,7 @@ def proxy(
         console.print(f"  [dim]注：{n}[/dim]")
     if sc.no_proxy:
         console.print(f"  直连例外（配置）    : {', '.join(sc.no_proxy)}")
-    console.print(
-        "  内网/本机直连       : "
-        + ("是（proxy_local_direct）" if getattr(sc, "proxy_local_direct", False)
-           else "否（默认全部走代理）")
-    )
+    console.print("  内网/本机          : 同样走代理（不拦截）")
 
     if not info.found and not sc.proxy:
         console.print(
@@ -312,10 +308,8 @@ def proxy(
             # 直连的理由要说清，否则用户会误判"代理没生效"
             if in_no_proxy:
                 why = "命中直连例外 scan.no_proxy"
-            elif not (getattr(sc, "proxy", None) or "").strip():
-                why = "本机未检测到代理"
             else:
-                why = "内网/本机目标且开启了 proxy_local_direct"
+                why = "本机未检测到代理"
             console.print(f"  决策               : [cyan]直连[/cyan]（{why}）")
         console.print(
             "[dim]注：端口扫描优先走 SOCKS5 / HTTP CONNECT 隧道，"

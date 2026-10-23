@@ -40,11 +40,10 @@ scan:
   verify_tls: false          # 靶场/自建证书常为自签
   proxy: null                # 如 http://127.0.0.1:8080
   # 直连例外表：命中的主机不走 proxy（支持域名后缀 / CIDR / 192.168.* 通配）。
-  # 唯一的显式例外出口——无论下面那个开关怎么设都生效。
+  # 唯一的直连出口——你自己写进来的声明。
+  # （Windows 注册表的 ProxyOverride 分流表已被忽略：那是浏览器的规则，
+  #   拿它当例外表会让扫描内网目标时静默直连、真实 IP 暴露。）
   no_proxy: []
-  # 内网/本机目标是否强制直连。默认 false = 全部目标都走代理
-  #（挂了 Burp/Clash 就该看到所有流量，包括内网目标）。
-  proxy_local_direct: false
   # 自动探测本机代理（HTTP_PROXY 环境变量 / Windows 系统代理）：
   # 探测到就默认走代理——这解决"挂了 Burp/Clash 却看不到扫描流量"。
   # 端口扫描经 SOCKS5 / HTTP CONNECT 隧道转发，不支持时自动降级直连。
@@ -151,11 +150,8 @@ POCS_CONCURRENCY=8
 # 探测到就默认走代理——默认**所有目标都走代理**（内网/本机也不例外）。
 # POCS_PROXY=http://127.0.0.1:8080
 # "直连例外"表（逗号分隔，支持域名后缀 / CIDR / 192.168.* 通配）。
-# 无论下面那个开关怎么设都生效。
+# 唯一的直连出口——你自己写进来的声明。
 # POCS_NO_PROXY=internal.corp.com,10.0.0.0/8
-# 内网/本机目标是否强制直连。默认 false = 全部走代理；
-# 置 true 可恢复"内网直连"的旧行为。
-POCS_PROXY_LOCAL_DIRECT=false
 # 关掉自动探测（=false 时只认 POCS_PROXY，行为回到旧版）。
 POCS_PROXY_AUTODETECT=true
 # 自动"公开性核验"：命中漏洞后回源站根目录取证，判定为站点自己公开的资源

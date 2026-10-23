@@ -190,7 +190,7 @@ class Detector(ABC):
         if self._client is None:
             # 代理决策统一收敛到 core/proxy.py：显式配置 > 自动探测到的代理。
             # 默认**全部目标都走代理**（内网也走），这样挂了 Burp/Clash
-            # 就能看到全部流量；要让内网直连就开 scan.proxy_local_direct。
+            # 就能看到全部流量——内网/本机也不拦截。
             self._client = httpx.AsyncClient(
                 **build_client_kwargs(self.cfg, url or self._client_url_hint)
             )

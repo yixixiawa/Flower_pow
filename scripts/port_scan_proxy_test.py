@@ -35,7 +35,7 @@ from core.tunnel import (  # noqa: E402
 class _Cfg:
     """最小 ScanConfig 替身。"""
 
-    def __init__(self, proxy=None, no_proxy=None, local_direct=False):
+    def __init__(self, proxy=None, no_proxy=None):
         self.timeout = 5.0
         self.verify_tls = False
         self.follow_redirects = True
@@ -43,7 +43,6 @@ class _Cfg:
         self.proxy = proxy
         self.no_proxy = list(no_proxy or [])
         self.proxy_autodetect = True
-        self.proxy_local_direct = local_direct
 
 
 # ── 本地假服务器 ──────────────────────────────────────────────────────

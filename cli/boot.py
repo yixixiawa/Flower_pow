@@ -177,11 +177,7 @@ def _print_proxy_notice(cfg: Config) -> None:
     if not sc.proxy:
         return
     source = "配置指定" if not sc.proxy_autodetect else "自动探测"
-    tail = (
-        "内网/本机目标直连（proxy_local_direct）"
-        if getattr(sc, "proxy_local_direct", False)
-        else "全部目标走代理，端口扫描经 SOCKS5/CONNECT 隧道"
-    )
+    tail = "全部目标走代理（含内网/本机），端口扫描经 SOCKS5/CONNECT 隧道"
     console.print(f"[dim]代理：{sc.proxy}（{source}）· {tail}[/dim]")
 
 

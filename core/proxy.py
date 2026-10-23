@@ -8,28 +8,32 @@
   ——常是上一层工具链（Burp、mitmproxy、公司网关）注入的拦截口，
   所有 HTTP(S) 流量都要经过它才能被看见/篡改。
 * **Windows 系统代理**（注册表 ``Internet Settings``）
-  ——常是 Clash / v2ray 这类分流工具的入口，自带 ``ProxyOverride`` 分流表。
+  ——常是 Clash / v2ray 这类分流工具的入口。
 
 业务上的真实需求是：**"我挂了代理，扫描流量就该走代理，
 不然 Burp 里什么也看不到、Clash 的分流也白配了"**。
 
-因此本模块的默认行为是**流量全部走代理——包括内网与本机目标**。
-历史上这里写死过"内网目标一律直连"，理由是怕把内网拓扑泄露给第三方代理；
-但那条规则与用户的真实诉求直接冲突（挂了 Clash mixed 端口就想抓内网流量，
-结果一条都没进代理，Burp 里空空如也）。现在改成**默认走代理 + 显式开关**：
+因此本模块的默认行为是**流量全部走代理——包括内网与本机目标**，
+且**不越权替 Clash 做分流决策**：
 
-* ``scan.proxy_local_direct: true`` → 恢复旧行为（内网/本机直连）。
-* ``scan.no_proxy`` → 始终生效的直连例外表（无论开关怎么设）。
+* **不做内网拦截。** 只要配了代理就无脑走。流量的隐藏与路由交给
+  Clash 节点（真正的分流决策在那儿），本机代码只负责"把请求送进代理"。
+* **丢弃 Windows 的 ``ProxyOverride`` 分流表。** 那张表塞满内网 IP
+  （``10.*;172.16.*;192.168.*;<local>``），是给浏览器/系统应用用的规则；
+  拿它当"直连例外"会让扫描内网目标时静默直连、真实 IP 直接暴露。
+  详见 :func:`_read_system_windows`。
+* **唯一保留的直连出口是 ``scan.no_proxy``**——用户自己写进配置的
+  显式声明，属于有意为之，不是副作用。
 
 两个坑仍然存在，但都已有对策：
 
 1. **代理本身可能不支持目标网段。** 内网目标发给公网代理会全部 502——
    这是代理侧的能力问题，不是本模块能兜住的；开了代理却全 502 时，
    用 ``scan.no_proxy`` 把内网网段加进例外表即可。
-2. **端口扫描需要 SOCKS5 才能转发任意 TCP。** HTTP 代理只转发 HTTP 语义的
-   请求；``collectors/port_scan.py`` 改用 **SOCKS5 CONNECT** 隧道
-   （Clash mixed 端口同时支持 HTTP 与 SOCKS5，正好够用），
-   代理不认 SOCKS5 时自动回落直连。
+2. **端口扫描需要 SOCKS5 / CONNECT 隧道。** HTTP 代理只转发 HTTP 语义的
+   请求，不转发任意 TCP；``collectors/port_scan.py`` 因此走
+   **SOCKS5 CONNECT / HTTP CONNECT 隧道**（Clash mixed 端口两种都支持），
+   代理不认隧道时自动回落直连。
 
 设计取舍
 --------
@@ -37,8 +41,7 @@
   用户在 ``config.yaml`` / ``POCS_PROXY`` 里写死的东西永远最高，
   它代表"我就是要走这个"，不做任何自动化判断覆盖它。
 * **探测到代理 = 对所有目标都走代理。** 落到具体请求时用
-  :func:`resolve_proxy_for` 按主机再判一次，唯一的例外是
-  ``no_proxy`` 表与 ``proxy_local_direct`` 开关。
+  :func:`resolve_proxy_for`，唯一可能直连的是 ``scan.no_proxy``。
 * **探测过程绝不发网络请求。** 只读环境变量与注册表——
   在只读模式（``readonly=true``）下也必须能安全运行。
 """
@@ -231,6 +234,47 @@ def _read_env() -> tuple[str, str, list[str], dict[str, str]]:
     return "", "", no_proxy, raw
 
 
+def _parse_system_proxy(raw: dict[str, str]) -> tuple[str, list[str]]:
+    """解析 Windows 系统代理的注册表取值 → ``(代理 URL, 直连例外表)``。
+
+    抽成纯函数（不碰注册表）是为了能直接测"ProxyOverride 被丢弃"这条规则。
+
+    **Windows 的 ProxyOverride 分流表在这里被直接丢弃。**
+    为什么：Windows 开启系统代理（Clash / v2ray）时，注册表里的
+    ProxyOverride 会塞满内网 IP（``<local>;10.*;172.16.*;192.168.*;...``），
+    那是给"浏览器/系统应用"用的分流规则——但我们的诉求恰恰相反：
+    **要把全部流量（含内网）交给 Clash 节点出去**，由 Clash 自己决定
+    怎么分流，本机代码不越权替它做决定。
+
+    一旦把 ProxyOverride 并进 no_proxy，扫描内网目标就会静默直连，
+    真实 IP 直接暴露——这正是这套方案要消灭的行为。
+
+    代价：不再尊重 Windows 自己的分流约定。用户若确实需要某些主机
+    直连，用 ``scan.no_proxy`` 显式声明（那是有意为之，不是副作用）。
+    """
+    enabled = raw.get("ProxyEnable", "")
+    if enabled not in ("1", "True", "true"):
+        # 系统代理没开。AutoConfigURL(PAC) 无法可靠解析——
+        # 调用方会记一条 note，而不是假装没有代理。
+        return "", []
+
+    server = raw.get("ProxyServer", "")
+    # ProxyServer 可能是 ``host:port`` 或 ``http=x;https=y`` 形式
+    proxy_url = ""
+    if "=" in server:
+        parts = dict(
+            p.split("=", 1) for p in server.split(";") if "=" in p
+        )
+        proxy_url = (
+            parts.get("https") or parts.get("http") or next(iter(parts.values()), "")
+        )
+    else:
+        proxy_url = server
+
+    # ← ProxyOverride 在此被丢弃，返回空的例外表
+    return normalize_proxy(proxy_url), []
+
+
 def _read_system_windows() -> tuple[str, list[str], dict[str, str]]:
     """读 Windows 系统代理（注册表）。非 Windows 或读取失败返回空。"""
     if os.name != "nt":
@@ -248,9 +292,6 @@ def _read_system_windows() -> tuple[str, list[str], dict[str, str]]:
         return "", [], {}
 
     raw: dict[str, str] = {}
-    enabled = ""
-    server = ""
-    override = ""
     try:
         for name in ("ProxyEnable", "ProxyServer", "ProxyOverride", "AutoConfigURL"):
             try:
@@ -258,34 +299,14 @@ def _read_system_windows() -> tuple[str, list[str], dict[str, str]]:
                 raw[name] = str(val)
             except FileNotFoundError:
                 continue
-        enabled = raw.get("ProxyEnable", "")
-        server = raw.get("ProxyServer", "")
-        override = raw.get("ProxyOverride", "")
     finally:
         try:
             winreg.CloseKey(key)
         except OSError:
             pass
 
-    if enabled not in ("1", "True", "true"):
-        # 系统代理没开。但 AutoConfigURL(PAC) 存在时无法可靠解析——
-        # 明确记一条 note，而不是假装没有代理。
-        return "", [], raw
-
-    # ProxyServer 可能是 ``host:port`` 或 ``http=x;https=y`` 形式
-    proxy_url = ""
-    if "=" in server:
-        parts = dict(
-            p.split("=", 1) for p in server.split(";") if "=" in p
-        )
-        proxy_url = (
-            parts.get("https") or parts.get("http") or next(iter(parts.values()), "")
-        )
-    else:
-        proxy_url = server
-
-    no_proxy = [x for x in override.split(";") if x.strip()]
-    return normalize_proxy(proxy_url), no_proxy, raw
+    proxy_url, no_proxy = _parse_system_proxy(raw)
+    return proxy_url, no_proxy, raw
 
 
 def detect_proxy(*, use_system: bool = True) -> ProxyInfo:
@@ -322,7 +343,7 @@ def detect_proxy(*, use_system: bool = True) -> ProxyInfo:
         info.no_proxy = sys_no
         info.notes.append(
             f"Windows 系统代理 {sys_proxy} 已启用；"
-            f"系统分流表 {len(sys_no)} 条已并入直连例外"
+            "注册表 ProxyOverride 分流表已忽略（全部流量交给 Clash 节点分流）"
         )
         return info
 
@@ -370,29 +391,28 @@ def resolve_proxy_for(cfg, host: str, *, force: bool = False) -> str | None:
     本函数回答"**这次请求**要不要用它"。规则：
 
     1. 没配代理 → 直连。
-    2. ``force=True``（用户显式 ``--proxy`` 或配置强制）→ 一律走。
-    3. 主机命中 ``no_proxy`` 例外表 → 直连（这是唯一的显式例外出口）。
-    4. 主机是本机/内网（:func:`is_local_host`）且
-       ``scan.proxy_local_direct=true`` → 直连（默认**不**直连）。
-    5. 其余 → 走配置里的代理。
+    2. 其余 → **一律走代理**。
 
-    **默认所有目标（含内网/本机）都走代理**——这是用户挂代理的初衷：
-    内网流量也要能在 Burp / Clash 里被看见。要恢复"内网直连"的旧行为，
-    把 ``scan.proxy_local_direct`` 打开即可。
+    **不做内网拦截。** 只要配了代理就无脑走——流量的隐藏与分流
+    交给 Clash 节点去做，本机代码不越权替它决定：
+
+    * 旧逻辑里的 ``is_local_host(host) → 直连`` 会让扫描内网目标时
+      真实 IP 直接暴露给目标方，正是这套方案要消灭的行为。
+    * Windows 系统代理自带的 ``ProxyOverride`` 分流表也已在
+      :func:`_read_system_windows` 里丢弃（那是浏览器的规则，
+      不是我们"要不要走代理"的规则）。
+
+    唯一保留的直连出口是 ``scan.no_proxy``——**用户自己写进配置**的
+    显式声明，属于有意为之，不是副作用。
 
     返回 ``None`` 表示直连；返回 URL 表示该用这个代理。
     """
     proxy = normalize_proxy(getattr(cfg, "proxy", None) or "")
     if not proxy:
         return None
-    if force:
-        return proxy
+    # 用户显式声明的直连例外（scan.no_proxy）——这是有意的选择
     no_proxy = getattr(cfg, "no_proxy", None) or []
     if (host or "").strip() and _match_no_proxy(host, list(no_proxy)):
-        return None
-    # 内网/本机直连是可选项，不是默认。默认走代理——
-    # 否则挂了 Clash mixed 端口也抓不到内网流量，代理就白挂了。
-    if getattr(cfg, "proxy_local_direct", False) and is_local_host(host):
         return None
     return proxy
 

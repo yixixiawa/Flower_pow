@@ -3,10 +3,12 @@
 这块最怕两件事，测试就围绕它们展开：
 
 1. **"我挂了代理却看不到流量"** —— 探测不到、或探测到了但没回填配置。
-2. **"内网目标被送去公网代理"** —— 比第 1 条严重得多，可能泄露内网拓扑。
+2. **"内网目标被静默直连"** —— 真实 IP 直接暴露给目标方，代理等于白挂。
 
 第 2 条是设计的核心取舍，所以占用最多断言：本机 / 回环 / 三个私网段 /
-链路本地 / 内网后缀，**一个都不能走代理**。
+链路本地 / 内网后缀，**只要配了代理就必须走代理**（不替 Clash 做分流）。
+另外 Windows 的 ``ProxyOverride`` 分流表必须被丢弃——那是浏览器的规则，
+拿它当例外表会让内网目标静默直连。
 
 网络无关：探测只读环境变量与注册表，测试用 monkeypatch 造环境，不真连网。
 
@@ -24,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.proxy import (  # noqa: E402
     ProxyInfo,
+    _parse_system_proxy,
     build_client_kwargs,
     detect_and_apply,
     detect_proxy,
@@ -42,7 +45,7 @@ _PROXY_KEYS = (
 class _Cfg:
     """最小 ScanConfig 替身。"""
 
-    def __init__(self, proxy=None, no_proxy=None, autodetect=True, local_direct=False):
+    def __init__(self, proxy=None, no_proxy=None, autodetect=True):
         self.timeout = 5.0
         self.verify_tls = False
         self.follow_redirects = True
@@ -50,7 +53,6 @@ class _Cfg:
         self.proxy = proxy
         self.no_proxy = list(no_proxy or [])
         self.proxy_autodetect = autodetect
-        self.proxy_local_direct = local_direct
 
 
 def _has_socksio() -> bool:
@@ -106,8 +108,8 @@ def main() -> int:
     check(normalize_proxy("ftp://x:21") == "", "未知 scheme 不当代理")
     check(normalize_proxy("://bad") == "", "畸形串 → 空")
 
-    # ── 场景2 is_local_host（核心：内网绝不走代理）────────────────
-    print("场景2 is_local_host：内网/本机识别（决定了谁不许走代理）")
+    # ── 场景2 is_local_host（保留为工具函数，不再用于拦截决策）──────
+    print("场景2 is_local_host：内网/本机识别（仅作识别，不再拦截）")
     for h in ("localhost", "LOCALHOST", "api.localhost", "127.0.0.1", "127.1.2.3",
               "::1", "192.168.10.128", "10.0.0.5", "172.16.3.9", "172.31.255.1",
               "169.254.1.1", "a.internal", "x.local", "y.lan", "z.intranet",
@@ -146,6 +148,37 @@ def main() -> int:
         check(info.no_proxy == ["a.com", " b.com ", "", "c.com"] or
               all(x.strip() for x in info.no_proxy if x), "NO_PROXY 解析为列表")
         check(len([x for x in info.no_proxy if x.strip()]) == 3, "空项被忽略（3 条有效）")
+
+    print("场景3e Windows ProxyOverride 分流表被丢弃（关键规则）")
+    # Clash 开启系统代理后，注册表 ProxyOverride 塞满内网 IP。
+    # 拿它当"直连例外"会让扫描内网目标时静默直连、真实 IP 暴露。
+    override_blob = "<local>;10.*;172.16.*;192.168.*;*.internal;localhost"
+    raw_on = {
+        "ProxyEnable": "1",
+        "ProxyServer": "127.0.0.1:7897",
+        "ProxyOverride": override_blob,
+    }
+    p_url, p_no = _parse_system_proxy(raw_on)
+    check(p_url == "http://127.0.0.1:7897", "提取到代理地址")
+    check(p_no == [], "ProxyOverride 例外表被丢弃（不并进 no_proxy）")
+    check(len(p_no) == 0, "例外表为空——内网不会被静默直连")
+
+    print("场景3e-2 ProxyServer 的多协议形式也能解析")
+    raw_multi = {
+        "ProxyEnable": "1",
+        "ProxyServer": "http=127.0.0.1:7897;https=127.0.0.1:7897",
+        "ProxyOverride": override_blob,
+    }
+    p_url2, p_no2 = _parse_system_proxy(raw_multi)
+    check(p_url2 == "http://127.0.0.1:7897", "http=x;https=y 形式解析正确")
+    check(p_no2 == [], "多协议形式下例外表同样被丢弃")
+
+    print("场景3e-3 系统代理没开 → 提取不到代理")
+    p_off, p_no3 = _parse_system_proxy({
+        "ProxyEnable": "0", "ProxyServer": "127.0.0.1:7897",
+        "ProxyOverride": override_blob,
+    })
+    check(p_off == "" and p_no3 == [], "ProxyEnable=0 → 无代理")
 
     print("场景3d 无任何代理 → found=False，且不发网络请求")
     with _Env():
@@ -198,18 +231,17 @@ def main() -> int:
     check(resolve_proxy_for(cfg2, "192.168.5.5") is None, "通配前缀命中直连")
     check(resolve_proxy_for(cfg2, "other.com") == "http://p:1", "不在例外表 → 走代理")
 
-    print("场景5e proxy_local_direct=true 恢复内网直连旧行为")
-    cfg3 = _Cfg(proxy="http://127.0.0.1:8080", local_direct=True)
-    check(resolve_proxy_for(cfg3, "192.168.10.128") is None, "内网 IP 直连")
-    check(resolve_proxy_for(cfg3, "127.0.0.1") is None, "回环直连")
-    check(resolve_proxy_for(cfg3, "a.internal") is None, "内网后缀直连")
-    check(resolve_proxy_for(cfg3, "example.com") == "http://127.0.0.1:8080", "公网仍走代理")
-    check(resolve_proxy_for(cfg3, "10.1.2.3", force=True) == "http://127.0.0.1:8080",
-          "force 覆盖内网直连")
+    print("场景5e 内网一律不拦截：只配了代理就统统走")
+    cfg3 = _Cfg(proxy="http://127.0.0.1:8080")
+    for h in ("192.168.10.128", "127.0.0.1", "10.1.2.3", "172.16.5.5",
+              "a.internal", "localhost", "169.254.1.1"):
+        check(resolve_proxy_for(cfg3, h) == "http://127.0.0.1:8080",
+              f"{h} 也走代理（不越权替 Clash 分流）")
 
-    print("场景5f no_proxy 在 proxy_local_direct=false 时也生效（更严格）")
+    print("场景5f no_proxy 仍是唯一的直连出口（用户自己写的声明）")
     cfg4 = _Cfg(proxy="http://p:1", no_proxy=["10.0.0.0/8"])
     check(resolve_proxy_for(cfg4, "10.9.9.9") is None, "例外表优先于默认走代理")
+    check(resolve_proxy_for(cfg4, "192.168.1.1") == "http://p:1", "不在例外表 → 走代理")
 
     # ── 场景6 build_client_kwargs：httpx 参数 ─────────────────────
     print("场景6 build_client_kwargs：httpx 客户端参数正确")
