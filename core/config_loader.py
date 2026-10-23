@@ -47,8 +47,13 @@ class ScanConfig(BaseModel):
     verify_tls: bool = Field(default=False)
     proxy: str | None = Field(default=None)
     # 代理例外表：命中的主机会**直连**，不走 proxy。
-    # 内网/本机已由 core/proxy.py 自动直连，这里补充"我想额外直连的域名"。
+    # 这是唯一的显式例外出口（无论 proxy_local_direct 怎么设都生效）。
     no_proxy: list[str] = Field(default_factory=list)
+    # 内网/本机目标是否强制直连。
+    # 默认 false = **全部目标都走代理**（挂了 Burp/Clash 就该看到所有流量，
+    # 包括内网目标——这才是挂代理的初衷）。
+    # 打开则恢复旧行为：内网/本机直连，不经代理。
+    proxy_local_direct: bool = Field(default=False)
     # 是否自动探测本机代理（环境变量 / Windows 系统代理）。
     # 探测到就默认走代理——这是"挂了代理却看不到流量"的解药。
     # 关掉则只认 proxy 字段，行为回到旧版。
@@ -389,6 +394,7 @@ def load_config(path: str | Path | None = None) -> Config:
     s.concurrency = _env_int("POCS_CONCURRENCY", s.concurrency)
     s.proxy = _env_str("POCS_PROXY", s.proxy or "") or None
     s.no_proxy = _env_list("POCS_NO_PROXY", s.no_proxy)
+    s.proxy_local_direct = _env_bool("POCS_PROXY_LOCAL_DIRECT", s.proxy_local_direct)
     s.proxy_autodetect = _env_bool("POCS_PROXY_AUTODETECT", s.proxy_autodetect)
     s.auto_dismiss_public = _env_bool("POCS_AUTO_DISMISS_PUBLIC", s.auto_dismiss_public)
     s.fs_ops_enabled = _env_bool("POCS_FS_OPS", s.fs_ops_enabled)

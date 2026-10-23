@@ -1073,7 +1073,7 @@ chunk 先下（`monitor-api-390a46d5.js` 正是这一类），vendor / echarts /
 > 是否未鉴权、是否越权，要由 `js_audit` 逐条发一次免凭证 GET 才知道
 > （`js_logic_probe_api`，默认开）。
 
-### 4.6 本机代理：有代理就走代理，但内网永远直连
+### 4.6 本机代理：有代理就走代理（内网也走，端口扫描也走）
 
 渗透测试机上通常**同时**挂着两套代理，而它们的用途不同：
 
@@ -1106,29 +1106,43 @@ $ python flower_pow.py proxy --target https://example.com/
   决策               : 走代理 http://127.0.0.1:54426
 
 $ python flower_pow.py proxy --target http://192.168.10.128:8899/
-  决策               : 直连（内网/本机目标，强制直连以防内网流量外泄）
-注：端口扫描走裸 TCP，HTTP 代理无法转发，始终直连。
+  决策               : 走代理 http://127.0.0.1:54426
 ```
 
-**但"有代理"不等于"所有目标都走代理"**，这是本功能最重要的一条约束：
+**默认语义：所有目标都走代理——包括内网与本机。**
 
 | 目标类型 | 走不走代理 | 为什么 |
 | --- | --- | --- |
 | 公网域名 | ✅ 走 | 这正是 Burp/Clash 要拦的流量 |
-| 内网 IP（`10.` / `172.16-31.` / `192.168.`） | ❌ 直连 | **防内网拓扑泄露给第三方代理**；且代理多半回不来内网，表现为全 502 |
-| 回环 / `localhost` / `*.local` / `*.internal` | ❌ 直连 | 同上 |
-| 端口扫描 | ❌ 直连 | 裸 TCP 无法经 HTTP 代理转发 |
+| 内网 IP（`10.` / `172.16-31.` / `192.168.`） | ✅ 走 | **默认也走**——挂了代理就是想看全部流量，内网也不例外 |
+| 回环 / `localhost` / `*.local` / `*.internal` | ✅ 走 | 同上 |
+| 端口扫描 | ✅ 走 | 经 SOCKS5 / HTTP CONNECT 隧道转发（见下） |
 
-> **为什么内网必须直连？** 被测目标常是**物理机网口 IP**（`192.168.x.x`）。
-> 把这类请求送给公网代理，轻则全部 502，重则把内网存活情况告诉了代理方。
-> Windows 系统代理自带的 `ProxyOverride` 分流表本身就是这个道理，
-> 而裸环境变量没有——这就是两者差异的根源。
+> **为什么改成"内网也走"？** 旧版把"内网一律直连"写死成硬规则，
+> 结果挂了 Clash mixed 端口也抓不到内网流量——代理等于白挂，
+> Burp 里空空如也。现在直连只由两个**显式**开关决定：
+> `scan.proxy_local_direct`（内网直连）与 `scan.no_proxy`（例外表）。
+> 想要旧行为，把 `proxy_local_direct` 打开即可。
+
+**端口扫描怎么走代理？** 端口扫描是裸 TCP（`asyncio.open_connection`），
+HTTP 代理只转发 HTTP 语义的请求——**但 SOCKS5 的 CONNECT 命令可以，
+HTTP 代理的 `CONNECT` 方法也可以**。所以 `core/tunnel.py` 自带一个最小
+SOCKS5 客户端（不依赖 `socksio`），按顺序尝试：
+
+1. 代理是 `socks5://` → SOCKS5 握手 + CONNECT；
+2. 代理是 `http://` → 先试 **HTTP CONNECT** 隧道（Burp 场景），
+   失败再试 **SOCKS5**（Clash mixed 端口场景）；
+3. 代理完全不支持隧道 → **自动降级直连**，不因为代理让整个扫描失败。
+
+隧道结果直接映射成端口状态：连接成功 = `open`，代理回
+"connection refused" = `closed`，不可达 / 超时 = `filtered`。
 
 **配置**（`config.yaml` 的 `scan` 段）：
 
 ```yaml
-proxy: null                # 显式指定，如 http://127.0.0.1:8080
-no_proxy: []               # 额外直连例外：域名后缀 / CIDR / 192.168.* 通配
+proxy: null                # 显式指定，如 http://127.0.0.1:7897
+no_proxy: []               # 直连例外（唯一显式出口）：域名后缀 / CIDR / 192.168.* 通配
+proxy_local_direct: false  # true = 内网/本机强制直连（恢复旧行为）
 proxy_autodetect: true     # 自动探测；false 时只认 proxy 字段（回到旧版行为）
 ```
 
@@ -1136,7 +1150,13 @@ proxy_autodetect: true     # 自动探测；false 时只认 proxy 字段（回�
 `POCS_PROXY` 里写死的东西永远最高——它代表"我就是要走这个"，不做自动化覆盖。
 
 决策全部收敛在 `core/proxy.py`，所有 HTTP 客户端（检测器 / 采集器 / 登录器）
-共用同一个入口 `build_client_kwargs()`，不会出现"这个模块走代理、那个不走"的割裂。
+共用同一个入口 `build_client_kwargs()`；端口扫描则共用同一个
+`resolve_proxy_for()`，不会出现"HTTP 走代理但端口扫描直连"的割裂。
+
+> **代理不支持 socks5 怎么办？** httpx 的 SOCKS 支持依赖可选依赖 `socksio`，
+> 没装时构造客户端就抛 `ImportError`。`httpx_compatible_proxy()` 会在缺
+> `socksio` 时把 `socks5://` 自动降级成 `http://`——Clash 的 mixed 端口
+> 两种协议都接受，所以照常工作。
 
 ### 4.7 被 WAF 拦截时自动降速（`-t 1` 重试）
 
@@ -1830,7 +1850,8 @@ POCS_DATA_DIR=./data
 
 # 代理（详见 §4.6）
 # POCS_PROXY=http://127.0.0.1:8080   # 显式指定：优先级最高，不再自动探测
-# POCS_NO_PROXY=corp.internal,10.0.0.0/8   # 额外直连名单（逗号或分号分隔）
+# POCS_NO_PROXY=corp.internal,10.0.0.0/8   # 直连名单（逗号或分号分隔）
+POCS_PROXY_LOCAL_DIRECT=false       # true = 内网/本机强制直连（默认全部走代理）
 POCS_PROXY_AUTODETECT=true         # 未显式配置时，自动探测本机代理
 
 # 公开性核验（详见 §4.1.4）：命中漏洞后回源站根目录取证，

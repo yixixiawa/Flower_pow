@@ -135,7 +135,7 @@ class OpenApiCollector:
         if self._client is None or self._client.is_closed:
             from core.proxy import build_client_kwargs
 
-            # 代理决策收敛到 core/proxy.py：内网/本机直连，公网走代理。
+            # 代理决策收敛到 core/proxy.py：默认全部目标都走代理。
             self._client = httpx.AsyncClient(
                 **build_client_kwargs(self.cfg, self._base_url)
             )

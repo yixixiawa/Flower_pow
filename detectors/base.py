@@ -66,13 +66,15 @@ def similarity(a: str, b: str) -> float:
 
 
 def _fallback_proxy(cfg: ScanConfig) -> str | None:
-    """不知道目标主机时的代理决策——**保守：不启用代理**。
+    """不知道目标主机时的代理决策——**跟着配置走**。
 
     调用 ``client()`` 却不给 url 的情形（例如只想拿客户端去做个无关请求），
-    无法判断目标是不是内网。此时宁可直连也不要盲目走代理：
-    错发内网流量到外部代理的代价，远大于少走一次代理。
+    无法判断目标是不是内网。此时按配置里的代理走——因为默认语义就是
+    "挂了代理就全部走代理"，用户要例外时用 ``scan.no_proxy`` 表达。
     """
-    return None
+    from core.proxy import normalize_proxy
+
+    return normalize_proxy(getattr(cfg, "proxy", None) or "") or None
 
 
 def persist_evidence(evdir: str, ev: Evidence, *, require_status: bool = True) -> str:
@@ -159,7 +161,7 @@ class Detector(ABC):
     def client(self, url: str = "") -> httpx.AsyncClient:
         """取 HTTP 客户端。
 
-        ``url`` 是这个客户端的**首个目标**，用于代理决策（内网直连、公网走代理）。
+        ``url`` 是这个客户端的**首个目标**，用于代理决策（默认全部走代理）。
         检测器实例通常只服务一个目标，所以第一次调用时定下的代理会被复用。
         若后续请求换了主机（跨主机的检测器），代理决策与已建好的客户端不一致，
         此时**重建客户端**——比"用错代理静默扫描"要安全得多。
@@ -186,9 +188,9 @@ class Detector(ABC):
                 pass
 
         if self._client is None:
-            # 代理决策统一收敛到 core/proxy.py：显式配置 > 自动探测到的代理，
-            # 但**内网/本机目标一律直连**——否则扫 127.0.0.1 / 10.x 会被
-            # 送去外部代理，表现为全部 502，更糟的是把内网请求泄露给第三方。
+            # 代理决策统一收敛到 core/proxy.py：显式配置 > 自动探测到的代理。
+            # 默认**全部目标都走代理**（内网也走），这样挂了 Burp/Clash
+            # 就能看到全部流量；要让内网直连就开 scan.proxy_local_direct。
             self._client = httpx.AsyncClient(
                 **build_client_kwargs(self.cfg, url or self._client_url_hint)
             )

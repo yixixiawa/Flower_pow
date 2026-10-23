@@ -259,11 +259,10 @@ def proxy(
 ) -> None:
     """查看本机代理检测结果与请求级代理决策。
 
-    渗透机上常挂着 Burp / Clash 的代理，但内网与本机目标**绝不能**送外部代理。
-    这个命令把两件事分开讲清楚：
+    渗透机上常挂着 Burp / Clash 的代理。这个命令把两件事分开讲清楚：
 
     * 本机**有没有**代理、来源是什么（环境变量 / Windows 系统代理）
-    * 扫描某个目标时**会不会**真的走代理（内网一律直连）
+    * 扫描某个目标时**会不会**真的走代理（默认全部走代理）
     """
     from core.proxy import build_client_kwargs, detect_proxy
 
@@ -281,6 +280,11 @@ def proxy(
         console.print(f"  [dim]注：{n}[/dim]")
     if sc.no_proxy:
         console.print(f"  直连例外（配置）    : {', '.join(sc.no_proxy)}")
+    console.print(
+        "  内网/本机直连       : "
+        + ("是（proxy_local_direct）" if getattr(sc, "proxy_local_direct", False)
+           else "否（默认全部走代理）")
+    )
 
     if not info.found and not sc.proxy:
         console.print(
@@ -292,8 +296,6 @@ def proxy(
 
     if target:
         from urllib.parse import urlparse
-
-        from core.proxy import is_local_host
 
         console.print("\n[bold]请求级决策[/bold]")
         kw = build_client_kwargs(sc, target)
@@ -307,16 +309,17 @@ def proxy(
         if chosen:
             console.print(f"  决策               : [green]走代理 {chosen}[/green]")
         else:
-            # 直连的三种理由要分清，否则用户会误判"代理没生效"
-            if is_local_host(host):
-                why = "内网/本机目标，强制直连以防内网流量外泄"
-            elif in_no_proxy:
+            # 直连的理由要说清，否则用户会误判"代理没生效"
+            if in_no_proxy:
                 why = "命中直连例外 scan.no_proxy"
-            else:
+            elif not (getattr(sc, "proxy", None) or "").strip():
                 why = "本机未检测到代理"
+            else:
+                why = "内网/本机目标且开启了 proxy_local_direct"
             console.print(f"  决策               : [cyan]直连[/cyan]（{why}）")
         console.print(
-            "[dim]注：端口扫描走裸 TCP，HTTP 代理无法转发，始终直连。[/dim]"
+            "[dim]注：端口扫描优先走 SOCKS5 / HTTP CONNECT 隧道，"
+            "代理不支持时自动降级直连。[/dim]"
         )
     else:
         console.print(

@@ -134,7 +134,7 @@ class Authenticator:
         if self._c is None or self._c.is_closed:
             from core.proxy import build_client_kwargs
 
-            # 代理决策收敛到 core/proxy.py：内网/本机直连，公网走代理。
+            # 代理决策收敛到 core/proxy.py：默认全部目标都走代理。
             kw = build_client_kwargs(self.cfg, self._base_url)
             # build_client_kwargs 为 httpx.AsyncClient 设计，这里同步客户端同样吃这些键
             self._c = httpx.Client(**kw)
@@ -191,7 +191,7 @@ class Authenticator:
     def login(
         self, base: str, assets: list[Asset], username: str, password: str
     ) -> AuthResult:
-        self._base_url = base   # 代理决策依据（内网直连 / 公网走代理）
+        self._base_url = base   # 代理决策依据（默认全部走代理）
         ep = pick_login_endpoint(assets)
         if ep is None:
             return AuthResult(False, notes=["接口清单里找不到登录端点"])

@@ -13,25 +13,32 @@
 业务上的真实需求是：**"我挂了代理，扫描流量就该走代理，
 不然 Burp 里什么也看不到、Clash 的分流也白配了"**。
 
-但这里有两个致命陷阱，不加约束直接把 ``trust_env`` 打开就会踩：
+因此本模块的默认行为是**流量全部走代理——包括内网与本机目标**。
+历史上这里写死过"内网目标一律直连"，理由是怕把内网拓扑泄露给第三方代理；
+但那条规则与用户的真实诉求直接冲突（挂了 Clash mixed 端口就想抓内网流量，
+结果一条都没进代理，Burp 里空空如也）。现在改成**默认走代理 + 显式开关**：
 
-1. **内网目标不能送外部代理。** 被测目标常是物理机网口 IP
-   （``192.168.x.x`` / ``10.x`` / ``172.16-31.x``）或 ``127.0.0.1``。
-   把这类请求送给一个公网代理，轻则全部 502（代理回不来内网），
-   重则**把内网拓扑泄露给第三方**。系统代理的 ``ProxyOverride``
-   本身就带这份分流表，而裸环境变量没有——这正是差异所在。
-2. **端口扫描根本无法走 HTTP 代理。** ``collectors/port_scan.py``
-   用的是裸 TCP（``asyncio.open_connection``），HTTP 代理只能转发
-   HTTP 语义的请求，不转发任意 TCP。所以端口探测必须直连，
-   这一点在文档里要写清楚，否则用户会以为"开了代理端口就扫描不到"。
+* ``scan.proxy_local_direct: true`` → 恢复旧行为（内网/本机直连）。
+* ``scan.no_proxy`` → 始终生效的直连例外表（无论开关怎么设）。
+
+两个坑仍然存在，但都已有对策：
+
+1. **代理本身可能不支持目标网段。** 内网目标发给公网代理会全部 502——
+   这是代理侧的能力问题，不是本模块能兜住的；开了代理却全 502 时，
+   用 ``scan.no_proxy`` 把内网网段加进例外表即可。
+2. **端口扫描需要 SOCKS5 才能转发任意 TCP。** HTTP 代理只转发 HTTP 语义的
+   请求；``collectors/port_scan.py`` 改用 **SOCKS5 CONNECT** 隧道
+   （Clash mixed 端口同时支持 HTTP 与 SOCKS5，正好够用），
+   代理不认 SOCKS5 时自动回落直连。
 
 设计取舍
 --------
 * **优先级：显式配置 > 环境变量 > 系统代理。**
   用户在 ``config.yaml`` / ``POCS_PROXY`` 里写死的东西永远最高，
   它代表"我就是要走这个"，不做任何自动化判断覆盖它。
-* **探测到代理 ≠ 对所有目标都走代理。** 落到具体请求时用
-  :func:`resolve_proxy_for` 按主机再判一次：内网/本机一律直连。
+* **探测到代理 = 对所有目标都走代理。** 落到具体请求时用
+  :func:`resolve_proxy_for` 按主机再判一次，唯一的例外是
+  ``no_proxy`` 表与 ``proxy_local_direct`` 开关。
 * **探测过程绝不发网络请求。** 只读环境变量与注册表——
   在只读模式（``readonly=true``）下也必须能安全运行。
 """
@@ -300,7 +307,7 @@ def detect_proxy(*, use_system: bool = True) -> ProxyInfo:
         info.no_proxy = env_no
         info.notes.append(
             f"环境变量代理 {env_proxy} 已启用；"
-            "内网/本机目标仍会直连（见 resolve_proxy_for）"
+            "默认所有目标都走代理（内网/本机也走）"
         )
         return info
 
@@ -362,29 +369,52 @@ def resolve_proxy_for(cfg, host: str, *, force: bool = False) -> str | None:
     这是比"探测"更细的一层——探测回答"本机有没有代理"，
     本函数回答"**这次请求**要不要用它"。规则：
 
-    1. ``force=True``（用户显式 ``--proxy`` 或配置强制）→ 一律走。
-    2. 主机是本机/内网（:func:`is_local_host`）→ **一律直连**，
-       避免内网流量被送出外部，也避免 502 假死。
-    3. 主机命中 ``NO_PROXY`` 例外表 → 直连。
-    4. 其余 → 走配置里的代理（可能是探测回填的）。
+    1. 没配代理 → 直连。
+    2. ``force=True``（用户显式 ``--proxy`` 或配置强制）→ 一律走。
+    3. 主机命中 ``no_proxy`` 例外表 → 直连（这是唯一的显式例外出口）。
+    4. 主机是本机/内网（:func:`is_local_host`）且
+       ``scan.proxy_local_direct=true`` → 直连（默认**不**直连）。
+    5. 其余 → 走配置里的代理。
+
+    **默认所有目标（含内网/本机）都走代理**——这是用户挂代理的初衷：
+    内网流量也要能在 Burp / Clash 里被看见。要恢复"内网直连"的旧行为，
+    把 ``scan.proxy_local_direct`` 打开即可。
 
     返回 ``None`` 表示直连；返回 URL 表示该用这个代理。
     """
-    proxy = (getattr(cfg, "proxy", None) or "").strip()
+    proxy = normalize_proxy(getattr(cfg, "proxy", None) or "")
     if not proxy:
         return None
     if force:
-        return normalize_proxy(proxy)
-    # 主机为空 = 调用方也说不上来目标是谁。此时**保守直连**：
-    # 错发内网流量到外部代理的代价，远大于少走一次代理。
-    if not (host or "").strip():
-        return None
-    if is_local_host(host):
-        return None
+        return proxy
     no_proxy = getattr(cfg, "no_proxy", None) or []
-    if _match_no_proxy(host, list(no_proxy)):
+    if (host or "").strip() and _match_no_proxy(host, list(no_proxy)):
         return None
-    return normalize_proxy(proxy)
+    # 内网/本机直连是可选项，不是默认。默认走代理——
+    # 否则挂了 Clash mixed 端口也抓不到内网流量，代理就白挂了。
+    if getattr(cfg, "proxy_local_direct", False) and is_local_host(host):
+        return None
+    return proxy
+
+
+def httpx_compatible_proxy(proxy: str) -> str:
+    """把代理 URL 调整成 httpx 能直接用的形式。
+
+    httpx 的 SOCKS 支持依赖可选依赖 ``socksio``，没装时**构造客户端就抛
+    ``ImportError``**（不是运行时报错，是整条链路起不来）。而 Clash 的
+    mixed 端口同时接受 HTTP 与 SOCKS5，所以缺 ``socksio`` 时把
+    ``socks5://`` 降级成 ``http://`` 最实用。
+
+    装了 ``socksio`` 就原样保留 socks5。
+    """
+    p = normalize_proxy(proxy)
+    if not p.startswith("socks"):
+        return p
+    try:  # noqa: SIM105
+        import socksio  # noqa: F401,PLC0415
+    except ImportError:
+        return "http://" + p.split("://", 1)[1]
+    return p
 
 
 def build_client_kwargs(cfg, url: str = "", *, force: bool = False) -> dict:
@@ -416,7 +446,7 @@ def build_client_kwargs(cfg, url: str = "", *, force: bool = False) -> dict:
     }
     chosen = resolve_proxy_for(cfg, host, force=force)
     if chosen:
-        kw["proxy"] = chosen
+        kw["proxy"] = httpx_compatible_proxy(chosen)
     return kw
 
 

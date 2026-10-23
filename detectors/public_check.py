@@ -310,7 +310,7 @@ class PublicResourceChecker:
         if self._client is None or self._client.is_closed:
             from core.proxy import build_client_kwargs
 
-            # 核验发的是真实请求，代理决策必须走统一入口（内网直连、公网走代理）
+            # 核验发的是真实请求，代理决策必须走统一入口（默认全部走代理）
             self._client = httpx.AsyncClient(**build_client_kwargs(self.cfg, url))
         return self._client
 

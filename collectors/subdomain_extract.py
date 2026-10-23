@@ -248,7 +248,7 @@ class SubdomainCollector:
         self.notes: list[str] = []
         # 按**代理决策所依据的主机**分别缓存客户端。所有被动源都是公网服务，
         # 决策结果通常一致；但按主机分桶才能在将来接入内网源时不出错
-        # （见 core/proxy.py 的"用错主机名会被判定内网直连"警告）。
+        # （见 core/proxy.py 的"用错主机名会拿错主机做决策"警告）。
         self._clients: dict[str, httpx.AsyncClient] = {}
 
     def client(self, url: str = CRT_SH_URL) -> httpx.AsyncClient:
@@ -259,7 +259,7 @@ class SubdomainCollector:
 
             # 被动源是**公网服务**，不是被测目标——代理决策要用它自己的
             # 主机名，而不是被枚举的那个域名。用错的话，枚举内网域名时
-            # 会被判定"内网直连"，结果一个被动源都连不上。
+            # 会拿内网主机名去决策，结果一个被动源都连不上。
             c = httpx.AsyncClient(**build_client_kwargs(self.cfg, url))
             self._clients[host] = c
         return c

@@ -10,10 +10,18 @@
 安全边界：只做 ``connect`` 扫描（发SYN 或完成三次握手），
 **绝不使用** ``-sU`` UDP 全端口扫（对目标压力大且极易被 IDS 记录）。
 
-**为什么不走 HTTP 代理**：本模块用裸 TCP（``asyncio.open_connection``），
-HTTP 代理只转发 HTTP 语义的请求，不转发任意 TCP 连接。所以即使配了代理、
-也探测到本机代理，端口扫描**始终直连**。这一点在 ``proxy`` 命令与
-启动提示里都写明了——否则用户会误以为"开了代理端口就扫不到了"。
+**端口扫描怎么走代理**：本模块用裸 TCP（``asyncio.open_connection``），
+HTTP 代理只转发 HTTP 语义的请求，不转发任意 TCP——**但 SOCKS5 的 CONNECT
+命令可以**，HTTP 代理的 ``CONNECT`` 方法也可以。所以这里不再"始终直连"，
+而是优先用 :mod:`core.tunnel` 建隧道：
+
+* 代理是 ``socks5://`` → SOCKS5 握手 + CONNECT；
+* 代理是 ``http://`` → 先试 HTTP CONNECT 隧道（Burp 场景），
+  失败再试 SOCKS5（Clash mixed 端口场景）；
+* 代理不支持隧道 → **自动降级直连**，不因为代理而让整个扫描失败。
+
+隧道建立的成败直接映射为端口状态：连接成功 = ``open``，
+代理回 "connection refused" = ``closed``，不可达/超时 = ``filtered``。
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from dataclasses import dataclass, field
 
 from core.config_loader import ScanConfig
 from core.state import Asset
+from core.tunnel import TunnelError, open_tunnel
 
 # 常见 Web / 中间件端口——优先扫这些，命中即高价值
 COMMON_PORTS: dict[int, str] = {
@@ -71,6 +80,18 @@ class PortScanner:
     def __init__(self, cfg: ScanConfig) -> None:
         self.cfg = cfg
         self.use_nmap = shutil.which("nmap") is not None
+        self.notes: list[str] = []
+
+    # ── 代理决策 ────────────────────────────────────────────────
+    def _proxy_for(self, host: str) -> str | None:
+        """本次端口扫描该用哪个代理（``None`` = 直连）。
+
+        走与 HTTP 完全同一套决策（:func:`core.proxy.resolve_proxy_for`），
+        所以"HTTP 走代理但端口扫描直连"的割裂不复存在。
+        """
+        from core.proxy import resolve_proxy_for
+
+        return resolve_proxy_for(self.cfg, host)
 
     # ── 原生实现 ──────────────────────────────────────────────────
     async def _probe_port(
@@ -80,7 +101,42 @@ class PortScanner:
 
         区分 closed / filtered 很关键：closed 说明主机在线但端口没开（有效信息），
         filtered 多数是被防火墙丢包（也说明主机可能在线）。
+
+        优先通过代理隧道探测；代理不支持隧道时降级直连。
         """
+        proxy = self._proxy_for(host)
+        if proxy:
+            try:
+                reader, writer = await open_tunnel(proxy, host, port, timeout)
+            except TunnelError as exc:
+                if exc.state == "unsupported":
+                    # 代理不转发任意 TCP —— 记一次，之后本轮都直连
+                    self.notes.append(
+                        f"代理 {proxy} 不支持 TCP 隧道，端口扫描降级直连"
+                    )
+                    return await self._probe_direct(host, port, timeout)
+                return PortResult(
+                    port=port, state=exc.state, service=exc.detail[:80]
+                )
+            except (OSError, asyncio.CancelledError):
+                return PortResult(port=port, state="error", service="隧道建立失败")
+
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (OSError, asyncio.CancelledError):
+                pass
+            return PortResult(
+                port=port, state="open", service=COMMON_PORTS.get(port, ""),
+                extra={"via": "proxy"},
+            )
+
+        return await self._probe_direct(host, port, timeout)
+
+    async def _probe_direct(
+        self, host: str, port: int, timeout: float
+    ) -> PortResult:
+        """直连的 TCP connect 探测。"""
         try:
             fut = asyncio.open_connection(host, port)
             reader, writer = await asyncio.wait_for(fut, timeout=timeout)
@@ -121,6 +177,10 @@ class PortScanner:
 
         只扫 TCP（``-sT``），不扫 UDP、不做脚本扫描、不做漏洞检测——
         我们自己有 POC 引擎，不需要 nmap 的 NSE。
+
+        代理是 SOCKS 时给 nmap 传 ``--proxy``（它原生支持 SOCKS4/5 隧道）；
+        代理是 HTTP 时不走 nmap——nmap 的 HTTP 代理支持有限，
+        交给原生隧道实现更可靠。
         """
         import re
 
@@ -130,6 +190,16 @@ class PortScanner:
         cmd = ["nmap", "-sT", "-sV", "--version-light", "-T4", "-Pn", "-n", host]
         if port_arg:
             cmd += ["-p", port_arg]
+        proxy = self._proxy_for(host)
+        if proxy:
+            from core.tunnel import parse_proxy_endpoint
+
+            ep = parse_proxy_endpoint(proxy)
+            if ep and ep.scheme.startswith("socks"):
+                cmd += ["--proxy", f"socks5://{ep.host}:{ep.port}"]
+            else:
+                # HTTP 代理 + nmap = 不可靠，走原生隧道
+                return []
 
         try:
             proc = await asyncio.create_subprocess_exec(

@@ -42,7 +42,7 @@ _PROXY_KEYS = (
 class _Cfg:
     """最小 ScanConfig 替身。"""
 
-    def __init__(self, proxy=None, no_proxy=None, autodetect=True):
+    def __init__(self, proxy=None, no_proxy=None, autodetect=True, local_direct=False):
         self.timeout = 5.0
         self.verify_tls = False
         self.follow_redirects = True
@@ -50,6 +50,15 @@ class _Cfg:
         self.proxy = proxy
         self.no_proxy = list(no_proxy or [])
         self.proxy_autodetect = autodetect
+        self.proxy_local_direct = local_direct
+
+
+def _has_socksio() -> bool:
+    try:
+        import socksio  # noqa: F401,PLC0415
+    except ImportError:
+        return False
+    return True
 
 
 class _Env:
@@ -163,23 +172,24 @@ def main() -> int:
         check(cfg.proxy is None, "没探测到 → 保持 None（退回直连）")
 
     # ── 场景5 resolve_proxy_for：请求级决策（最关键）─────────────
-    print("场景5 resolve_proxy_for：内网直连、公网走代理")
+    print("场景5 resolve_proxy_for：默认全部目标都走代理")
     cfg = _Cfg(proxy="http://127.0.0.1:8080")
     check(resolve_proxy_for(cfg, "example.com") == "http://127.0.0.1:8080", "公网走代理")
-    check(resolve_proxy_for(cfg, "192.168.10.128") is None, "物理机网口 IP 直连")
-    check(resolve_proxy_for(cfg, "127.0.0.1") is None, "回环直连")
-    check(resolve_proxy_for(cfg, "10.1.2.3") is None, "10 段直连")
-    check(resolve_proxy_for(cfg, "172.16.5.5") is None, "172.16 段直连")
-    check(resolve_proxy_for(cfg, "a.internal") is None, "内网后缀直连")
+    check(resolve_proxy_for(cfg, "192.168.10.128") == "http://127.0.0.1:8080",
+          "物理机网口 IP 也走代理")
+    check(resolve_proxy_for(cfg, "127.0.0.1") == "http://127.0.0.1:8080", "回环走代理")
+    check(resolve_proxy_for(cfg, "10.1.2.3") == "http://127.0.0.1:8080", "10 段走代理")
+    check(resolve_proxy_for(cfg, "172.16.5.5") == "http://127.0.0.1:8080", "172.16 段走代理")
+    check(resolve_proxy_for(cfg, "a.internal") == "http://127.0.0.1:8080", "内网后缀走代理")
 
-    print("场景5b force=True 时无视内网判断（用户显式要求）")
+    print("场景5b force=True 时无视一切例外（用户显式要求）")
     check(resolve_proxy_for(cfg, "192.168.10.128", force=True) == "http://127.0.0.1:8080",
           "force 强制走代理")
 
     print("场景5c 没配代理时一律 None")
     check(resolve_proxy_for(_Cfg(), "example.com") is None, "无代理 → None")
 
-    print("场景5d no_proxy 例外表生效")
+    print("场景5d no_proxy 例外表生效（唯一显式例外出口）")
     cfg2 = _Cfg(proxy="http://p:1", no_proxy=["skip.com", ".corp.com", "10.0.0.0/8", "192.168.*"])
     check(resolve_proxy_for(cfg2, "skip.com") is None, "精确匹配直连")
     check(resolve_proxy_for(cfg2, "www.skip.com") is None, "后缀匹配（裸域名）直连")
@@ -187,6 +197,19 @@ def main() -> int:
     check(resolve_proxy_for(cfg2, "10.9.9.9") is None, "CIDR 命中直连")
     check(resolve_proxy_for(cfg2, "192.168.5.5") is None, "通配前缀命中直连")
     check(resolve_proxy_for(cfg2, "other.com") == "http://p:1", "不在例外表 → 走代理")
+
+    print("场景5e proxy_local_direct=true 恢复内网直连旧行为")
+    cfg3 = _Cfg(proxy="http://127.0.0.1:8080", local_direct=True)
+    check(resolve_proxy_for(cfg3, "192.168.10.128") is None, "内网 IP 直连")
+    check(resolve_proxy_for(cfg3, "127.0.0.1") is None, "回环直连")
+    check(resolve_proxy_for(cfg3, "a.internal") is None, "内网后缀直连")
+    check(resolve_proxy_for(cfg3, "example.com") == "http://127.0.0.1:8080", "公网仍走代理")
+    check(resolve_proxy_for(cfg3, "10.1.2.3", force=True) == "http://127.0.0.1:8080",
+          "force 覆盖内网直连")
+
+    print("场景5f no_proxy 在 proxy_local_direct=false 时也生效（更严格）")
+    cfg4 = _Cfg(proxy="http://p:1", no_proxy=["10.0.0.0/8"])
+    check(resolve_proxy_for(cfg4, "10.9.9.9") is None, "例外表优先于默认走代理")
 
     # ── 场景6 build_client_kwargs：httpx 参数 ─────────────────────
     print("场景6 build_client_kwargs：httpx 客户端参数正确")
@@ -197,15 +220,24 @@ def main() -> int:
     check(kw["timeout"] == 5.0 and kw["verify"] is False, "超时与 TLS 从配置来")
 
     kw2 = build_client_kwargs(cfg, "http://192.168.10.128:8899/")
-    check("proxy" not in kw2, "内网目标不带 proxy")
+    check(kw2.get("proxy") == "http://127.0.0.1:8080", "内网目标也带 proxy")
     check(kw2["trust_env"] is False, "内网目标仍 trust_env=False")
 
     kw3 = build_client_kwargs(_Cfg(), "https://example.com/")
     check("proxy" not in kw3, "无代理配置 → 不带 proxy")
 
-    print("场景6b 无 url 时保守直连（无法判主机就不盲走代理）")
+    print("场景6b 无 url 时跟着配置走（默认全走代理语义）")
     kw4 = build_client_kwargs(cfg, "")
-    check("proxy" not in kw4, "无 url → 不启用代理")
+    check(kw4.get("proxy") == "http://127.0.0.1:8080", "无 url → 仍按配置走代理")
+
+    print("场景6c socks5 代理在缺 socksio 时降级成 http（mixed 端口兼容）")
+    kw5 = build_client_kwargs(_Cfg(proxy="socks5://127.0.0.1:7897"), "http://a.com/")
+    check(kw5.get("proxy") in ("socks5://127.0.0.1:7897", "http://127.0.0.1:7897"),
+          f"socks5 代理可用（实为 {kw5.get('proxy')}）")
+    if _has_socksio():
+        check(kw5.get("proxy") == "socks5://127.0.0.1:7897", "装了 socksio → 保留 socks5")
+    else:
+        check(kw5.get("proxy") == "http://127.0.0.1:7897", "缺 socksio → 降级为 http")
 
     # ── 场景7 ProxyInfo.describe ─────────────────────────────────
     print("场景7 ProxyInfo：状态描述")

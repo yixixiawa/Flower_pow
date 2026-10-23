@@ -170,16 +170,18 @@ def _print_proxy_notice(cfg: Config) -> None:
 
     为什么值得单独打一行：渗透机挂 Burp / Clash 时，用户最怕的是
     "我以为流量走代理了，结果全是直连，Burp 里啥也看不到"。
-    相反，"我扫的是内网，结果被送去公网代理"更糟——所以这里把
-    **内网会直连**这件事也一并说清楚，避免用户误以为代理没生效。
+    这里把**所有目标（含内网/本机）都走代理**这件事说清楚，
+    免得用户以为"开了代理端口就扫描不到"。
     """
     sc = cfg.scan
     if not sc.proxy:
         return
     source = "配置指定" if not sc.proxy_autodetect else "自动探测"
-    console.print(
-        f"[dim]代理：{sc.proxy}（{source}）· "
-        "内网/本机目标自动直连，端口扫描始终直连[/dim]"
+    tail = (
+        "内网/本机目标直连（proxy_local_direct）"
+        if getattr(sc, "proxy_local_direct", False)
+        else "全部目标走代理，端口扫描经 SOCKS5/CONNECT 隧道"
     )
+    console.print(f"[dim]代理：{sc.proxy}（{source}）· {tail}[/dim]")
 
 
