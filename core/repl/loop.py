@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 from core.completer import Completer, HOTKEY_FULL_AUTO, PromptReader
 from core.session import (
     Phase,
