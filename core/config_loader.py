@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 DEFAULT_TIMEOUT = 12.0
 DEFAULT_CONCURRENCY = 8
+DEFAULT_POC_DIR = Path(__file__).resolve().parent.parent / "poc"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0 Safari/537.36 POC-Scanner/2.0"
@@ -124,7 +125,7 @@ class RAGConfig(BaseModel):
     """检索增强配置。"""
 
     enabled: bool = Field(default=True)
-    poc_dir: str = Field(default="./poc")
+    poc_dir: str = Field(default=str(DEFAULT_POC_DIR))
     db_dir: str = Field(default="./data/vector_db")
     # 召回多少条 POC 交给检测器
     top_k: int = Field(default=12)

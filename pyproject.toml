@@ -32,12 +32,14 @@ build-backend = "hatchling.build"
 # 顶层是单文件入口 flower_pow.py，因此不能用 packages=["flower_pow"]（会误打包整个目录）
 include = [
     "flower_pow.py",
+    "cli/**/*.py",
     "core/**/*.py",
     "collectors/**/*.py",
     "detectors/**/*.py",
     "kb/**/*.py",
     "llm/**/*.py",
     "output/**/*.py",
+    "poc/**/*.yaml",
 ]
 
 [tool.ruff]

@@ -31,23 +31,31 @@
 ```bash
 cd D:/anyworkspace/python/flower_pow
 
-# 1) 安装（依赖刻意保持最小）
-.venv/Scripts/pip install -r requirements.txt
+# 1) 从源码安装（依赖刻意保持最小）
+python -m pip install .
 
 # 2) 直接运行：自动体检环境 → 索要 API Key → 进入 AI Agent 会话
-.venv/Scripts/python.exe flower_pow.py
+flower-pow
 
 # 3) 想启用 LLM 重排与降误判，填入 API Key（首次运行会交互询问并写入 .env，
 #    也可先 export DEEPSEEK_API_KEY=sk-xxx）
 export DEEPSEEK_API_KEY=sk-xxx
 
 # 4) 检查引擎、采集器、索引、外部工具状态
-.venv/Scripts/python.exe flower_pow.py engines
-.venv/Scripts/python.exe flower_pow.py tools      # Agent 能调用的两层能力
+flower-pow engines
+flower-pow tools      # Agent 能调用的两层能力
 
 # 5) 一次性扫描（不开对话）
-.venv/Scripts/python.exe flower_pow.py scan http://你的目标
+flower-pow scan http://你的目标
 ```
+
+也可以安装发布后的 wheel：
+
+```bash
+python -m pip install flower-pow
+```
+
+安装后可在任意工作目录执行 `flower-pow`。内置 POC 规则会随 wheel 安装；扫描结果、索引和本地配置仍写入当前工作目录的 `data/`、`output/` 与 `config.yaml`。
 
 首次运行会做一次完整体检并打印：外部工具探测、本机能力清单、POC 库与索引状态、
   
