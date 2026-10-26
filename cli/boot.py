@@ -25,7 +25,7 @@ def _reconfigure_console_utf8() -> None:
     而新版控制台/终端实际跑 UTF-8——编码错配时中文按错误编码解码，
     症状就是「首字节丢失、要打两次才生效」。在这里修而不是在各读取
     点修，是因为三条输入路径**共享同一个 sys.stdin**：PromptReader
-    （msvcrt getwch / POSIX 裸模式）、上传审核的 ``input()``
+    （prompt_toolkit 的 PromptSession）、上传审核的 ``input()``
     （cli/probe.py、core/repl/history.py）、密码框 getpass
     （chat.py 的 typer.prompt(hide_input=True)）。入口统一 reconfigure
     一次三条全受益，不会出现"修了主输入、审核路径照样丢字节"。

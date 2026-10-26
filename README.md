@@ -346,45 +346,42 @@ data/sessions/
 | `/assets <Tab>` | 资产类型（port/path/api/endpoint/…） |
 | `/target <Tab>` | 当前目标及其常见路径 |
 
-**为什么自己实现**：`readline` 是 POSIX 模块，**Windows 官方 Python 发行版不提供**
-（CPython 在 win32 下不编译它）。`pyreadline3` 要额外装，tkinter 在精简版里
-也没编。本项目要求「只靠 httpx + yaml 就能跑」，所以自实现：Windows 用
-`msvcrt.getwch()` 逐键读，POSIX 用 `termios` 切cbreak 模式。
+**为什么用 prompt_toolkit**：以前本项目自研了一套终端输入层（`core/completer/`
+下的 7 个文件近 1000 行），自己处理裸模式按键、ANSI 重绘与宽字符对齐。代价是
+Windows 中文输入首字节丢失、CJK 折行错位、Tab 补全与历史回放全是自己维护的
+边界情况。**现在全部废弃**，改用 [prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/)：
+
+| 能力 | 之前 | 现在 |
+|---|---|---|
+| 按键读取 | `msvcrt.getwch()` / `termios` 裸模式 | prompt_toolkit 统一处理 |
+| 中文宽字符 | 自己按 2 列算 | wcwidth，pt 原生支持 |
+| 多行编辑 | 无 | Shift+Enter 换行 |
+| 语法高亮 | 无 | 命令绿 / 参数黄 |
+| 折行与重绘 | 自己写 ANSI 相对定位 | pt 全权负责 |
+
+本项目只保留**补全词表**这一个核心资产（`core/completer/__init__.py`），
+其余（宽字符、多行编辑、终端转义序列）全部交给 pt 自己处理。
 
 **关键约束**：非 TTY（`echo "/help" | python flower_pow.py`、CI、脚本调用）
 时自动退回原生 `input()`，**行为与原来完全一致**——补全绝不能拖垮程序。
 
-**输入区怎么重绘**：`\r` 只回到**当前物理行**行首，输入一旦超过终端宽度就会
-自动折行，这时 `\r` 回不到逻辑行首，按一行宽度清屏也擦不干净。所以自己按显示
-列宽折行（CJK 按 2 列算），用 ANSI **相对**上移回到输入区首行、`\x1b[J` 一次
-擦到屏幕末尾，再相对移回光标该在的位置。光标行号由上一次重绘返回、下次传回，
-这样**回删**（行号变小）时也能正确上移。
+> **全程不许用绝对定位**是旧自研实现的教训：算出来的行列是"相对输入区首行"的，
+> 拿去当屏幕绝对坐标用，光标会被扔到屏幕左上角。现在这套风险由 pt 消除，
+> 但**回归测试的思路保留**——断言必须落在最终缓冲区里的文字上，不能只对转义
+> 字符串断言（那是自证的）。
 
-> **全程不许用绝对定位**（`\x1b[行;列H`）。算出来的行列是"相对输入区首行"的，
-> 拿去当屏幕绝对坐标用，光标会被扔到屏幕左上角，下一次重绘就从那里开始擦屏——
-> 表现就是输入时整个屏幕乱跳、上方已打印的输出被抹掉。
+回归测试**真的按 prompt_toolkit 的键**（`scripts/completer_pt_test.py`）：
+用 pt 自带的管道输入（`create_pipe_input`）把按键喂进去，断言**最终缓冲区里
+的文字**。覆盖四件事：
 
-Windows 控制台需要先开 `ENABLE_VIRTUAL_TERMINAL_PROCESSING` 才认这些序列；
-拿不到控制台时退回单行重绘，并把内容**裁进一行**——不裁的话每次重画都会折行，
-输入区会每敲一个字往下掉一行（实测 25 个字符掉 6 行）。
+1. **Tab 补全**：`/re` + Tab → `/report`；`/report m` + Tab → `/report md`
+2. **Ctrl+C 双语义**：有文字 → 只清空文字（程序活着）；空输入 → 抛 `KeyboardInterrupt` 退出程序
+3. **历史**：`↑` 翻出上一条输入
+4. **降级**：无控制台环境（CI / 管道）下 `PromptReader` 优雅降级而不是抛异常
 
-回归测试用**终端模拟器**验证屏幕结果（`scripts/_terminal_sim.py` 的假屏幕 +
-`scripts/completer_terminal_test.py`）：
-造一块假屏幕，按真实语义折行、上滚、处理转义序列，然后断言"输入区相对位置恒定、
-上方内容不被动、下方无残留、全程没有绝对定位"。三个手感用例已固化：**超宽长输入**、
-**折行后退格回短输入**、**Tab 弹候选后继续打字**。
-
-这三条先用内部函数（`_repaint` / `_show_candidates`）验一遍，再**用真实按键循环
-跑一遍**——用假的 `msvcrt` 喂键序列（`/re` + `Tab` + `Tab` + `port` + 回车），
-从 `PromptReader.read()` 进去。为什么要两遍：只调内部函数只能证明"重绘函数对"，
-证明不了**键盘分发**对——Tab 那一段（第一次只记候选、第二次才展示）就写在
-`_read_win` 里，绕过它等于没测。
-
-> 只对转义字符串做断言是自证的——算错行号照样"通过"（旧用例断言的 `\x1b[2;13H`
-> 正是那个 bug 的产物）。所以断言必须落在屏幕结果上。
-> 这些用例做过"种回 bug"验证：把绝对定位、`cur_row` 用新行号这两处分别改回去，
-> 用例都会失败（后者表现正是输入区首行序列 `3→4→5→6` 向下漂移，按键循环那条
-> 也一样报出来）。
+> 为什么不用自己模拟终端：那套东西现在**就是** prompt_toolkit，自造一个假屏幕
+> 去断言 ANSI 序列，测的是"我们对 prompt_toolkit 的用法对不对"这件事的影子。
+> 直接按真键、断言真文字，才是端到端的证据。
 
 #### 对话索引：每轮对话一个标题
 
@@ -1645,12 +1642,12 @@ set_target → recon_fingerprint → http_request → recon_openapi
 flower_pow.py          主入口：CLI（默认进 Agent / scan/chat/tools/index/pocs/intel/…）
 config.yaml            配置：扫描、RAG、LLM
 .env                   API Key 落点（已gitignore，不入仓库）
-requirements.txt       依赖（5 个包）
+requirements.txt       依赖（7 个包）
 
 core/
 ├── subdomain.py       ★★ 子域批量扫描：多格式解析 / 主域收敛 / 并发探活 / 汇总报告
-├── completer/         ★ Tab 补全（Windows 无 readline 时自实现）+ 命令/参数两级候选
-│   │                  （keys·width·layout·paint·candidate·reader 六层，都 <150 行）
+├── completer/         ★ 终端输入层（prompt_toolkit）：命令/参数两级补全 + 语法高亮
+│   │                  自研的 reader/layout/paint/width 已全部废弃，只留补全词表
 ├── agent.py           ★★ 流式工具调用 Agent：模型决定调哪个工具，软警告+硬拒绝双层防死循环
 ├── tools/             ★★ 工具层（包）：声明 / 探测 / 参数归一 / 执行，对外只露
 │                      ★  `from core.tools import ToolRunner` 一个入口
@@ -1741,7 +1738,7 @@ output/
                      同主域但**不同子站**会自动加子域后缀区分，不静默合并
 
 scripts/
-├── run_tests.py       ★ 全量回归入口：python scripts/run_tests.py 一把跑完下面 28 个
+├── run_tests.py       ★ 全量回归入口：python scripts/run_tests.py 一把跑完下面 29 个
 │                      *_test.py（固定重定向 stdin + 单脚本超时 + 汇总项数）
 ├── wrap_up.py         ★ 收尾提交：一轮改动的 git add . + git commit，标题写清
 │                      **改了哪些功能点与方法**。内置三门禁（编译 + 密钥扫描 +
@@ -1773,11 +1770,9 @@ scripts/
 ├── record_finding_test.py ★ 手工发现登记测试：证据必填 / 去重 / 进报告 / 流式截断
 ├── completer_candidates_test.py ★ 候选与标题索引：命令名·参数两级候选 / 非 TTY 降级 /
 │                                  标题往返 / 脱敏（纯逻辑，不碰终端）
-├── completer_editing_test.py    ★ 行编辑：提示符拆分 / 列宽计算 / 行内光标与按词跳转 /
-│                                  折行布局（待定折行、ANSI 剥离）
-├── completer_terminal_test.py   ★ 终端行为级（假屏幕断言，不匹配转义字符串）：
-│                                  **输入区不漂移·上方不被擦·无残影·无绝对定位** /
-                                  Tab 两段式 / 无 ANSI 兜底 / _finish_line
+├── completer_pt_test.py ★★ 交互层行为级（**真按 prompt_toolkit 的键**，断言缓冲区文字）：
+│                                  Tab 补全 / **Ctrl+C 双语义**（有字清空·空输入退出）/
+│                                  历史 ↑ / 无控制台优雅降级
 ├── autopilot_test.py     ★ 全自动测试：SQLi 全规则 / 上传审核四路径 / Alt+Shift / 结果合并
 ├── config_test.py        ★ 配置测试：环境变量三规则 / 类型容错 / init 模板与 config.yaml 同构
 ├── naming_test.py        ★ 命名测试：报告名 report_<日期>_<主域名> / 主域名裁剪（含 co.uk）
@@ -1821,8 +1816,6 @@ scripts/
 ├── export_report_test.py ★ 报告导出测试：非法 fmt 报错不静默 / fmt 大小写·空格归一 /
                           **参数类型归一（"false"→False，undo 不误撤销）** / [新建]·[覆盖]
                           标注与实际一致 / overwrite=false 三格式共用主干 / notes 不重复累积
-└── _terminal_sim.py     —— 终端模拟器（**公共测试设施**，下划线开头且不带 `_test`
-                           后缀，故不会被 run_tests.py 当成回归脚本）
 
 data/
 ├── tools.local.yaml    ★★ 自定义外部工具清单（加工具改这里，不用改源码）

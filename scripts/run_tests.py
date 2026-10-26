@@ -4,8 +4,8 @@
   .venv/Scripts/python.exe scripts/run_tests.py            # 全部
   .venv/Scripts/python.exe scripts/run_tests.py throttle   # 只跑名字含 throttle 的
 
-收集规则：文件名以 `_test.py` 结尾。`_terminal_sim.py` 这类公共测试设施
-（下划线开头、不带 `_test` 后缀）不会被当成一个测试来跑。
+收集规则：文件名以 `_test.py` 结尾。下划线开头、不带 `_test` 后缀的公共
+测试设施不会被当成一个测试来跑。
 
 为什么需要它：全量回归原本要手写
   for f in scripts/*_test.py; do python "$f" < /dev/null; done

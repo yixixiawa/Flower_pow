@@ -1,12 +1,22 @@
 """``_LoopMixin``：主循环与命令分发。
 
 ``_handle`` 是**唯一**的命令入口：拿到 ``/xxx`` 拆成命令与参数再分派，
-未知命令、人话、阶段推进、剧本模式下一轮都在这里分流。"""
+未知命令、人话、阶段推进、剧本模式下一轮都在这里分流。
+
+Ctrl+C 在这里有**两种语义**，必须分开处理：
+
+* **输入框里**按 Ctrl+C —— 由 ``core.completer`` 的按键绑定处理：有文字
+  就清空文字（``buf.text = ""``），空输入才退出程序。所以这一层收到的
+  ``KeyboardInterrupt`` 一定意味着"用户想退出"，直接收尾即可。
+* **会话途中**（Agent 跑着 / 扫描跑着）按 Ctrl+C —— **中断当前这一轮，
+  不退出程序**。这一层是 asyncio，Ctrl+C 表现为 ``CancelledError``
+  （Python 3.13 的 ``asyncio.Runner`` 第一次 Ctrl+C 先 cancel 任务、
+  第二次才抛 ``KeyboardInterrupt``），所以两种都要捕获。
+"""
 
 from __future__ import annotations
 
 import asyncio
-import sys
 
 from core.completer import Completer, HOTKEY_FULL_AUTO, PromptReader
 from core.session import (
@@ -22,6 +32,23 @@ from core.repl.consts import BANNER_AGENT
 from core.repl.consts import PHASE_ALIAS
 from core.repl.consts import NATURAL
 from core.repl.consts import _call_name
+
+
+def uncancel() -> None:
+    """吞掉一次 asyncio 取消请求，把任务的"取消计数"退回去。
+
+    为什么需要：Ctrl+C 在 asyncio 里表现为 ``Task.cancel()``，任务收到
+    ``CancelledError``。我们要的是"中断这一轮、程序继续活着"，所以捕获
+    之后必须调 ``uncancel()``（Python 3.11+）把计数清零——否则任务会一直
+    处在 ``cancelling`` 状态，后续的 ``asyncio.timeout`` 之类会误判。
+    """
+    task = asyncio.current_task()
+    uncancel_fn = getattr(task, "uncancel", None)
+    if uncancel_fn is not None:
+        try:
+            uncancel_fn()
+        except Exception:  # noqa: BLE001 - 清不掉也不致命
+            pass
 
 
 class _LoopMixin:
@@ -46,7 +73,7 @@ class _LoopMixin:
         while True:
             try:
                 tag = "agent" if self.agent_on else f"轮 {self.session.turn_no}·{self.session.phase.label}"
-                raw = self.reader.read(f"\n[{tag}] > ")
+                raw = await self.reader.read(f"\n[{tag}] > ")
                 # Alt+Shift 热键：走全自动，不进命令分发
                 if raw == HOTKEY_FULL_AUTO:
                     await self._autopilot()
@@ -54,18 +81,32 @@ class _LoopMixin:
                 raw = raw.strip()
                 if raw:
                     self._push_history(raw)
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                print("\n（退出）")
+                break
+            except KeyboardInterrupt:
+                # 输入框为空时按 Ctrl+C —— prompt_toolkit 把这一下当成
+                # "退出程序"抛出来（见 core.completer 的 c-c 绑定）。
+                print("\n（退出）")
+                break
+            except asyncio.CancelledError:
+                # 非 tty / 管道场景下 Ctrl+C 走的是信号 → 任务取消。
+                # 同样按"用户想退出"处理。
+                uncancel()
                 print("\n（退出）")
                 break
             if not raw:
-                await self._on_enter()
+                await self._guarded(self._on_enter())
                 continue
             if raw.lower() in ("/quit", "/exit", "quit", "exit", "q"):
                 break
             try:
                 keep = await self._handle(raw)
-            except KeyboardInterrupt:
-                print("\n[yellow]已中断本轮[/yellow]")
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # 会话途中 Ctrl+C：**中断这一轮**，程序继续活着，
+                # 用户可以接着输入下一条指令。
+                uncancel()
+                self._note_interrupt()
                 keep = True
             except Exception as exc:  # noqa: BLE001
                 print(f"[!] 命令执行异常：{type(exc).__name__}: {exc}")
@@ -93,7 +134,7 @@ class _LoopMixin:
         if self.session.target:
             prompt = (
                 f"本次会话目标已设定为 {self.session.target}。"
-                f"请先说明你打算怎么开展这一轮测试，然后开始执行。"
+                "请先说明你打算怎么开展这一轮测试，然后开始执行。"
             )
         else:
             prompt = (
@@ -108,13 +149,48 @@ class _LoopMixin:
         else:
             await self._advance_and_run()
 
+    def _note_interrupt(self) -> None:
+        """会话途中被 Ctrl+C 打断：提示一句，并在 Agent 历史里留个痕迹。
+
+        留痕迹是为了让模型知道上下文断在哪——否则下一轮模型会以为自己
+        上一步已经跑完了，接着往下做就跳过了被打断的那一段。
+        """
+        print("\n[yellow]⚠ 已中断当前对话/扫描任务。[/yellow]")
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return
+        try:
+            agent.history.append(
+                {"role": "system", "content": "用户手动中断了任务。"}
+            )
+        except Exception:  # noqa: BLE001 - 留痕失败不影响收尾
+            pass
+
+    async def _guarded(self, coro):
+        """跑一个可能很长的动作，Ctrl+C 只中断它，不退出程序。
+
+        返回值原样透传（``_on_enter`` 返回 ``None``），中断与异常都被就地
+        消化掉——调用方不需要再包一层 try。
+        """
+        try:
+            return await coro
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            uncancel()
+            self._note_interrupt()
+            return None
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] 命令执行异常：{type(exc).__name__}: {exc}")
+            return None
+
     async def _run_agent(self, text: str) -> None:
         before = self.runner.calls if self.runner else []
         n_before = len(before)
         try:
             out = await self.agent.send(text)
-        except KeyboardInterrupt:
-            print("\n[yellow]已中断[/yellow]")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # 会话途中 Ctrl+C：中断这一轮，**不退出程序**。
+            uncancel()
+            self._note_interrupt()
             out = ""
         except Exception as exc:  # noqa: BLE001
             print(f"\n[!] Agent 执行异常：{type(exc).__name__}: {exc}")
@@ -134,6 +210,7 @@ class _LoopMixin:
         self._save()
 
     # ── 命令分发 ──────────────────────────────────────────────────
+
     async def _handle(self, raw: str) -> bool:
         low = raw.lower()
 
@@ -251,4 +328,3 @@ class _LoopMixin:
         return True
 
     # ── 模式与配置 ────────────────────────────────────────────────
-

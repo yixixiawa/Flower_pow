@@ -3,8 +3,9 @@
 补全是**纯逻辑**（`complete` 返回值），不需要真实 TTY；
 标题索引走 Session 快照往返与脱敏。
 
-终端行为级回归（输入区不漂移 / ANSI 兜底 / 按键分发）在
-`completer_terminal_test.py`；提示符拆分与折行布局在 `completer_editing_test.py`。
+交互层的**行为级**回归（按键真的走一遍 prompt_toolkit）在
+`completer_pt_test.py`——那里用 prompt_toolkit 自己的管道输入驱动真实的
+``PromptSession``，验证 Tab 补全与 Ctrl+C 双语义真的成立。
 
 运行：.venv/Scripts/python.exe scripts/completer_candidates_test.py
 """
@@ -17,8 +18,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 补全数据与终端测试共用一份，避免两边改了不同步
-from _terminal_sim import ARGS, CMDS  # noqa: E402
+# 补全夹具用的一组命令名与参数候选。
+# 注意：``/login`` 与 ``/fp`` 已从真实命令表下线，这里也不再用它们做样本——
+# 夹具里留着一条现实里不存在的命令，测试就成了自证的假通过。
+CMDS = ["/help", "/status", "/report", "/resume", "/quit", "/target",
+        "/agent", "/assets", "/title", "/chats"]
+ARGS = {
+    "report": ["md", "html", "json", "all"],
+    "assets": ["port", "path", "api", "endpoint"],
+    "phase": ["recon", "model", "exploit", "iterate"],
+    "agent": ["on", "off"],
+    "target": ["http://a.example.com/x", "http://b.example.com/y"],
+    "title": ["1", "2", "3"],
+}
+
 from core.completer import Completer, PromptReader, available  # noqa: E402
 from core.session import ConversationTurn, Session  # noqa: E402
 
@@ -69,31 +82,28 @@ def main() -> int:
     new4, _, _ = c.complete("/target http://a")
     check(new4 == "/target http://a.example.com/x", f"含空格参数补全，实={new4!r}")
 
-    print("\n场景5 交互层在非TTY 下优雅降级")
+    print("\n场景5 补全候选的 start_position（prompt_toolkit 接口）")
+    # 命令级：/re 的 tail 长度是 3 → start_position=-3，替换 "/re" 为 "/report"
+    from prompt_toolkit.document import Document
+
+    comps = list(c.get_completions(Document("/re", 3), None))
+    check(len(comps) == 2, f"/re 出两个候选，实={len(comps)}")
+    check(all(x.start_position == -3 for x in comps),
+          f"命令级 start_position=-3（替换 tail），实={[x.start_position for x in comps]}")
+    # 参数级：/report m 的 tail 长度是 1 → start_position=-1，替换 "m" 为 "md"
+    comps2 = list(c.get_completions(Document("/report m", 9), None))
+    check(len(comps2) == 1 and comps2[0].text == "md",
+          f"/report m 补出 md，实={[x.text for x in comps2]}")
+    check(comps2[0].start_position == -1,
+          f"参数级 start_position=-1，实={comps2[0].start_position}")
+
+    print("\n场景6 交互层在非TTY 下优雅降级")
     # 管道输入时必须退回 input()，否则会读到 EOF 直接崩
     r = PromptReader(c)
     check(isinstance(r.enabled, bool), "enabled 是 bool")
     check(r.enabled == available(), f"enabled 与 available() 一致（{r.enabled}）")
-    # 直接验证降级路径：enabled=False 时 read 走 input()
-    r.enabled = False
-    import builtins
 
-    calls = []
-
-    def fake_input(prompt=""):
-        calls.append(prompt)
-        return "/help"
-
-    orig = builtins.input
-    builtins.input = fake_input
-    try:
-        out = r.read("[agent] > ")
-        check(out == "/help", "非TTY 时退回 input() 并正常返回")
-        check(calls and "[agent]" in calls[0], "提示符原样传给 input")
-    finally:
-        builtins.input = orig
-
-    print("\n场景6 对话标题索引落盘往返")
+    print("\n场景7 对话标题索引落盘往返")
     tmp = Path(tempfile.mkdtemp())
     s = Session(target="http://t", session_id="ct")
     check(s.conversations == [], "新会话标题列表为空")
@@ -106,7 +116,7 @@ def main() -> int:
     check(s2.conversations[0].title == "信息收集与指纹识别", "标题正确")
     check(s2.conversations[1].tools == ["record_finding"], "工具清单保留")
 
-    print("\n场景7 标题脱敏（与对话历史同一套规则）")
+    print("\n场景8 标题脱敏（与对话历史同一套规则）")
     s3 = Session(target="http://t", session_id="ct3")
     s3.add_conversation(
         "登录成功 Authorization: Bearer SECRETVALUE123456", []
@@ -115,7 +125,7 @@ def main() -> int:
     txt = str(raw)
     check("SECRETVALUE123456" not in txt, "标题里的凭据已脱敏")
 
-    print("\n场景8 v1 旧快照仍可加载")
+    print("\n场景9 v1 旧快照仍可加载")
     import json
 
     old_dir = tmp / "old"
@@ -129,7 +139,7 @@ def main() -> int:
     check(s4 is not None, "v1 快照可加载")
     check(s4 is not None and s4.conversations == [], "v1 无标题字段时为空")
 
-    print("\n场景9 ConversationTurn 单体往返")
+    print("\n场景10 ConversationTurn 单体往返")
     ct = ConversationTurn(no=3, title="标题", at=123.0, tools=["a", "b"])
     d = ct.to_dict()
     ct2 = ConversationTurn.from_dict(d)

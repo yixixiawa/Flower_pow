@@ -4,7 +4,7 @@
 #
 # 设计取舍：向量检索用纯 Python 的 hashing trick 实现（kb/indexer.py），
 # 因此不需要 numpy / chromadb / qdrant 这一整棵依赖树。
-# 直接依赖仅 6 个，其余均为其传递依赖。
+# 直接依赖仅 7 个，其余均为其传递依赖。
 
 # ---- 直接依赖（代码中直接 import）----
 httpx==0.28.1            # HTTP 客户端（异步）
@@ -13,6 +13,7 @@ typer==0.27.3             # CLI
 rich==15.0.0              # 终端表格与面板
 pydantic==2.13.5          # 配置校验
 PyYAML==6.0.3             # POC YAML 解析与配置读取
+prompt_toolkit==3.0.53    # 多行中文终端输入、补全与高亮
 
 # ---- 传递依赖：httpx ----
 httpcore==1.0.9
@@ -27,6 +28,9 @@ h11==0.16.0
 idna==3.20
 sniffio==1.3.1
 truststore==0.10.4
+
+# ---- 传递依赖：prompt_toolkit ----
+wcwidth==0.9.3            # 宽字符计算（中文列宽靠它）
 
 # ---- 传递依赖：openai ----
 annotated-doc==0.0.5
