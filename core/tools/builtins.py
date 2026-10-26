@@ -66,6 +66,30 @@ BUILTINS: list[BuiltinTool] = [
         params=_obj({}),
     ),
     BuiltinTool(
+        name="extract_variable",
+        group="编排",
+        desc=(
+            "把响应或错误里提取到的 ID、工号、手机号、Token、验证码等线索保存到"
+            "当前会话的上下文变量池。后续工具参数可以用 ${变量名} 自动替换；"
+            "拿到可复用线索后必须立刻调用此工具。"
+        ),
+        params=_obj(
+            {
+                "name": {"type": "string", "description": "变量名，如 jobNumber、authCode、tmpToken"},
+                "value": {"type": "string", "description": "实际提取到的值"},
+                "evidence": {"type": "string", "description": "值出现在哪段响应或哪条事实中"},
+                "source": {"type": "string", "description": "来源 URL、工具或接口说明"},
+            },
+            ["name", "value"],
+        ),
+    ),
+    BuiltinTool(
+        name="context_get",
+        group="编排",
+        desc="读取当前会话上下文变量池；传 name 只读取一个变量，不传则读取全部变量。",
+        params=_obj({"name": {"type": "string", "description": "可选变量名"}}),
+    ),
+    BuiltinTool(
         name="http_request",
         group="侦察",
         desc=(
@@ -429,8 +453,58 @@ BUILTINS: list[BuiltinTool] = [
                     "description": "分类：sqli / xss / idor / ssrf / lfi / rce / authz / info_disclosure / other",
                 },
                 "cve": {"type": "string", "description": "关联 CVE（没有就不传）"},
+                "chain_id": {"type": "string", "description": "所属攻击链 ID；独立发现不传"},
+                "step_index": {"type": "integer", "description": "该发现位于攻击链第几步，从 0 开始"},
+                "exploit_payload": {
+                    "type": "string",
+                    "description": "实际用于串联下一步的载荷或变量使用方式",
+                },
             },
             ["name", "severity", "matched_at", "evidence", "payload"],
+        ),
+    ),
+    BuiltinTool(
+        name="record_attack_chain",
+        group="报告",
+        desc=(
+            "显式记录一条由多个漏洞/事实串联的攻击链。必须写清入口、每一步的"
+            "前置条件/动作/核心证据/结果，以及最终影响；用 finding_id 关联已有发现。"
+            "当一个发现拿到的凭证、ID 或 Token 被用于下一个发现时，必须调用此工具，"
+            "不能只把链路写在自然语言回复里。"
+        ),
+        params=_obj(
+            {
+                "chain_id": {"type": "string", "description": "可选稳定 ID，如 chain-api-admin"},
+                "title": {"type": "string", "description": "攻击链名称"},
+                "entry_point": {"type": "string", "description": "入口点或前置条件"},
+                "final_impact": {"type": "string", "description": "最终可证明的危害"},
+                "severity": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low", "info"],
+                },
+                "finding_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "已有 Finding 的 poc_id 列表（兼容简化记录）",
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "每步包含 action、finding_id、evidence、result，可选 exploit_payload",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string"},
+                            "finding_id": {"type": "string"},
+                            "evidence": {"type": "string"},
+                            "result": {"type": "string"},
+                            "exploit_payload": {"type": "string"},
+                        },
+                        "required": ["action", "evidence", "result"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            ["title", "entry_point", "final_impact"],
         ),
     ),
     BuiltinTool(

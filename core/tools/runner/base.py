@@ -70,6 +70,8 @@ _STATUS_MARKERS: dict[str, str] = {
     "【启动失败】": "error",
 }
 
+_CONTEXT_VAR_RE = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_-]{0,63})\}")
+
 
 def _classify_arg(a: str) -> str:
     """把一个非选项参数归类为 ``target`` / ``path`` / ``other``。
@@ -274,6 +276,8 @@ class _ToolRunnerBase:
         # `undo="false"` 真的会撤销），也会把枚举写错大小写（`"MD"` → 判断全落空、
         # 静默什么都不做）。逐个 handler 打补丁治不了根，所以收在这一处。
         args = normalize_args(name, args)
+        if name not in {"extract_variable", "context_get"}:
+            args = self._expand_context_vars(args, session.result.context_vars)
         status = "ok"
         try:
             handler = getattr(self, f"_h_{name}", None)
@@ -333,6 +337,23 @@ class _ToolRunnerBase:
             }
         )
         return text
+
+    @classmethod
+    def _expand_context_vars(cls, value: Any, pool: dict[str, Any]) -> Any:
+        """递归展开工具参数中的 ``${name}``，未找到的变量保持原样。"""
+        if isinstance(value, str):
+            def replace(match: re.Match[str]) -> str:
+                item = pool.get(match.group(1))
+                if isinstance(item, dict) and "value" in item:
+                    item = item["value"]
+                return str(item) if item is not None else match.group(0)
+
+            return _CONTEXT_VAR_RE.sub(replace, value)
+        if isinstance(value, list):
+            return [cls._expand_context_vars(item, pool) for item in value]
+        if isinstance(value, dict):
+            return {key: cls._expand_context_vars(item, pool) for key, item in value.items()}
+        return value
 
 
     # ── 大输出落盘 ────────────────────────────────────────────────
@@ -427,6 +448,10 @@ class _ToolRunnerBase:
         if api:
             no_auth = sum(1 for a in api if not a.meta.get("auth"))
             lines.append(f"接口清单：{len(api)} 个操作（其中免鉴权声明 {no_auth}）")
+        if r.context_vars:
+            lines.append("上下文变量：" + "、".join(sorted(r.context_vars)))
+        if r.attack_chains:
+            lines.append(f"攻击链：{len(r.attack_chains)} 条（已记录步骤）")
 
 
     # ── 会话合并 ──────────────────────────────────────────────────

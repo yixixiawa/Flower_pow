@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from core.state.enums import Category, Severity
 from core.state.models import (
+   AttackChain,
+   AttackStep,
     Asset,
     Evidence,
     Finding,
@@ -46,7 +48,7 @@ from core.state.util import dataclass_to_dict, re_search, safe_name
 __all__ = [
     "Severity", "Category",
     "MatchTarget", "MatchOp", "MatchRule", "RequestSpec", "POC",
-    "Evidence", "Fingerprint", "Asset", "Finding",
+   "Evidence", "Fingerprint", "Asset", "AttackStep", "AttackChain", "Finding",
     "dismiss_finding", "restore_finding",
     "ScanResult",
     "re_search", "safe_name", "dataclass_to_dict",

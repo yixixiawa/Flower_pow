@@ -57,6 +57,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, Callable
@@ -373,7 +374,22 @@ class Agent:
                     # 骨架只认**连续**：中间插了别的工具调用，连击断开
                     self._skeletons.clear()
                 self.on_event(f"\n  ⚙ {_describe(c['name'], args)}{parse_note}")
-                result = await self.runner.execute(c["name"], args, self.session)
+                try:
+                    result = await self.runner.execute(c["name"], args, self.session)
+                except asyncio.CancelledError:
+                    result = "【工具中断】该工具调用被用户中断，未取得结果。"
+                    self.history.append(
+                        {"role": "tool", "tool_call_id": c["id"], "content": result}
+                    )
+                    raise
+                except KeyboardInterrupt:
+                    result = "【工具中断】该工具调用被用户中断，未取得结果。"
+                    self.history.append(
+                        {"role": "tool", "tool_call_id": c["id"], "content": result}
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    result = f"【工具失败】{type(exc).__name__}: {exc}"
                 self.on_event(_indent(result))
                 self.history.append(
                     {"role": "tool", "tool_call_id": c["id"], "content": result}
@@ -442,6 +458,7 @@ class Agent:
         那条带 ``tool_calls`` 的 assistant，否则协议上不合法，服务端会 400。
         所以切割点必须落在一个非 tool 消息上。
         """
+        self.history = self._repair_tool_history(self.history)
         chars = sum(len(json.dumps(m, ensure_ascii=False)) for m in self.history)
         while len(self.history) > MAX_HISTORY_MSGS or chars > MAX_HISTORY_CHARS:
             if len(self.history) < 4:
@@ -454,6 +471,47 @@ class Agent:
                 break
             self.history = self.history[cut:]
             chars -= sum(len(json.dumps(m, ensure_ascii=False)) for m in dropped)
+
+    @staticmethod
+    def _repair_tool_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """补齐恢复/中断后缺失的 tool 消息，保证 OpenAI 消息协议完整。"""
+        repaired: list[dict[str, Any]] = []
+        pending: dict[str, None] = {}
+
+        def flush() -> None:
+            for call_id in pending:
+                repaired.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": "【工具结果缺失】该调用在上次会话中未完成。",
+                    }
+                )
+            pending.clear()
+
+        for raw in history or []:
+            if not isinstance(raw, dict):
+                continue
+            msg = dict(raw)
+            role = msg.get("role")
+            if role == "assistant" and msg.get("tool_calls"):
+                flush()
+                repaired.append(msg)
+                for call in msg.get("tool_calls") or []:
+                    if isinstance(call, dict) and call.get("id"):
+                        pending[str(call["id"])] = None
+                continue
+            if role == "tool" and pending:
+                call_id = str(msg.get("tool_call_id") or "")
+                if call_id in pending:
+                    repaired.append(msg)
+                    pending.pop(call_id, None)
+                continue
+            if pending:
+                flush()
+            repaired.append(msg)
+        flush()
+        return repaired
 
     def reset(self) -> None:
         self.history.clear()
@@ -468,7 +526,9 @@ class Agent:
         用于会话恢复：模型得记得上次聊过什么，否则「恢复」只是恢复了资产，
         它会对已经排除过的方向重新试探。
         """
-        self.history = [dict(m) for m in (history or []) if isinstance(m, dict)]
+        self.history = self._repair_tool_history(
+            [dict(m) for m in (history or []) if isinstance(m, dict)]
+        )
         self._trim()
         self._call_fingerprints.clear()
         self._skeletons.clear()

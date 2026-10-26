@@ -53,6 +53,8 @@ class _CommandMixin:
         r.assets.clear()
         r.findings.clear()
         r.fingerprints.clear()
+        r.context_vars.clear()
+        r.attack_chains.clear()
         r.notes.clear()
         r.errors.clear()
         self.session.credentials.clear()

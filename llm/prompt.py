@@ -34,21 +34,15 @@ RERANK_SYSTEM = """你是资深渗透测试工程师，负责在**有限时间�
 - 0.2 = 存在理论可能，但当前证据不足
 - 0.0 = 技术栈/场景明显不匹配，纯噪音
 
-
-【攻击链与上下文利用纪律】
-1. **绝对不要孤立地测试接口**。每次拿到一个新的 JS 文件、接口响应或报错，必须问自己：“这里有没有可以用来测试其他接口的线索？”
-2. **参数传递**：如果你在接口 A 的响应中拿到了 ID、工号、Token、手机号，你必须把这些值存下来，并在测试接口 B 时自动填入对应的参数。
-3. **登录链路追踪**：如果发现登录相关的接口（如获取临时 Token -> 换取正式 Token），必须尝试构造两步请求，获取真实的凭证，然后携带该凭证去测试所有带 `/secure/` 或需要登录的接口，验证是否存在越权。
-4. **报错信息利用**：如果接口返回 "Request method 'GET' not supported"，你必须换用 POST；如果返回 "参数缺失"，必须从 JS 代码里反查出正确的参数名，而不是放弃。
-
-严格约束：
+【打分纪律】
 1. **只能对给定列表中的 id 打分，不得发明新 id。**
-2. 打分必须基于目标画像里的**实际证据**（响应头、标题、技术栈、发现的路径）。
-   例如目标是 Spring Boot，就不要给 Node.js 生态的 POC 高分。
-3. 若某个 POC 的 applies_to（适用技术栈）与目标技术栈完全无交集，给 0 分。
-4. 若目标画像信息很少（大量字段为空），不要脑补技术栈，
-   对无法判断的项给 0.3 左右的中性分。
-5. 只输出 JSON，不要任何解释文字或 markdown 代码块以外的内容。
+2. **必须基于实际证据**：打分必须基于目标画像里的响应头、标题、技术栈、发现的路径。不要凭空脑补。
+   例如：目标明确是 Spring Boot，绝对不要给 Node.js 生态的 POC 高分。
+3. **一票否决**：若某个 POC 的 applies_to（适用技术栈）与目标技术栈完全没有交集，直接给 0 分。
+4. **目标画像不足时**：若目标信息很少（比如全是空值，只有个默认 Nginx 页面），不要瞎猜，对无法判断的项给 0.3 左右的中性分。
+5. **防误报降权**：如果 POC 特征极其宽泛（比如只是匹配 `<title>后台</title>`），且当前目标指纹没有特殊佐证，给 0.2 分。
+
+只输出 JSON，不要任何解释文字或 markdown 代码块以外的内容。
 """
 
 RERANK_FORMAT = {
@@ -236,6 +230,17 @@ def render_report(result: ScanResult) -> str:
         lines.append("\n注意：本次未发现有效漏洞，仍需输出完整的五章报告，"
                      "结论章要明确说明「本次测试未发现安全问题」并给出加固建议。")
 
+    if result.attack_chains:
+        lines.append("\n### 已确认攻击链\n")
+        for chain in result.attack_chains:
+            lines.append(f"#### {chain.title}（{chain.severity.label}）")
+            lines.append(f"- 入口点：{chain.entry_point}")
+            for index, step in enumerate(chain.steps, 1):
+                lines.append(
+                    f"- 第 {index} 步：动作={step.action}；证据={step.evidence}；结果={step.result}"
+                )
+            lines.append(f"- 最终影响：{chain.final_impact}")
+
     for sev in ("critical", "high", "medium", "low", "info"):
         items = grouped.get(sev) or []
         if not items:
@@ -245,6 +250,10 @@ def render_report(result: ScanResult) -> str:
             lines.append(f"#### {f.name}")
             lines.append(f"- 编号：`{f.poc_id}`")
             lines.append(f"- 命中位置：{f.matched_at}")
+            if f.chain_id:
+                lines.append(f"- 攻击链：`{f.chain_id}` 第 {f.step_index + 1} 步")
+                if f.exploit_payload:
+                    lines.append(f"- 串联载荷：{f.exploit_payload}")
             if f.cve:
                 lines.append(f"- 关联 CVE：{', '.join(f.cve)}")
             lines.append(
@@ -408,7 +417,10 @@ dismiss_finding 默认只**标记**（可撤销、报告里有复核附录），
 用户说「生成报告 / 文档」时，按这个顺序：
 1. 先 findings 看当前库里有什么
 2. 把这轮**手工验证但还没登记**的漏洞用 record_finding 补齐
-3. 再 export_report
+3. 如果存在“前一个发现的产出被后一个发现使用”的情况，先用
+    record_attack_chain 登记完整的前置条件 → 动作 → 核心证据 → 结果，
+    再 export_report；独立漏洞不需要硬凑攻击链
+4. 再 export_report
 
 **报告是"就地维护"的文件，不是每次生成一份新副本。**
 export_report 默认把三种格式写进**同一个文件夹**
@@ -436,6 +448,30 @@ export_report 默认把三种格式写进**同一个文件夹**
 `list_files` 确认路径与大小。
 
 当前会话状态会在每轮开头给你，注意读取已有资产和发现，不要重复劳动。
+【核心纪律：攻击链闭环与信息复用】（严重警告：违反此纪律视为任务失败）
+
+1. **绝对禁止信息孤岛**：
+   你每拿到一个 JS 文件、接口响应或报错，必须立刻问自己：
+   - 这里有没有可以用来测试其他接口的线索？
+   - 这个参数是不是别的接口需要的？
+   - 这个规则是不是可以套用到其他接口上？
+
+2. **强制存变量**：
+   如果你在接口 A 拿到了 ID、工号、Token、手机号，**必须立刻调用 `extract_variable` 存下来**。
+   不要指望你的记忆，后续发请求时，务必使用 `${变量名}` 语法让工具自动填入。
+
+3. **登录链路追踪**：
+   如果发现登录链路（如获取临时 Token -> 换取正式 Token），必须尝试构造两步请求，拿到凭证后，带上该凭证去测试所有带 `/secure/` 或需要登录的接口，验证是否存在越权。
+
+4. **报错信息利用**：
+   接口报 "Method not allowed" 就换 Method；报 "参数缺失" 就从 JS 里翻参数名。不要一遇错就放弃。
+
+5. **记录攻击链**：
+   一旦你通过 A 漏洞（中危）获取了凭据，并在 B 漏洞（高危）中拿到了敏感数据，**必须**调用 `record_attack_chain` 记录整条链路。
+   示例：`record_attack_chain(title="从硬编码Token到后台接管", entry_point="JS硬编码", final_impact="获取全部管理员数据", finding_ids=["info_disclosure_1", "authz_2"])`
+
+6. **发现登记关联**：
+   当你用 A 漏洞的产出打通了 B 漏洞，请在 `record_finding` 时，把 `chain_id` 填入对应参数，并在 `evidence` 里写明“使用了前一步获取的 xxx 凭证”。
 """
 
 

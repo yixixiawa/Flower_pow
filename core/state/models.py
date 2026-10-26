@@ -162,6 +162,68 @@ class Asset:
 
 
 @dataclass(slots=True)
+class AttackStep:
+    """一个可复核的攻击链步骤：前置条件、动作、证据与结果。"""
+
+    action: str
+    finding_id: str = ""
+    evidence: str = ""
+    result: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "finding_id": self.finding_id,
+            "evidence": self.evidence,
+            "result": self.result,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "AttackStep":
+        d = d or {}
+        return cls(
+            action=str(d.get("action") or ""),
+            finding_id=str(d.get("finding_id") or ""),
+            evidence=str(d.get("evidence") or ""),
+            result=str(d.get("result") or ""),
+        )
+
+
+@dataclass(slots=True)
+class AttackChain:
+    """多条发现串联后的、可直接放进报告的攻击链。"""
+
+    chain_id: str
+    title: str
+    entry_point: str
+    final_impact: str
+    severity: Severity
+    steps: list[AttackStep] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chain_id": self.chain_id,
+            "title": self.title,
+            "entry_point": self.entry_point,
+            "final_impact": self.final_impact,
+            "severity": self.severity.value,
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "AttackChain":
+        d = d or {}
+        return cls(
+            chain_id=str(d.get("chain_id") or ""),
+            title=str(d.get("title") or ""),
+            entry_point=str(d.get("entry_point") or ""),
+            final_impact=str(d.get("final_impact") or ""),
+            severity=Severity.parse(d.get("severity") or "info"),
+            steps=[AttackStep.from_dict(x) for x in (d.get("steps") or [])],
+        )
+
+
+@dataclass(slots=True)
 class Finding:
     """一条漏洞发现。"""
 
@@ -194,6 +256,10 @@ class Finding:
     dismissed: bool = False
     dismiss_reason: str = ""
     dismissed_at: float = 0.0
+    # ── 攻击链关联 ──────────────────────────────────────────────
+    chain_id: str = ""
+    step_index: int = 0
+    exploit_payload: str = ""
 
     @property
     def active(self) -> bool:
@@ -222,6 +288,9 @@ class Finding:
             "dismissed": self.dismissed,
             "dismiss_reason": self.dismiss_reason,
             "dismissed_at": self.dismissed_at,
+            "chain_id": self.chain_id,
+            "step_index": self.step_index,
+            "exploit_payload": self.exploit_payload,
         }
 
     @classmethod
@@ -248,6 +317,9 @@ class Finding:
             dismissed=bool(d.get("dismissed", False)),
             dismiss_reason=str(d.get("dismiss_reason") or ""),
             dismissed_at=float(d.get("dismissed_at") or 0.0),
+            chain_id=str(d.get("chain_id") or ""),
+            step_index=int(d.get("step_index") or 0),
+            exploit_payload=str(d.get("exploit_payload") or ""),
         )
 
 
@@ -308,6 +380,9 @@ class ScanResult:
     fingerprints: list[Fingerprint] = field(default_factory=list)
     assets: list[Asset] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    # Agent 主动提取并复用的上下文变量，如 jobNumber / authCode / tmpToken。
+    context_vars: dict[str, Any] = field(default_factory=dict)
+    attack_chains: list[AttackChain] = field(default_factory=list)
     # 调度阶段耗时，用于报告里的"时间都花在哪"
     phases: dict[str, float] = field(default_factory=dict)
     pocs_loaded: int = 0
@@ -392,6 +467,15 @@ class ScanResult:
     def assets_of(self, kind: str) -> list[Asset]:
         return [a for a in self.assets if a.kind == kind]
 
+    def add_attack_chain(self, chain: AttackChain) -> AttackChain:
+        """新增或替换同 ID 的攻击链，避免模型重复调用造成重复报告。"""
+        for index, existing in enumerate(self.attack_chains):
+            if existing.chain_id == chain.chain_id:
+                self.attack_chains[index] = chain
+                return chain
+        self.attack_chains.append(chain)
+        return chain
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target,
@@ -411,6 +495,8 @@ class ScanResult:
             "rag_enabled": self.rag_enabled,
             "phases": {k: round(v, 2) for k, v in self.phases.items()},
             "findings": [f.to_dict() for f in self.findings],
+            "context_vars": self.context_vars,
+            "attack_chains": [c.to_dict() for c in self.attack_chains],
             "errors": self.errors,
             "notes": self.notes,
         }
@@ -425,6 +511,8 @@ class ScanResult:
             fingerprints=[Fingerprint.from_dict(x) for x in (d.get("fingerprints") or [])],
             assets=[Asset(**x) for x in (d.get("assets") or []) if isinstance(x, dict)],
             findings=[Finding.from_dict(x) for x in (d.get("findings") or [])],
+            context_vars=dict(d.get("context_vars") or {}),
+            attack_chains=[AttackChain.from_dict(x) for x in (d.get("attack_chains") or [])],
             phases={str(k): float(v) for k, v in (d.get("phases") or {}).items()},
             pocs_loaded=int(d.get("pocs_loaded") or 0),
             pocs_selected=int(d.get("pocs_selected") or 0),

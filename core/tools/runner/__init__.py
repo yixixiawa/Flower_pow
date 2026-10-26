@@ -28,6 +28,7 @@ r"""工具执行器——把模型的 tool_call 变成真实动作。
 ``verify``              业务与验证类 handler（login、authz_probe、run_pipeline）
 ``report``              发现台账 handler（findings、dismiss_finding...）
 ``evidence``            证据登记 handler（record_finding、backfill_evidence）
+``chain``               上下文变量与攻击链 handler
 ``export``              报告导出 handler（export_report）
 ``files``               文件操作 handler（read_file、write_file...）
 ``external``            外部 CLI 执行与 argv 闸门
@@ -40,6 +41,7 @@ r"""工具执行器——把模型的 tool_call 变成真实动作。
 from __future__ import annotations
 
 from core.tools.runner.base import MAX_TOOL_OUTPUT, ToolBlocked, _ToolRunnerBase
+from core.tools.runner.chain import ChainMixin
 from core.tools.runner.evidence import EvidenceMixin
 from core.tools.runner.export import ExportMixin
 from core.tools.runner.external import ExternalMixin
@@ -56,6 +58,7 @@ class ToolRunner(
     VerifyMixin,
     FindingMixin,
     EvidenceMixin,
+   ChainMixin,
     ExportMixin,
     FileMixin,
     ExternalMixin,

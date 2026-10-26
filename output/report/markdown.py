@@ -163,6 +163,35 @@ def write_markdown(
         L += ["", "## 侦察资产", ""]
         L += _asset_section(result)
 
+    if result.attack_chains:
+        L += ["", "## 攻击链路", ""]
+        L.append(
+            "> 以下链路只展示 Agent 显式登记的前置条件、动作、证据与结果；"
+            "未登记的推测不计入最终影响。"
+        )
+        L.append("")
+        for chain_no, chain in enumerate(result.attack_chains, 1):
+            L += [f"### 攻击链 {chain_no}：{unescape_md(chain.title)}", ""]
+            L += [
+                f"- 链条 ID：`{chain.chain_id}`",
+                f"- 整体等级：{chain.severity.label}",
+                f"- 入口点：{unescape_md(chain.entry_point)}",
+                f"- 最终影响：{unescape_md(chain.final_impact)}",
+                "",
+                "| 步骤 | 关联发现 | 动作 | 核心证据 | 结果 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+            for step_no, step in enumerate(chain.steps, 1):
+                cells = [
+                    str(step_no),
+                    f"`{step.finding_id}`" if step.finding_id else "-",
+                    unescape_md(step.action).replace("|", "\\|"),
+                    unescape_md(step.evidence).replace("|", "\\|").replace("\n", "<br>"),
+                    unescape_md(step.result).replace("|", "\\|").replace("\n", "<br>"),
+                ]
+                L.append("| " + " | ".join(cells) + " |")
+            L.append("")
+
     # 阶段耗时——告诉使用者时间花在哪
     if result.phases:
         L += ["", "## 执行阶段耗时", "", "| 阶段 | 耗时 |", "| --- | --- |"]
@@ -222,6 +251,10 @@ def write_markdown(
                 L.append(f"- 研判依据：{f.rationale}")
             if f.tags:
                 L.append(f"- 标签：{', '.join(f.tags)}")
+            if f.chain_id:
+                L.append(f"- 攻击链：`{f.chain_id}` 第 {f.step_index + 1} 步")
+                if f.exploit_payload:
+                    L.append(f"- 串联载荷：`{unescape_md(f.exploit_payload)}`")
             L.append("")
             if desc:
                 # 说明按**段落**渲染，不再塞进 `- 说明：xxx` 一条列表项：

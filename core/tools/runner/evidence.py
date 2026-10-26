@@ -101,6 +101,9 @@ class EvidenceMixin:
         payload: str = "",
         expected: str = "",
         response: str = "",
+        chain_id: str = "",
+        step_index: int = 0,
+        exploit_payload: str = "",
     ) -> str:
         """登记一条手工验证的漏洞。
 
@@ -290,6 +293,9 @@ class EvidenceMixin:
             detector="manual",
             cve=[c.strip() for c in (cve or "").split(",") if c.strip()],
             tags=["manual", str(category).lower()],
+            chain_id=str(chain_id or "").strip(),
+            step_index=max(0, int(step_index or 0)),
+            exploit_payload=str(exploit_payload or "").strip(),
         )
         added = self._merge_findings(session, [f])
         if not added:
