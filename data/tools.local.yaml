@@ -1,9 +1,9 @@
 # 自定义外部工具清单
 # ==================
-# 装了新工具但 starter.py tools 显示"未安装"？在这里登记，不用改 Python 源码。
+# 装了新工具但 flower_pow.py tools 显示"未安装"？在这里登记，不用改 Python 源码。
 #
 # 生效方式：改完直接跑下一条命令即可（探测每次都重新读这个文件，无需重启）。
-#     python starter.py tools
+#     python flower_pow.py tools
 #
 # 四条规则：
 # 1. key 用小写字母/数字/下划线，同名会**覆盖**内置清单里的同名项。
