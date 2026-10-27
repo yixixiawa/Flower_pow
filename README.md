@@ -12,7 +12,7 @@
 | 章节 | 一句话 |
 |---|---|
 | [1. 它是什么](#1-它是什么) | 渗透搭档：判断归你，跑腿归它 |
-| [2. 上手](#2-上手) | 四条命令进到第一个目标 |
+| [2. 启动](#2-启动) | 装 → 配 Key → 第一次启动 → 四种启动姿势 |
 | [3. 一次渗透长什么样](#3-一次渗透长什么样) | 六步流程 + 真实回放 + 常用打法速查 |
 | [4. 武器库](#4-武器库) | 34 个内置工具 / 18 个命令 / 33 条 POC |
 | [5. 攻击链](#5-攻击链从一串漏洞到一条路径) | 上下文变量池 + 显式链路登记 |
@@ -78,34 +78,135 @@
 
 ---
 
-## 2. 上手
+## 2. 启动
+
+从裸机器到敲出第一句渗透指令，一共四步：**装 → 配 Key → 第一次启动 → 挑启动姿势**。
+Windows / Linux / macOS 都支持，下面以最常见的 Windows + venv 为例。
+
+### 2.1 第一步：装
+
+**环境要求**：Python ≥ 3.10（3.12+ 更稳）、能访问模型 API 端点（默认 `api.deepseek.com`，可换成任何 OpenAI 兼容端点）。
 
 ```bash
-# 1) 装（直接依赖只有 7 个，没有 numpy / chromadb 那棵依赖树）
-python -m pip install .
+# ① 进入项目目录
+cd flower_pow
 
-# 2) 体检：引擎、采集器、POC 索引、外部工具、模型状态一次看清
+# ② 建并激活虚拟环境（别裸装进系统 Python）
+python -m venv .venv
+source .venv/Scripts/activate        # Git Bash
+# .venv\Scripts\Activate.ps1         # PowerShell
+# source .venv/bin/activate          # Linux / macOS
+
+# ③ 安装（二选一）
+python -m pip install -r requirements.txt   # 开发方式：源码直接跑
+python -m pip install .                     # 安装方式：注册 flower-pow 命令
+```
+
+直接依赖只有 7 个（httpx / openai / typer / rich / pydantic / pyyaml / prompt-toolkit）——
+向量检索用的是纯 Python 的 hashing trick + BM25（`kb/indexer.py`），
+没有 numpy / chromadb 那棵依赖树，装起来很快。
+
+**验证装好了**：
+
+```bash
+# 推荐姿势：完整路径永远指向对的解释器，绕开 venv 激活的所有坑（详见 §13）
+.venv/Scripts/python.exe flower_pow.py engines
+
+# 装成包之后也可以直接用命令
 flower-pow engines
+```
 
-# 3) 填 Key（首次运行会交互询问并写进 .env；也可直接 export）
+体检正常会一次列清：引擎、采集器、POC 索引、外部工具（nmap / dirsearch / nuclei…装了就认）、模型状态。
+
+### 2.2 第二步：配 Key
+
+Agent 对话需要一把 Key（默认 DeepSeek）。三种给法，任选其一：
+
+```bash
+# ① 环境变量（当前终端有效）
 export DEEPSEEK_API_KEY=sk-xxx
 
-# 4) 开打
-flower-pow chat https://你的授权目标
+# ② 写进 .env（项目根目录，已被 .gitignore 排除，不会进 git）
+echo DEEPSEEK_API_KEY=sk-xxx > .env
+
+# ③ 什么都不配 —— 首次启动时程序会交互询问一次，答完自动写入 .env
 ```
 
-也可以装 wheel（`pip install flower-pow`），内置 POC 规则随包分发，结果仍写当前目录的 `data/` `output/`。
+**没 Key 也能跑**：扫描、POC 验证、RAG 检索、报告导出全部正常，只有对话式 Agent、
+RAG 重排和误报研判需要 Key。没配时程序自动降级进固定剧本模式，会话内 `/key` 随时可补。
+这也是为什么体检在前、要 Key 在后——不让"没 Key 就没法用"的误解发生。
 
-**没 Key 也能用**：扫描、POC 验证、报告模板渲染都不依赖大模型，只有 RAG 重排和误报研判需要。
-体检在前、要 Key 在后，就是为了不让"没 Key 就没法用"这种误解发生。
+### 2.3 第三步：第一次启动（推荐入口）
 
-**看工具清单**，确认它手上有多少家伙：
+什么都不带，直接：
 
 ```bash
-flower-pow tools       # Agent 能调的两层能力：本机外部 CLI + 34 个内置工具
-flower-pow pocs        # 33 条 POC，--detail 看详情
-flower-pow proxy       # 本机代理检测结果 + 请求级代理决策
+.venv/Scripts/python.exe flower_pow.py
 ```
+
+启动流程是固定的**体检 → 要 Key → 进对话**，每一步在屏幕上都能看到：
+
+| 程序做什么 | 说明 |
+|---|---|
+| ① 修终端编码 | Windows 中文机 stdin/stdout 固定成 UTF-8，避免"中文要打两次才生效" |
+| ② 初始化体检 | 依赖完整性、POC 向量索引、外部工具探测（`--no-probe` 可跳过版本探测，启动更快） |
+| ③ 模型/代理提示 | 配置里写了已下线模型名会警告；探测到 Burp / Clash 代理会告知"全部目标走代理（含内网）" |
+| ④ 索要 Key | 没有才问，写 `.env`；给不了就降级固定剧本模式 |
+| ⑤ 进提示符 | **不开场白、不自我介绍**，光标直接停在那等你 |
+
+进提示符之后，第一句话就是任务：
+
+```
+› 目标 https://target.com，先做信息收集
+```
+
+### 2.4 第四步：挑一个启动姿势
+
+同一套武器库，四种打开方式：
+
+| 姿势 | 命令 | 什么时候用 |
+|---|---|---|
+| **无参入口**（推荐） | `python flower_pow.py` | 日常开工，先体检再对话 |
+| **指定目标进会话** | `python flower_pow.py chat https://目标` | 已经想好打哪 |
+| **一次性扫描** | `python flower_pow.py scan https://目标` | 不想交互，跑完出报告 |
+| **固定剧本** | 任意命令加 `--classic` | 不烧 token / 给别人复现 |
+
+常用变体：
+
+```bash
+flower-pow chat https://target --auto 10        # 自动推进 10 轮
+flower-pow chat --poll                          # 跑到穷尽（有轮数安全阀）
+flower-pow chat --resume                        # 断点续跑，恢复完整对话历史
+flower-pow scan https://target --format all     # md + html + json 都要
+flower-pow subs subs.txt --root target.com      # 子域批量发现
+```
+
+全部 18 个 CLI 命令见 §4.2；进会话后的 25 个 `/命令` 见 §3.3。
+
+### 2.5 无参入口的全部选项
+
+```text
+--config/-c PATH           指定配置文件（默认 ./config.yaml）
+--api-key KEY              直接传 Key（跳过交互输入）
+--save-key/--no-save-key   要不要把 Key 写进 .env（默认写）
+--no-probe                 跳过外部工具版本探测，启动更快
+--classic                  不进 Agent，直接固定剧本模式
+--kickoff                  启动后先让模型自我介绍一轮（默认直接进提示符）
+```
+
+到这里，启动就讲完了。往下是"进了会话怎么打"——先看 §3 的一次完整渗透流程。
+
+### 2.6 启动后多了哪些目录
+
+首次运行会在项目根目录生成：
+
+```
+data/      会话快照、排除清单、知识库、日志
+output/    证据报文 + 导出的 MD/HTML/JSON 报告
+.env       API Key（.gitignore 已排除）
+```
+
+都不是要提交的东西，`.gitignore` 已统一排除。
 
 ---
 
