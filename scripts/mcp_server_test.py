@@ -136,9 +136,18 @@ def main() -> int:
     print("\n场景6 CLI 注册与导入隔离")
     from cli import app as typer_app
 
-    cmd_names = {getattr(c.callback, "__name__", "") for c in typer_app.registered_commands}
-    check("mcpserve" in cmd_names, "`flower_pow mcp` 已注册到 CLI")
+    # `mcp` 现在是**子命令组**（serve / install / status / uninstall），
+    # 无参时的行为仍是启动 server，所以配置里 `[flower_pow.py, mcp]` 形状不变。
+    group_names = {g.name for g in typer_app.registered_groups}
+    check("mcp" in group_names, "`flower_pow mcp` 已注册到 CLI（子命令组）")
+    from cli.mcpsrv import mcp_app
+
+    sub_names = {getattr(c.callback, "__name__", "") for c in mcp_app.registered_commands}
+    check("mcp_install" in sub_names, "`flower_pow mcp install` 可用")
     import mcp_server
+    from mcp_server import registry
+
+    check(callable(registry.fingerprint), "接入层可独立导入（不依赖 mcp 包）")
 
     check(callable(getattr(mcp_server, "main", None)), "包入口 mcp_server.main 可用")
     check(Path("mcp_server/server.py").is_file(), "server.py 存在")
