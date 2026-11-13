@@ -54,6 +54,11 @@ class EvidenceMixin:
         只拦**形态不一致**的明显串线：目标是域名却登记 IP，或目标是 IP
         却登记域名。同形态不同主机（子域名、多主机业务）一律放行——
         那是正常业务形态，拦了会误伤。
+
+        形态不一致也有一条**豁免通道**：登记的主机在本会话的资产里出现过
+        （域名目标解析出来的 IP、扫描中发现的别名域/反查域名都会作为资产
+        入库）。出现在资产里说明它是本次测试正当覆盖的主机，不是串线——
+        一刀切按形态拦，反而把最正常的"测着测着拿到了解析 IP"挡在门外。
         """
         target = getattr(session, "target", "") or ""
         target_host = self._scope_host(target)
@@ -73,20 +78,33 @@ class EvidenceMixin:
         if is_match_ip == is_target_ip:
             return ""
 
+        # 豁免：该主机是本会话自己发现并登记过的资产，不算串线
+        if self._host_known(session, match_host):
+            return ""
+
         if is_target_ip:
             return (
                 f"【已拦截】当前会话的目标是 IP（{target_host}），"
                 f"你登记的却是域名（{match_host}）。"
-                "为防止报告串线，请先使用 /target 切换到该域名后再登记，"
-                "或把matched_at 改回当前目标。"
+                "为防止报告串线，请先用 set_target 工具切换到该域名后再登记，"
+                "或把 matched_at 改回当前目标。"
             )
         return (
             f"【已拦截】你尝试在一个域名为目标（{target_host}）的会话中，"
             f"登记 IP（{match_host}）的漏洞。"
-            "为了防止报告串线，请先使用 "
-            f"/target http://{match_host} 切换目标后再登记，"
+            "为了防止报告串线，请先调用 set_target 工具切换目标"
+            f"（set_target url=\"http://{match_host}\"）后再登记，"
             "或把 matched_at 改回当前目标。"
         )
+
+    @classmethod
+    def _host_known(cls, session, host: str) -> bool:
+        """主机是否已是本会话登记过的资产（URL/主机/IP 各形态都认）。"""
+        result = getattr(session, "result", None)
+        for a in getattr(result, "assets", None) or []:
+            if cls._scope_host(str(getattr(a, "value", "") or "")) == host:
+                return True
+        return False
 
     async def _h_record_finding(
         self,
@@ -155,6 +173,31 @@ class EvidenceMixin:
         scope_msg = self._check_target_scope(session, matched_at)
         if scope_msg:
             return scope_msg
+
+        # ── 攻击链归属校验：chain_id 必须指向已登记的链 ─────────────
+        # 早期只收不查：模型编一个 "chain-1" 也能挂上，报告里出现指向
+        # 空气的攻击链关联。step_index 也要落在该链的步骤范围内。
+        chain_id = str(chain_id or "").strip()
+        if chain_id:
+            chains = {c.chain_id: c for c in getattr(session.result, "attack_chains", [])}
+            chain = chains.get(chain_id)
+            if chain is None:
+                hint = "、".join(chains) if chains else "还没有任何已登记的攻击链"
+                return (
+                    f"登记失败：chain_id {chain_id} 不存在（当前：{hint}）。"
+                    "只有 record_attack_chain 登记过的链才能关联；"
+                    "独立发现不要传 chain_id，确属攻击链就先登记链再回来补关联。"
+                )
+            try:
+                idx = max(0, int(step_index or 0))
+            except (TypeError, ValueError):
+                idx = 0
+            if idx >= len(chain.steps):
+                return (
+                    f"登记失败：step_index {idx} 超出攻击链 {chain_id} 的步骤范围"
+                    f"（共 {len(chain.steps)} 步，从 0 开始）。"
+                )
+            step_index = idx
 
         if not name.strip():
             return "登记失败：name 不能为空"
@@ -293,7 +336,7 @@ class EvidenceMixin:
             detector="manual",
             cve=[c.strip() for c in (cve or "").split(",") if c.strip()],
             tags=["manual", str(category).lower()],
-            chain_id=str(chain_id or "").strip(),
+            chain_id=chain_id,
             step_index=max(0, int(step_index or 0)),
             exploit_payload=str(exploit_payload or "").strip(),
         )

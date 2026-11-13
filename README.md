@@ -25,6 +25,7 @@
 | [12. 目录与规模](#12-目录与规模) | 145 个文件都在哪 |
 | [13. 排障](#13-排障) | 三个最常撞的坑 |
 | [14. 许可](#14-许可) | MIT + 法律责任声明 |
+| [附录：MCP Server](#附录mcp-server接入-workbuddy--claude) | 把 10 个工具暴露给外部 AI 客户端 |
 
 ---
 
@@ -999,8 +1000,14 @@ scripts/                29 个回归脚本（不用 pytest，`python scripts/run
 `doc/auxiliary/FILE_MAP.md` 是每个文件的职责摘要与引用关系（本地生成，不入库）：
 
 ```bash
-python scripts/gen_file_map.py      # 改完代码重跑一次即可刷新
+python scripts/gen_file_map.py        # 改完代码重跑一次即可刷新
+python scripts/gen_repl_contract.py   # 改完 core/repl 重跑，刷新 mixin 类型契约
 ```
+
+`core/repl/_contract.py` 同理是生成物（**不手改**）：`Repl` 由七个 mixin 多继承拼成，
+静态分析器按单个 class 独立解析属性，会把这些跨 mixin 的 `self.xxx` 全判成 unknown。
+各 mixin 在 `TYPE_CHECKING` 阶段继承该契约即可消掉误报，运行期 `_Base` 仍是 `object`，
+MRO 与实例行为完全不变。
 
 ---
 
@@ -1050,3 +1057,55 @@ MIT。仅限**授权测试**、CTF 与安全教育。
 未经授权对他人系统进行渗透测试，在《网络安全法》《刑法》第 285/286 条下可能构成犯罪。
 使用本工具即表示你已获得目标所有者的书面授权。
 ```
+
+---
+
+## 附录：MCP Server（接入 WorkBuddy / Claude）
+
+`mcp_server/` 把扫描器包成一个 MCP Server，**10 个工具**通过标准协议暴露给外部客户端。
+设计上不复用 CLI 的打印流：CLI 是"一次性命令 + 终端输出"，MCP 是"常驻进程 + 结构化返回"，
+两者的生命周期完全不同，硬塞在一起会让 CLI 背上 mcp 依赖。
+
+### 装与跑
+
+```bash
+.venv/Scripts/python.exe -m pip install "mcp>=2"   # 可选依赖，不装主程序照常跑
+.venv/Scripts/python.exe flower_pow.py mcp         # 默认 stdio；--transport http 可为远程部署
+```
+
+### WorkBuddy 接入（`~/.workbuddy/mcp.json`）
+
+```json
+{
+  "mcpServers": {
+    "flower_pow": {
+      "command": "D://anyworkspace//python//flower_pow//.venv//Scripts//python.exe",
+      "args": ["D://anyworkspace//python//flower_pow//flower_pow.py", "mcp"]
+    }
+  }
+}
+```
+
+写完后到连接器管理页右上角的"自定义连接器"里 **Trust** 一下才会生效。启动时进程会自己
+`chdir` 到项目根——客户端给的 CWD 是不确定的，不切就会静默用默认配置 + 空 POC 目录扫一遍。
+
+### 工具清单
+
+| 工具 | 作用 |
+|---|---|
+| `doctor` | 体检：依赖 / 外部工具 / POC 库 / 索引是否过期 / 代理 / 只读模式（不回显 Key） |
+| `poc_list` | 规则清单，传 `query` 走向量召回 |
+| `poc_show` | 单条规则全文（含原始 YAML），排查"为什么没命中" |
+| `kb_search` | POC 库 + 历史沉淀知识双路召回 |
+| `sessions` / `findings` | 最近会话 / 某次会话的发现清单 |
+| `scan_start` | 起扫描，**立即返回 job_id** |
+| `scan_status` | 状态、用时、最近日志、完成后的结果摘要 |
+| `scan_cancel` | 取消（会话快照仍会落盘） |
+| `report` | 已完成任务出报告（md / html / all / json） |
+
+### 三个必须知道的约定
+
+1. **扫描是后台任务**：`scan_start` → `scan_status` 轮询 → `report`。三分钟的扫描塞进一次
+   工具调用，客户端超时后拿不到结果，后台却还在打目标——那是最难排查的状态。
+2. **stdout 是协议通道**：所有诊断都走 stderr，工具只返回结构化数据。
+3. **回归**：`python scripts/mcp_server_test.py`（29 项，全程不碰外网）。

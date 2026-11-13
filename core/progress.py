@@ -154,7 +154,7 @@ async def poll_until_done(
     *,
     ex: Exhaustion,
     on_round: Callable[[RoundOutcome], None] | None = None,
-    checkpoint: Callable[[], None] | None = None,
+    checkpoint: Callable[[], object] | None = None,
 ) -> tuple[str, list[RoundOutcome]]:
     """反复跑轮，直到 :class:`Exhaustion` 判定停下。
 

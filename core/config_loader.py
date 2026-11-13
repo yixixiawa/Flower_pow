@@ -437,6 +437,11 @@ def load_config(path: str | Path | None = None) -> Config:
 
     cfg.output_dir = _env_str("POCS_OUTPUT_DIR", cfg.output_dir)
     cfg.data_dir = _env_str("POCS_DATA_DIR", cfg.data_dir)
+    # 相对路径按**配置文件所在目录**解析，而不是进程 CWD。
+    # 这是"历史会话莫名其妙不见了"的根因之一：`data_dir: ./data` 是相对路径，
+    # 从别的目录启动（快捷方式、IDE 工作目录、计划任务）时它指到别处，
+    # `/sessions` 和 `flower_pow sessions` 就会一脸空白地说"暂无历史会话"。
+    _resolve_relative_dirs(cfg, cfg_path)
     s.evidence_dir = _env_str("POCS_EVIDENCE_DIR", s.evidence_dir)
     # 证据落盘目录的默认值必须等 output_dir 尘埃落定后再填：
     # detector 只拿得到 ScanConfig，够不到顶层的 output_dir。
@@ -487,6 +492,41 @@ def _resolve_llm_models(cfg: Config) -> None:
         cfg.llm.deep_model, warn2 = normalize(cfg.llm.deep_model)
         if warn2:
             cfg.llm.model_warnings.append(warn2)
+
+
+def _resolve_relative_dirs(cfg: Config, cfg_path: Path) -> None:
+    """把 ``output_dir`` / ``data_dir`` 的相对路径固定到**配置文件所在目录**。
+
+    为什么不能按 CWD 解析：``data_dir: ./data`` 是相对路径，从别的目录启动
+    （快捷方式、IDE 工作目录、计划任务、别的项目里调用）时它就指到别处，
+    ``/sessions`` 与 ``flower_pow sessions`` 会一片空白，看起来像"历史会话
+    全丢了"。配置跟着配置文件走才是符合直觉的语义。
+
+    只在"解析出的基准目录与 CWD 不同"时改写，正常从项目根启动时路径
+    与以前完全一致（行为零变化）。找不到 config.yaml 时基准退回**项目根**
+    （``core/`` 的上一级）——装到别处的脚本从任意目录启动也能找回自己的
+    ``data/sessions``。
+    """
+    try:
+        base = cfg_path.resolve().parent if cfg_path.is_file() else _project_root()
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return
+    if base == cwd:
+        return
+    for name in ("output_dir", "data_dir"):
+        raw = getattr(cfg, name, "")
+        if not raw:
+            continue
+        p = Path(raw)
+        if p.is_absolute() or raw.startswith("~"):
+            continue
+        setattr(cfg, name, str((base / p).resolve()))
+
+
+def _project_root() -> Path:
+    """本包所在项目根目录（``core/`` 的上一级）。"""
+    return Path(__file__).resolve().parent.parent
 
 
 def sessions_dir(cfg: Config) -> Path:

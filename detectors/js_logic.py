@@ -18,7 +18,8 @@
 两条边界
 --------
 1. **不执行 JS。** 全部是正则匹配，不 eval、不渲染、不加载第三方资源。
-2. **验证只发 GET。** 与 api_authz 一致——探测不该改动业务数据。
+2. **验证只发 GET。** 与 api_authz 的 GET 线一致——探测不该改动业务数据
+   （api_authz 另有查询型 POST 线，同样受 WRITE_RE 写操作黑名单约束）。
 """
 
 from __future__ import annotations

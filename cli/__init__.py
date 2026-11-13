@@ -22,6 +22,7 @@
 ``subs``     子域批量发现与下探
 ``ledger``   ``sessions`` / ``findings`` / ``proxy``
 ``initcmd``  生成 ``.env`` 模板
+``mcpsrv``   ``mcp``：以 MCP Server 形式暴露工具（供 WorkBuddy / Claude 接入）
 ``summary``  扫描结果摘要打印
 =====================  ==========================================================
 """
@@ -42,6 +43,7 @@ from cli import models  # noqa: E402,F401
 from cli import subs  # noqa: E402,F401
 from cli import ledger  # noqa: E402,F401
 from cli import initcmd  # noqa: E402,F401
+from cli import mcpsrv  # noqa: E402,F401  —— mcp：把扫描器暴露成 MCP 工具
 from cli import summary  # noqa: E402,F401
 
 __all__ = ["app", "console", "err"]

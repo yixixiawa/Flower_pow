@@ -58,13 +58,25 @@ class FakeAgent:
 
 
 class FakeRunner:
-    """最小 runner 替身——记录 ``reset_target_scope`` 被调了几次。"""
+    """最小 runner 替身——记录 ``reset_target_scope`` / ``cancel_background``。
+
+    换目标时必须两件事都做：清运行期缓存，并**取消旧目标的后台任务**
+    （它们跑完会把资产并进新会话，报告串线）。
+    """
 
     def __init__(self):
         self.reset_calls = 0
+        self.cancel_calls: list[tuple[str, str]] = []
 
     def reset_target_scope(self):
         self.reset_calls += 1
+
+    def cancel_background(self, session, reason: str = ""):
+        n = len(session.tasks.running())
+        for t in session.tasks.running():
+            session.tasks.cancel(t.task_id, reason)
+        self.cancel_calls.append((reason, str(n)))
+        return n
 
 
 def make_repl(tmp: Path, session: Session) -> Repl:
@@ -86,7 +98,7 @@ def make_repl(tmp: Path, session: Session) -> Repl:
 def fill_session(s: Session) -> None:
     """给会话塞满"与目标绑定"的数据——每一项都该在切换时被清掉。"""
     s.result.assets.append(Asset(kind="port", value="80"))
-    from core.state import Category, Evidence, Finding, Severity
+    from core.state import AttackChain, AttackStep, Category, Evidence, Finding, Severity
 
     s.result.findings.append(
         Finding(
@@ -101,10 +113,22 @@ def fill_session(s: Session) -> None:
     s.result.fingerprints.append(Fingerprint(target="old.test", server="nginx"))
     s.result.notes.append("旧目标的备注")
     s.result.errors.append("旧目标的错误")
+    s.result.context_vars["token"] = {
+        "value": "old-token", "evidence": "", "source": "", "updated_at": 0.0,
+    }
+    s.result.attack_chains.append(
+        AttackChain(
+            chain_id="chain-1", title="旧目标的链", entry_point="e", final_impact="i",
+            severity=Severity.HIGH, steps=[AttackStep(action="a", evidence="ev", result="r")],
+        )
+    )
     s.credentials["token"] = "old-token"
     s.turns.append(Turn(no=1, phase=Phase.RECON, actions=["x"],
                         new_assets=1, new_findings=1, elapsed=1.0))
     s.model.resources.append("旧目标的接口")
+    # 对话历史也属于上一目标：不清的话 Agent 重建时会原样灌回
+    s.history.append({"role": "user", "content": "旧目标的对话"})
+    s.add_conversation("旧目标的对话")
 
 
 def main() -> int:
@@ -131,6 +155,8 @@ def main() -> int:
     print("\n场景2 /target 换目标 → 全清")
     s = Session(target="http://old.test")
     fill_session(s)
+    s.tasks.start("recon_ports_bg", "旧目标的端口扫描")   # 换目标必须取消它
+    old_sid = s.session_id
     repl = make_repl(tmp, s)
     repl.agent = FakeAgent(s)
     repl.runner = FakeRunner()
@@ -145,9 +171,16 @@ def main() -> int:
     check(repl.session.credentials == {}, "凭证清空")
     check(len(repl.session.turns) == 0, "轮次记录清空")
     check(len(repl.session.model.resources) == 0, "业务模型清空")
+    check(repl.session.result.context_vars == {}, "上下文变量清空")
+    check(len(repl.session.result.attack_chains) == 0, "攻击链清空")
+    check(repl.session.history == [], "对话历史清空（Agent 重建时不回填旧对话）")
+    check(len(repl.session.conversations) == 0, "对话标题索引清空")
+    check(repl.session.session_id != old_sid, "会话身份重新发放（旧快照不被覆盖）")
     check(repl.agent.reset_calls == 1, "Agent 对话历史被 reset")
     check(repl.runner.reset_calls == 1, "runner 运行期缓存被清")
     check(repl.session.result.target == "http://new.test", "result.target 也指向新目标")
+    check(bool(repl.runner.cancel_calls), "换目标时取消了旧目标的后台任务")
+    check(len(repl.session.tasks) == 0, "后台任务台账已清空")
 
     print("\n场景3 /target 同一目标 → 不动")
     s2 = Session(target="http://same.test")

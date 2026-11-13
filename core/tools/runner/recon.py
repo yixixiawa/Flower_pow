@@ -77,26 +77,52 @@ class ReconMixin:
         session.result.fingerprints.append(fp)
         return f"指纹：{fp.summary()}"
 
-    async def _h_recon_ports(self, session, host: str = "", top: int = 0) -> str:
+    def _host_of(self, session, host: str = "") -> str:
+        """确定要扫的主机：显式参数优先，否则取会话目标的主机名。"""
+        if host:
+            return urlparse(self._normalize_target(host)).hostname or host
+        return urlparse(self._target_of(session)).hostname or ""
+
+    async def _scan_ports(
+        self, session, host: str, top: int = 0, *, max_top: int
+    ) -> str:
+        """端口扫描的**唯一实现**（前台 / 后台共用）。
+
+        端口数走**配置副本**而不是改 ``self.cfg.scan``：前台探测与后台任务
+        可能同时在跑，共享一个可变配置会让两边的端口数互相覆盖
+        （原来的 save/restore 只在串行调用下成立）。
+        """
         from collectors.port_scan import PortScanner
 
-        if host:
-            norm = self._normalize_target(host)
-            h = urlparse(norm).hostname or host
-        else:
-            h = urlparse(self._target_of(session)).hostname or ""
-        if not h:
-            return "无法确定主机名"
-        old = self.cfg.scan.port_scan_top
-        if top:
-            self.cfg.scan.port_scan_top = max(1, min(int(top), 2000))
-        try:
-            assets = await PortScanner(self.cfg.scan).run(h, False)
-        finally:
-            self.cfg.scan.port_scan_top = old
+        want = int(top or 0) or int(getattr(self.cfg.scan, "port_scan_top", 0) or 0) or 100
+        # n 已经按调用方的 max_top 夹过：前台 200、后台 2000
+        n = max(1, min(want, max_top))
+        scan_cfg = self.cfg.scan.model_copy(update={"port_scan_top": n})
+        assets = await PortScanner(scan_cfg).run(host, False)
         added = self._merge_assets(session, assets)
         ports = [a.value for a in assets][:40]
         return f"开放端口 {len(ports)} 个（新增资产 {added}）：{', '.join(ports) or '无'}"
+
+    async def _h_recon_ports(self, session, host: str = "", top: int = 0) -> str:
+        """前台端口探测：**只做快速探测**（端口数上限 QUICK_PORTS_MAX）。
+
+        要大范围扫描用 ``recon_ports_bg``——它在后台跑，立即返回，
+        不阻塞模型的思考流程。
+        """
+        from core.tools.runner.tasks import QUICK_PORTS_MAX
+
+        h = self._host_of(session, host)
+        if not h:
+            return "无法确定主机名"
+        want = int(top or 0)
+        text = await self._scan_ports(session, h, want, max_top=QUICK_PORTS_MAX)
+        if want > QUICK_PORTS_MAX:
+            text += (
+                f"\n（前台只做快速探测：端口数已从 {want} 收到 {QUICK_PORTS_MAX}。"
+                f"要扫更多请用 recon_ports_bg —— 它立即返回，不阻塞你继续思考；"
+                f"之后用 list_tasks 取结果。）"
+            )
+        return text
 
     async def _h_recon_paths(self, session, url: str = "") -> str:
         from collectors.path_scan import PathScanner

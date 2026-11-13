@@ -17,7 +17,7 @@ COMMANDS = [
     "/help", "/status", "/assets", "/findings", "/model",
     "/title", "/chats", "/reset", "/report", "/sessions", "/resume",
     "/backfill", "/clean", "/agent", "/target", "/tools", "/key", "/turns",
-    "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/quit",
+    "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/readonly", "/quit",
 ]
 
 BANNER = """
@@ -50,8 +50,9 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
   /reset        **彻底重置**：销毁当前所有数据（目标/资产/发现/凭证/对话
                 历史/盘上快照），换一把全新的椅子
   /report [格式] 导出报告（md/html/json/all）
-  /sessions     列出可恢复的会话
-  /resume [id]  载入会话（不给 id 则取最近一次），连对话历史一起恢复
+  /sessions [N|all] 列出可恢复的会话（默认全部，带 #编号、标题、更新时间）
+  /resume [#编号|名字] 载入会话（不给则取最近一次），连对话历史一起恢复
+                支持 `#3`、完整目录名、id、唯一的名字片段
   /clean        删除所有空会话（没目标、没对话、没结果）。恢复时也会自动清
   /quit         退出（自动保存；空会话不保存）
 
@@ -61,6 +62,9 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
                     全部资产与发现**，防报告串线）
   /tools            列出本机可调用工具与版本
   /key              重新设置 API Key（写入 .env）
+  /readonly [on|off] 运行期切换只读模式（不带参数=查看当前状态）。
+                    off=放行攻击性外部工具与破坏性 POC（只影响本次运行，
+                    不写回 config.yaml，重启后回到配置值）；on=恢复只读
   /turns            历史轮次
   /kickoff          让模型自我介绍一轮（启动时默认不说，省一轮 token）
   /auto             一键全自动：给警告 → 确认 → 跑完整条流水线（等价 Alt+Shift）

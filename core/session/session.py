@@ -1,7 +1,7 @@
 """一次交互式测试的完整状态。
 
-持有轮次推进、发现台账、资产合并与快照读写；**``load`` 是类方法**，
-``data/sessions/<id>/session.json`` 就是它的 ``to_dict``。"""
+持有轮次推进、发现台账、资产合并、**后台任务台账**与快照读写；
+**``load`` 是类方法**，``data/sessions/<id>/session.json`` 就是它的 ``to_dict``。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,12 @@ from core.session.models import Phase
 from core.session.models import Turn
 from core.session.models import ConversationTurn
 from core.session.models import BusinessModel
+from core.session.models import as_dict
+from core.session.models import as_float
+from core.session.models import as_list
+from core.session.models import as_phase
+from core.session.models import as_str
+from core.session.tasks import TaskManager
 
 
 class Session:
@@ -38,6 +44,8 @@ class Session:
         created_at: float | None = None,
         history: list[dict[str, Any]] | None = None,
         conversations: list[ConversationTurn] | None = None,
+        tasks: TaskManager | None = None,
+        updated_at: float | None = None,
     ) -> None:
         self.target = target.rstrip("/")
         self.session_id = session_id or f"{int(time.time())}"
@@ -60,7 +68,13 @@ class Session:
         self.history: list[dict[str, Any]] = history or []
         # 每轮对话的标题索引（见 ConversationTurn）
         self.conversations: list[ConversationTurn] = conversations or []
-        self.updated_at = self.created_at
+        # 后台任务台账。**唯一事实来源**：端口后台扫描 / background_run
+        # 触发的任务都记在这里，Agent 用 list_tasks 查、快照跟着落盘。
+        self.tasks: TaskManager = tasks or TaskManager()
+        # updated_at 必须跟着快照回来：``/sessions`` 展示的就是它。
+        # 以前 from_dict 不传这个参数，载入后恒等于 created_at——列表里
+        # 每个会话都显示"创建时间"，看起来像"更新时间没生效"。
+        self.updated_at = float(updated_at or self.created_at)
 
     # ── 轮次 ──────────────────────────────────────────────────────
     @property
@@ -112,10 +126,12 @@ class Session:
     def status_line(self) -> str:
         c = self.counts()
         top = [f"{Severity(k).label} {v}" for k, v in c.items() if v]
+        running = len(self.tasks.running()) if self.tasks else 0
         return (
             f"目标 {self.target} | 第 {self.turn_no} 轮 | 阶段 {self.phase.label} | "
             f"资产 {len(self.result.assets)} | 发现 {sum(c.values())}"
             + (f"（{' '.join(top)}）" if top else "")
+            + (f" | 后台 {running} 运行中" if running else "")
         )
 
     # ── 持久化 ────────────────────────────────────────────────────
@@ -135,22 +151,43 @@ class Session:
             # 对话历史落盘前脱敏：里面有工具返回的原始响应
             "history": redact_messages(self.history),
             "conversations": [c.to_dict() for c in self.conversations],
+            # 后台任务台账：running 的任务在 from_dict 里会被如实改写成
+            # interrupted（进程退出后任务不可能还活着）
+            "tasks": self.tasks.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Session":
+        """快照 → 对象。**字段级容错**：坏字段退回默认值，不整条丢弃。
+
+        快照是外部输入（旧版本写的 / 手改过 / 写到一半被截断）。以前这里
+        直接 ``Phase(...)`` / ``int(...)``，任一字段对不上就抛异常，而
+        :func:`list_sessions` 没有逐条兜底——**一条坏快照就能让整个
+        ``/sessions`` 报错**，用户看到的是"历史会话全没了"。
+        """
+        d = as_dict(d)
+        result = d.get("result")
+        model = d.get("model")
+        conversations = d.get("conversations")
         return cls(
-            target=str(d.get("target") or ""),
-            session_id=str(d.get("session_id") or ""),
-            phase=Phase(d.get("phase") or Phase.RECON.value),
-            result=ScanResult.from_dict(d.get("result") or {}),
-            model=BusinessModel.from_dict(d.get("model") or {}),
-            turns=[Turn.from_dict(t) for t in (d.get("turns") or [])],
-            created_at=float(d.get("created_at") or time.time()),
-            history=list(d.get("history") or []),
-            conversations=[
-                ConversationTurn.from_dict(c) for c in (d.get("conversations") or [])
+            target=as_str(d.get("target")),
+            session_id=as_str(d.get("session_id")),
+            phase=as_phase(d.get("phase")),
+            result=ScanResult.from_dict(as_dict(result)),
+            model=BusinessModel.from_dict(as_dict(model)),
+            turns=[
+                Turn.from_dict(t) for t in as_list(d.get("turns")) if isinstance(t, dict)
             ],
+            created_at=as_float(d.get("created_at"), time.time()),
+            history=[h for h in as_list(d.get("history")) if isinstance(h, dict)],
+            conversations=[
+                ConversationTurn.from_dict(c)
+                for c in as_list(conversations)
+                if isinstance(c, dict)
+            ],
+            # 旧快照没有 tasks 字段——缺省就是空台账，向前兼容不需要升 version
+            tasks=TaskManager.from_dict(as_dict(d.get("tasks"))),
+            updated_at=as_float(d.get("updated_at"), 0.0) or None,
         )
 
     @property
@@ -214,6 +251,12 @@ class Session:
 
     @classmethod
     def load(cls, path: str | Path) -> "Session | None":
+        """读一份快照；**任何失败都返回 None，绝不抛异常**。
+
+        返回 None 的语义是"这一条读不出来"——调用方（``list_sessions`` /
+        ``latest_session`` / ``purge_empty_sessions``）必须能靠它跳过单条，
+        而不是让整个历史列表崩掉。
+        """
         p = Path(path)
         if p.is_dir():
             p = p / "session.json"
@@ -221,17 +264,34 @@ class Session:
             return None
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
-        # v1 快照没有对话历史，但其余字段可用——放行而不是整个丢弃
-        ver = int(d.get("version") or 0)
+        if not isinstance(d, dict):
+            return None
+        # v1 快照没有对话历史，但其余字段可用——放行而不是整个丢弃。
+        # 未知版本仍然拒绝：读不懂的数据宁可不展示，也不能按自己的猜测
+        # 解释出新内容（这一点与"坏字段退回默认值"不冲突——字段级容错
+        # 只处理已知版本里的脏值）。
+        try:
+            ver = int(d.get("version") or 0)
+        except (TypeError, ValueError):
+            ver = 0
         if ver not in (1, cls.VERSION):
             return None
-        s = cls.from_dict(d)
+        try:
+            s = cls.from_dict(d)
+        except Exception:  # noqa: BLE001 - 单条坏快照不该拖垮整个列表
+            return None
         # **目录名才是权威 id**——旧快照的目录名可能是纯数字，而内部 id 字段
         # 是另一串（甚至缺失）。不认目录名的话，删除/续存都会指到不存在的路径。
         s._dir_name = p.parent.name
         s.session_id = p.parent.name
+        # 老快照没有 updated_at：用文件的 mtime 兜底（那才是"最近动过"的时刻）
+        if not as_float(d.get("updated_at"), 0.0):
+            try:
+                s.updated_at = p.stat().st_mtime
+            except OSError:
+                pass
         return s
 
     # ── 对话历史 ──────────────────────────────────────────────────
@@ -284,6 +344,18 @@ class Session:
             return False
         r = self.result
         if r.assets or r.findings or r.notes:
+            return False
+        # 这些同样是"内容"：指纹、上下文变量、攻击链、错误日志、业务模型。
+        # 以前只查上面三项——只提取过变量或只拿到指纹的会话会被判成"空"，
+        # 退出时 _save 直接不落盘，数据静默丢失；/reset 之后误判空也一样
+        # 会让"彻底重置"的边界变得不可信。判定从严：任一非空就保留。
+        if r.fingerprints or r.context_vars or r.attack_chains or r.errors:
+            return False
+        if self.model.resources:
+            return False
+        # 后台任务也算内容：只触发过一个后台任务（结果还在等）就说明用户
+        # 至少干过一件事，清掉快照会把任务记录连同结果一起丢掉。
+        if len(self.tasks):
             return False
         return True
 

@@ -46,6 +46,16 @@ def _obj(props: dict[str, Any], required: list[str] | None = None) -> dict[str, 
 _S_URL = {"type": "string", "description": "完整 URL，如 https://example.com"}
 _S_HOST = {"type": "string", "description": "主机名或 IP（不含协议）"}
 
+# 文件类工具共用的沙箱 scope 参数。两个沙箱根互不重叠，扩展名白名单不同：
+# output 认报告类格式；poc 只认 .yaml/.yml（POC 规则就是声明式 YAML）。
+_SCOPE_PARAM = {
+    "type": "string",
+    "description": (
+        "沙箱选择：output=产物目录（默认）；"
+        "poc=POC 规则目录（只接受 .yaml/.yml，写自定义 POC 用这个）"
+    ),
+}
+
 BUILTINS: list[BuiltinTool] = [
     BuiltinTool(
         name="set_target",
@@ -64,6 +74,58 @@ BUILTINS: list[BuiltinTool] = [
         group="编排",
         desc="读取当前会话状态：目标、资产统计、发现列表摘要、已获凭证、业务模型。",
         params=_obj({}),
+    ),
+    BuiltinTool(
+        name="background_run",
+        group="编排",
+        desc=(
+            "把**任意一个前台工具**放到后台执行，立即返回任务号，不阻塞当前轮次。"
+            "**预计单个调用超过 30 秒就必须走这里**（dirsearch 大字典、nmap 全端口、"
+            "子域批量探测、大批量发包等）；端口扫描也可以直接用 recon_ports_bg。"
+            "不接受 background_run / list_tasks / 任何 *_bg 工具（禁止嵌套）。"
+            "后台结果不会自动弹回来——需要时主动调用 list_tasks 取；"
+            "完成时资产/发现会自动并入会话。"
+        ),
+        params=_obj(
+            {
+                "tool": {
+                    "type": "string",
+                    "description": "要后台执行的前台工具名，如 recon_paths / external_tool / js_audit",
+                },
+                "args": {
+                    "type": "object",
+                    "description": "该工具的参数对象，与前台调用完全一致",
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "一句话说明这个后台任务在干什么（会显示在任务列表里）",
+                },
+            },
+            ["tool"],
+        ),
+    ),
+    BuiltinTool(
+        name="list_tasks",
+        group="编排",
+        desc=(
+            "查看后台任务：谁还在跑、谁已完成、结果是什么。"
+            "不传参数=列全部任务（已完成任务附带结果首行）；"
+            "传 task_id=该任务的**完整结果**；传 status 可按状态过滤。"
+            "后台任务不会自己把结果塞回来，必须主动查询。"
+        ),
+        params=_obj(
+            {
+                "task_id": {
+                    "type": "string",
+                    "description": "任务号（如 bg-1）；留空则列全部任务",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "done", "failed", "cancelled", "interrupted"],
+                    "description": "只看某种状态的任务",
+                },
+            }
+        ),
     ),
     BuiltinTool(
         name="extract_variable",
@@ -115,8 +177,31 @@ BUILTINS: list[BuiltinTool] = [
     BuiltinTool(
         name="recon_ports",
         group="侦察",
-        desc="TCP 端口探测（只做 connect，不扫 UDP）。有 nmap 时优先用 nmap -sV。",
-        params=_obj({"host": _S_HOST, "top": {"type": "integer", "description": "探测端口数，默认 100"}}),
+        desc=(
+            "TCP 端口探测（只做 connect，不扫 UDP）。有 nmap 时优先用 nmap -sV。"
+            "**前台快速版**：端口数上限 200，适合「扫一眼开了哪些常用端口」。"
+            "预计超过 30 秒的大范围扫描不要用这个，改用 recon_ports_bg。"
+        ),
+        params=_obj({"host": _S_HOST, "top": {"type": "integer", "description": "探测端口数，默认 100，上限 200"}}),
+    ),
+    BuiltinTool(
+        name="recon_ports_bg",
+        group="侦察",
+        desc=(
+            "端口扫描的**后台版本**，用于大范围扫描（端口数可达 2000）。"
+            "调用后**立即**返回「已在后台启动，先干别的」+ 任务号，不阻塞你的思考流程；"
+            "期间去做别的事，之后用 list_tasks 查进度和结果。"
+            "任务完成时资产会自动并入会话。"
+        ),
+        params=_obj(
+            {
+                "host": _S_HOST,
+                "top": {
+                    "type": "integer",
+                    "description": "探测端口数，默认用配置值（通常 100），上限 2000",
+                },
+            }
+        ),
     ),
     BuiltinTool(
         name="recon_paths",
@@ -278,7 +363,7 @@ BUILTINS: list[BuiltinTool] = [
         group="验证",
         desc=(
             "高危漏洞一次性探针：RCE/模板注入（echo 标记回显）、任意文件读取"
-            "（路径穿越）、任意文件上传（默认关闭，需 readonly=false）。"
+            "（路径穿越）、任意文件上传（默认关闭，需用户在终端执行 /readonly off）。"
             "**每个接口每类只尝试一次**，没命中就跳过，出错即跳过——与 SQL 注入探针一致。 "
             "先调用 recon_openapi 或 recon_js 拿到接口清单，命中率会高得多。"
         ),
@@ -288,7 +373,7 @@ BUILTINS: list[BuiltinTool] = [
                 "kinds": {
                     "type": "string",
                     "enum": ["rce", "fileread", "upload", "all"],
-                    "description": "探测类别，默认 rce,fileread（upload 需显式指定且关闭只读）",
+                    "description": "探测类别，默认 rce,fileread（upload 需显式指定，且用户已在终端执行 /readonly off）",
                 },
                 "limit": {"type": "integer", "description": "最多探测多少个接口，默认 40"},
             }
@@ -453,7 +538,13 @@ BUILTINS: list[BuiltinTool] = [
                     "description": "分类：sqli / xss / idor / ssrf / lfi / rce / authz / info_disclosure / other",
                 },
                 "cve": {"type": "string", "description": "关联 CVE（没有就不传）"},
-                "chain_id": {"type": "string", "description": "所属攻击链 ID；独立发现不传"},
+                "chain_id": {
+                    "type": "string",
+                    "description": (
+                        "所属攻击链 ID——必须是**已经用 record_attack_chain 登记"
+                        "过**的 chain_id（独立发现不传）。传不存在的 id 会被拒绝。"
+                    ),
+                },
                 "step_index": {"type": "integer", "description": "该发现位于攻击链第几步，从 0 开始"},
                 "exploit_payload": {
                     "type": "string",
@@ -546,26 +637,32 @@ BUILTINS: list[BuiltinTool] = [
         name="list_files",
         group="文件",
         desc=(
-            "列出产物目录（output/）下的文件与子目录，含大小与修改时间。"
-            "改报告前先用它看看已经有哪些文件、哪份是最新的。"
+            "列出沙箱目录下的文件与子目录，含大小与修改时间。"
+            "scope=output 列产物目录（改报告前先看看有哪些文件、哪份最新）；"
+            "scope=poc 列 POC 规则目录（写 POC 前先看库里已有哪些规则、避免重名）。"
         ),
         params=_obj(
-            {"path": {"type": "string", "description": "相对 output 的子目录，留空=根目录"}}
+            {
+                "path": {"type": "string", "description": "相对根目录的子目录，留空=根目录"},
+                "scope": _SCOPE_PARAM,
+            }
         ),
     ),
     BuiltinTool(
         name="read_file",
         group="文件",
         desc=(
-            "读取产物目录里的文本文件。**两种模式**：\n"
+            "读取沙箱里的文本文件。**两种模式**：\n"
             "① 定位模式（推荐）：传 grep='关键字'，一次返回所有命中行 + 上下文，"
             "**不要从头逐页翻**——找函数名/字段名/URL 用这个。\n"
             "② 翻页模式：只传 start_line + max_lines 分段读（最后手段）。\n"
-            "**只能读 output/ 之内**——凭据、配置、源码都在外面，读不到。"
+            "scope=output 只能读产物目录；scope=poc 读 POC 规则目录。"
+            "凭据、配置、源码都在沙箱外，读不到。"
         ),
         params=_obj(
             {
-                "path": {"type": "string", "description": "相对 output 的文件路径"},
+                "path": {"type": "string", "description": "相对根目录的文件路径"},
+                "scope": _SCOPE_PARAM,
                 "grep": {
                     "type": "string",
                     "description": (
@@ -590,19 +687,24 @@ BUILTINS: list[BuiltinTool] = [
         name="write_file",
         group="文件",
         desc=(
-            "在产物目录里新建 / 覆盖一个文本文件。"
-            "写自定义说明、附录、清单，或整篇重写某个产物时用。"
-            "格式受限（md/txt/json/html/csv/xml/svg/log 等报告类产物）——"
-            "不允许写脚本或可执行文件。"
+            "在沙箱里新建 / 覆盖一个文本文件。\n"
+            "scope=output（默认）：写报告配套的自定义说明、附录、清单；"
+            "格式受限（md/txt/json/html/csv/xml/svg/log 等报告类产物），"
+            "不允许写脚本或可执行文件。\n"
+            "scope=poc：**写自定义 POC 规则**（只接受 .yaml/.yml，声明式格式，"
+            "字段参考 poc_show 返回的现有规则）。写入后即进入 POC 库，"
+            "重建 kb 索引后可被 RAG 召回，也可交给 batch_check 对多台服务器"
+            "批量检测验证漏洞通用性。**不要写成 .py 脚本**——POC 不放可执行代码。"
         ),
         params=_obj(
             {
-                "path": {"type": "string", "description": "相对 output 的文件路径，如 appendix.md"},
+                "path": {"type": "string", "description": "相对根目录的文件路径，如 poc-druid-unauth.yaml"},
                 "content": {"type": "string", "description": "完整文件内容"},
                 "overwrite": {
                     "type": "boolean",
                     "description": "目标已存在时是否覆盖（默认 true）",
                 },
+                "scope": _SCOPE_PARAM,
             },
             ["path", "content"],
         ),
@@ -611,21 +713,23 @@ BUILTINS: list[BuiltinTool] = [
         name="edit_file",
         group="文件",
         desc=(
-            "**就地修改**产物文件里的某个片段（精确替换），不用整篇重写。"
-            "改报告优先用这个：一次只动需要改的那段，其余原样保留。"
+            "**就地修改**沙箱文件里的某个片段（精确替换），不用整篇重写。"
+            "改报告 / 改 POC 优先用这个：一次只动需要改的那段，其余原样保留。"
             "old_text 必须与原文**逐字符一致**（含空白与换行），"
             "且出现次数与 count 相符（默认恰好 1 次），否则拒绝执行——"
             "含糊的替换可能悄悄改掉别处的同一段文字。"
+            "scope=poc 时改的是 POC 规则目录里的 YAML。"
         ),
         params=_obj(
             {
-                "path": {"type": "string", "description": "相对 output 的文件路径"},
+                "path": {"type": "string", "description": "相对根目录的文件路径"},
                 "old_text": {"type": "string", "description": "要被替换的原文片段，逐字符照抄"},
                 "new_text": {"type": "string", "description": "替换成什么"},
                 "count": {
                     "type": "integer",
                     "description": "期望的出现次数（默认 1，必须恰好相符）；传 0 表示全部替换",
                 },
+                "scope": _SCOPE_PARAM,
             },
             ["path", "old_text", "new_text"],
         ),
@@ -634,11 +738,16 @@ BUILTINS: list[BuiltinTool] = [
         name="delete_file",
         group="文件",
         desc=(
-            "删除产物目录里的**单个文件**（目录不删）。"
+            "删除沙箱里的**单个文件**（目录不删）。"
             "删除不可撤销，删之前先用 list_files 确认路径与大小。"
+            "scope=poc 删的是 POC 规则（删完重建 kb 索引后 RAG 不再召回）。"
         ),
         params=_obj(
-            {"path": {"type": "string", "description": "相对 output 的文件路径"}}, ["path"]
+            {
+                "path": {"type": "string", "description": "相对根目录的文件路径"},
+                "scope": _SCOPE_PARAM,
+            },
+            ["path"],
         ),
     ),
     BuiltinTool(

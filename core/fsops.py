@@ -1,4 +1,4 @@
-"""沙箱化的本地文件操作——给智能体「新建 / 修改 / 删除文件」的手，但关在产物目录里。
+"""沙箱化的本地文件操作——给智能体「新建 / 修改 / 删除文件」的手，但关在白名单目录里。
 
 要解决什么
 ----------
@@ -9,17 +9,24 @@
 所以补两件事：一是本模块（新建/读取/修改/删除），二是报告导出改成
 **就地覆盖同一个文件**。
 
+后来又开了第二个根：**POC 沙箱**（``scope="poc"``，根 = ``rag.poc_dir``）。
+没有它，智能体的 ``write_file`` 根锁在 output/ 里，永远写不进 POC 库——
+"自主写 POC"就是一句空话。POC 沙箱与产物沙箱共用同一套闸门
+（:meth:`FileSandbox.resolve`），只是根和扩展名白名单不同。
+
 安全边界（这一层是唯一边界）
 -----------------------------
 模型可以要求写任意路径，所以约束必须落在代码里，不能指望提示词。
 所有操作共用同一个 :meth:`FileSandbox.resolve`，五道结构性闸门：
 
-1. **只能在 ``output_dir`` 内**。绝对路径、盘符、UNC、``..`` 一律拒绝，
+1. **只能在对应 scope 的根之内**。绝对路径、盘符、UNC、``..`` 一律拒绝，
    最后再用 ``resolve()`` 的结果做一次"必须在根之内"的校验（这一步同时挡住
    符号链接/junction 逃逸——链接会被解析成真实路径，落在根外就出不去）。
+   两个根互不重叠：POC 沙箱写不进产物目录，产物沙箱也写不进 POC 库。
 2. **只认白名单扩展名**。这里是**白名单不是黑名单**——黑名单永远漏
-   （``.phtml``、``.xhtml``、``.shtml``、``.ps1xml``…）。而且这个沙箱的用途
-   就是"写报告产物"，不是通用文件系统，白名单是能用结构说清楚的。
+   （``.phtml``、``.xhtml``、``.shtml``、``.ps1xml``…）。产物沙箱认报告类
+   格式；POC 沙箱**更紧**，只认 ``.yaml/.yml``（POC 规则本来就是声明式
+   YAML，不写脚本，要跑逻辑走 batch_check）。
 3. **不写目录、不删目录**，只对文件生效。删目录一条命令就能毁掉整个产物区，
    而工具本身没有任何场景需要它。
 4. **原子写**（临时文件 + ``os.replace``），中途崩溃不会留下半个报告。
@@ -57,6 +64,12 @@ ALLOWED_EXTS: frozenset[str] = frozenset(
         ".log", ".diff", ".patch", ".sarif", ".sql", ".mmd", ".puml",
     }
 )
+
+# POC 沙箱（scope="poc"）的扩展名白名单。POC 规则只认 YAML
+# （``detectors/poc_loader.load_poc_dir`` 只加载 .yaml/.yml），
+# 所以这里比产物沙箱**更紧**：写别的格式一律没意义，直接拒绝。
+# 不放行 .py——POC 是声明式 YAML，不是可执行脚本；要跑逻辑走 batch_check。
+POC_ALLOWED_EXTS: frozenset[str] = frozenset({".yaml", ".yml"})
 
 # Windows 保留设备名——写 ``con.md`` 之类会打到设备上而不是文件
 _RESERVED = {
@@ -116,9 +129,14 @@ class FileOp:
 
 @dataclass
 class FileSandbox:
-    """把文件操作关在 ``root`` 里。"""
+    """把文件操作关在 ``root`` 里。
+
+    ``allowed_exts`` 决定这个沙箱认哪些扩展名：产物沙箱用
+    :data:`ALLOWED_EXTS`，POC 沙箱用更紧的 :data:`POC_ALLOWED_EXTS`。
+    """
 
     root: Path
+    allowed_exts: frozenset[str] = ALLOWED_EXTS
     log: list[FileOp] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -176,14 +194,13 @@ class FileSandbox:
                 raise FileOpDenied(f"不是文件（本工具不操作目录）：{rel}")
         return resolved
 
-    @staticmethod
-    def check_ext(path: Path) -> None:
+    def check_ext(self, path: Path) -> None:
         ext = path.suffix.lower()
-        if ext not in ALLOWED_EXTS:
-            allow = " ".join(sorted(ALLOWED_EXTS))
+        if ext not in self.allowed_exts:
+            allow = " ".join(sorted(self.allowed_exts))
             raise FileOpDenied(
                 f"不允许写 {ext or '（无扩展名）'} 文件。"
-                f"产物目录只接受这些格式：{allow}"
+                f"本沙箱只接受这些格式：{allow}"
             )
 
     def rel(self, path: Path) -> str:
@@ -344,19 +361,37 @@ def _atomic_write(path: Path, raw: bytes) -> None:
         raise
 
 
-def sandbox_for(cfg) -> FileSandbox:
+def sandbox_for(cfg, scope: str = "output") -> FileSandbox:
     """按配置建沙箱。``fs_ops_enabled=false`` 时抛 :class:`FileOpDenied`。
 
     关掉的语义是"这些工具不可用"，而不是"抛异常崩掉"——调用方把它当正常
     返回值喂回模型即可。
+
+    scope 两种取值，**根和白名单都不同**：
+
+    * ``"output"``（默认）：产物目录（``output_dir``），报告类白名单。
+    * ``"poc"``：POC 规则目录（``rag.poc_dir``，可用 ``POCS_POC_DIR`` 覆盖），
+      白名单只有 ``.yaml/.yml``。这是给"自主写 POC"开的口子——没有它，
+      ``write_file`` 的根锁在 output/ 里，模型永远够不到 POC 库。
+      两个沙箱根互不重叠，POC 沙箱里写 ``../output/x.md`` 会直接被
+      路径闸门拒绝，不存在从 POC 沙箱摸进产物目录（或反过来）的通路。
     """
     if not getattr(getattr(cfg, "scan", cfg), "fs_ops_enabled", True):
         raise FileOpDenied(
             "文件操作已关闭（scan.fs_ops_enabled=false / POCS_FS_OPS=false）。"
             "需要让模型改报告文件时把它打开。"
         )
-    root = getattr(cfg, "output_dir", "./output")
-    return FileSandbox(root=Path(root))
+    norm = (scope or "output").strip().lower()
+    if norm == "output":
+        return FileSandbox(root=Path(getattr(cfg, "output_dir", "./output")))
+    if norm == "poc":
+        poc_dir = getattr(getattr(cfg, "rag", None), "poc_dir", "./poc")
+        root = Path(poc_dir)
+        root.mkdir(parents=True, exist_ok=True)  # POC 库是常驻工作区，直接建
+        return FileSandbox(root=root, allowed_exts=POC_ALLOWED_EXTS)
+    raise FileOpDenied(
+        f"未知沙箱 scope：{scope!r}（只接受 output / poc）"
+    )
 
 
 __all__ = [
@@ -364,6 +399,7 @@ __all__ = [
     "FileOpDenied",
     "FileOp",
     "ALLOWED_EXTS",
+    "POC_ALLOWED_EXTS",
     "MAX_WRITE_BYTES",
     "MAX_READ_BYTES",
     "is_reparse_point",

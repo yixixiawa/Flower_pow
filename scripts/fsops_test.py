@@ -19,6 +19,9 @@
   8. **报告就地覆盖**：同一路径、内容更新、不产生 _2；overwrite=False 仍防覆盖
   9. 工具注册 + handler 行为（拒绝是返回值不是异常）+ 删除留痕
  10. ``readonly`` 不阻断本地产物写入；``fs_ops_enabled=false`` 整体关闭
+ 11. POC 沙箱（scope="poc"）：白名单收紧到 .yaml/.yml、与产物沙箱互不可达、
+     根自动创建、未知 scope 拒绝、默认 scope 不破坏旧调用
+ 12. handler 的 scope 参数端到端（写/读/改/列/删 + 非法 scope 是返回值）
 
 运行：.venv/Scripts/python.exe scripts/test_fsops.py
 """
@@ -30,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,6 +41,7 @@ from core.config_loader import ScanConfig  # noqa: E402
 from core.fsops import (  # noqa: E402
     ALLOWED_EXTS,
     MAX_WRITE_BYTES,
+    POC_ALLOWED_EXTS,
     FileOpDenied,
     FileSandbox,
     is_reparse_point,
@@ -51,12 +56,10 @@ from core.tools import BUILTINS  # noqa: E402
 class FakeCfg:
     """``cfg.scan`` 用真的 ScanConfig——假对象比真对象更容易骗过测试。"""
 
-    def __init__(self, root: Path, **scan_kw) -> None:
+    def __init__(self, root: Path, poc_dir: Path | None = None, **scan_kw) -> None:
         self.output_dir = str(root)
         self.scan = ScanConfig(**scan_kw)
-
-    class rag:
-        poc_dir = "./poc"
+        self.rag = SimpleNamespace(poc_dir=str(poc_dir) if poc_dir else "./poc")
 
 
 def mk_finding() -> Finding:
@@ -322,6 +325,50 @@ def main() -> int:
         "write_file", {"path": "off.md", "content": "x"}, Session(target="https://x.test")))
     check("已拒绝" in out, "关闭后 handler 也拒绝（不是抛异常）")
     check(not (root / "off.md").exists(), "关闭时确实没写出文件")
+
+    print("\n场景11 POC 沙箱（自主写 POC 的口子）")
+    poc_root = tmp / "poc_lib"
+    poc_cfg = FakeCfg(root, poc_dir=poc_root)
+    psb = sandbox_for(poc_cfg, scope="poc")
+    check(psb.root.resolve() == poc_root.resolve(), f"poc 沙箱根 = rag.poc_dir，实={psb.root}")
+    check(psb.allowed_exts == POC_ALLOWED_EXTS, "poc 沙箱白名单只有 .yaml/.yml")
+    check(psb.write("demo-unauth.yaml", "id: demo-unauth\n").exists(), "poc 沙箱写 yaml 成功")
+    for bad, why in (("note.md", ".md"), ("run.py", ".py"), ("a.txt", ".txt"), ("noext", "无扩展名")):
+        check(bool(denied(psb.write, bad, "x")), f"poc 沙箱拒绝 {why}")
+    check(bool(denied(psb.write, "../output/evil.md", "x")), "poc 沙箱越界被拒（摸不到产物目录）")
+    check(bool(denied(sb.write, "../poc_lib/evil.yaml", "x")), "产物沙箱同样摸不到 POC 目录")
+    check(bool(denied(sandbox_for, poc_cfg, "code")), "未知 scope 被拒")
+    fresh = tmp / "fresh_poc"
+    sandbox_for(FakeCfg(root, poc_dir=fresh), scope="poc")
+    check(fresh.exists(), "poc 根不存在时自动创建")
+    # 默认 scope 仍是产物沙箱
+    dft = sandbox_for(poc_cfg)
+    check(dft.root.resolve() == root.resolve() and dft.allowed_exts == ALLOWED_EXTS,
+          "不传 scope 默认回到产物沙箱（不破坏旧调用）")
+
+    print("\n场景12 handler 的 scope 参数（端到端）")
+    prunner = ToolRunner(poc_cfg, [], str(tmp))
+    out = asyncio.run(prunner.execute(
+        "write_file", {"path": "h.yaml", "content": "id: h", "scope": "poc"}, sess))
+    check("已新建 POC" in out, f"handler scope=poc 写 yaml，实={out[:40]!r}")
+    out = asyncio.run(prunner.execute(
+        "write_file", {"path": "h.py", "content": "x", "scope": "poc"}, sess))
+    check("已拒绝" in out, "handler scope=poc 拒绝 .py")
+    out = asyncio.run(prunner.execute("read_file", {"path": "h.yaml", "scope": "poc"}, sess))
+    check("id: h" in out, "handler scope=poc 读回来")
+    out = asyncio.run(prunner.execute(
+        "edit_file", {"path": "h.yaml", "old_text": "id: h", "new_text": "id: h2", "scope": "poc"}, sess))
+    check("已就地修改" in out, "handler scope=poc 就地改")
+    out = asyncio.run(prunner.execute("list_files", {"scope": "poc"}, sess))
+    check("h.yaml" in out, "handler scope=poc 列目录")
+    out = asyncio.run(prunner.execute(
+        "write_file", {"path": "x.md", "content": "x", "scope": "nope"}, sess))
+    check("已拒绝" in out, "非法 scope 被当返回值拒绝（不是异常）")
+    out = asyncio.run(prunner.execute("delete_file", {"path": "h.yaml", "scope": "poc"}, sess))
+    check("已删除" in out, "handler scope=poc 删除")
+    check(any("删除POC 文件" in n for n in sess.result.notes), "删除 POC 在会话里留痕")
+    out = asyncio.run(prunner.execute("write_file", {"path": "plain.md", "content": "ok"}, sess))
+    check("已新建" in out and "plain.md" in out, "不传 scope 默认写产物目录（旧行为不变）")
 
     print(f"\n{ok}/{total} 通过" + (f"（跳过 {skipped} 项）" if skipped else ""))
     return 0 if ok == total else 1

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from core.completer import Completer, HOTKEY_FULL_AUTO, PromptReader
 from core.config_loader import Config
 from core.session import (
@@ -16,7 +18,13 @@ from core.session import (
 )
 
 
-class _ReplBase:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _ReplBase(_Base):
     """交互式会话循环。"""
 
     def __init__(
@@ -42,7 +50,7 @@ class _ReplBase:
         self.tools: list = []
         self.probes = probes if probes is not None else self._probe()
         if agent and cfg.llm.enabled and cfg.llm.api_key:
-            self._build_agent()
+            self.agent = self._build_agent()
         self.reader = PromptReader(self._completer(), history=history)
         # 写操作的人工审核通道：每次上传前逐条问一遍
         if self.runner is not None:

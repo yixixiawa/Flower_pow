@@ -15,17 +15,37 @@ class FileMixin:
     """见模块说明。"""
 
     # ── 文件操作（沙箱与闸门在 core/fsops.py）─────────────────────
+    # scope="output" → 产物目录（报告类白名单）；
+    # scope="poc"    → POC 规则目录（只认 .yaml/.yml，给自主写 POC 用）。
 
-    def _sandbox(self):
+    _SCOPES = ("output", "poc")
+
+    def _sandbox(self, scope: str = "output"):
         from core.fsops import sandbox_for
 
-        return sandbox_for(self.cfg)
+        return sandbox_for(self.cfg, scope=scope)
 
-    async def _h_list_files(self, session, path: str = "") -> str:
+    @staticmethod
+    def _norm_scope(scope) -> str:
+        s = (scope or "output").strip().lower()
+        return s if s in FileMixin._SCOPES else s  # 非法值交给沙箱拒绝
+
+    @staticmethod
+    def _is_poc(sb) -> bool:
+        """判别是不是 POC 沙箱。
+
+        **不能**用 ``".yaml" in sb.allowed_exts``——产物沙箱的白名单本来就含
+        .yaml（报告附录可以写 YAML），那样产物写入会被误判成 POC。
+        直接比白名单集合本身。"""
+        from core.fsops import POC_ALLOWED_EXTS
+
+        return sb.allowed_exts == POC_ALLOWED_EXTS
+
+    async def _h_list_files(self, session, path: str = "", scope: str = "output") -> str:
         from core.fsops import FileOpDenied
 
         try:
-            sb = self._sandbox()
+            sb = self._sandbox(self._norm_scope(scope))
             items = sb.list_dir(path)
         except FileOpDenied as exc:
             return f"【已拒绝】{exc}"
@@ -41,7 +61,10 @@ class FileMixin:
             else:
                 ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(it["mtime"]))
                 lines.append(f"  [文件] {it['path']}  {it['size']} 字节  {ts}")
-        lines.append("  修改报告前先用 read_file 看清原文，再用 edit_file 就地改。")
+        if self._is_poc(sb):
+            lines.append("  修改 POC 前先用 read_file 看清原文，再用 edit_file 就地改。")
+        else:
+            lines.append("  修改报告前先用 read_file 看清原文，再用 edit_file 就地改。")
         return "\n".join(lines)
 
     async def _h_read_file(
@@ -52,11 +75,12 @@ class FileMixin:
         max_lines: int = 400,
         grep: str = "",
         context: int = 3,
+        scope: str = "output",
     ) -> str:
         from core.fsops import FileOpDenied
 
         try:
-            sb = self._sandbox()
+            sb = self._sandbox(self._norm_scope(scope))
             text = sb.read(path)
         except FileOpDenied as exc:
             return f"【已拒绝】{exc}"
@@ -105,12 +129,17 @@ class FileMixin:
         return "\n".join([head, *chunk, tail] if tail else [head, *chunk])
 
     async def _h_write_file(
-        self, session, path: str = "", content: str = "", overwrite: bool = True
+        self,
+        session,
+        path: str = "",
+        content: str = "",
+        overwrite: bool = True,
+        scope: str = "output",
     ) -> str:
         from core.fsops import FileOpDenied
 
         try:
-            sb = self._sandbox()
+            sb = self._sandbox(self._norm_scope(scope))
             existed = sb.resolve(path).exists()
             f = sb.write(path, content, overwrite=overwrite)
         except FileOpDenied as exc:
@@ -119,6 +148,16 @@ class FileMixin:
             return f"写入失败：{type(exc).__name__}: {exc}"
         size = f.stat().st_size
         act = "覆盖" if existed else "新建"
+        if self._is_poc(sb):
+            # POC 沙箱：写入即入库的提示（RAG 索引 / batch_check 都吃这个目录）
+            return (
+                f"已{act} POC：{sb.rel(f)}（{size} 字节）\n"
+                f"  完整路径：{f}\n"
+                f"  该文件已进入 POC 库（{sb.root}），可被检索与批量检测：\n"
+                f"  - 立即单点验证：让用户跑 Code/batch_check.py --poc {sb.rel(f)} --target <URL>\n"
+                f"  - 写完先 poc_show / 重新建 kb 索引后才能被 RAG 召回；\n"
+                f"  改已有 POC 用 edit_file，不要整篇重写。"
+            )
         return (
             f"已{act}：{sb.rel(f)}（{size} 字节）\n"
             f"  完整路径：{f}\n"
@@ -134,11 +173,12 @@ class FileMixin:
         old_text: str = "",
         new_text: str = "",
         count: int = 1,
+        scope: str = "output",
     ) -> str:
         from core.fsops import FileOpDenied
 
         try:
-            sb = self._sandbox()
+            sb = self._sandbox(self._norm_scope(scope))
             f, done = sb.edit(path, old_text, new_text, count=int(count))
         except FileOpDenied as exc:
             # 拒绝是**正常返回值**：模型据此改 prompt 重试，别当异常
@@ -150,19 +190,25 @@ class FileMixin:
             f"  原文件被原子替换，其余内容一字未动。"
         )
 
-    async def _h_delete_file(self, session, path: str = "") -> str:
+    async def _h_delete_file(self, session, path: str = "", scope: str = "output") -> str:
         from core.fsops import FileOpDenied
 
         try:
-            sb = self._sandbox()
+            sb = self._sandbox(self._norm_scope(scope))
             f, size = sb.delete(path)
         except FileOpDenied as exc:
             return f"【已拒绝】{exc}"
         except Exception as exc:  # noqa: BLE001
             return f"删除失败：{type(exc).__name__}: {exc}"
         # 删除不可撤销，必须在会话里留痕（会进报告的「执行说明」）
-        session.result.notes.append(f"删除产物文件：{sb.rel(f)}（{size} 字节）")
+        what = "POC 文件" if self._is_poc(sb) else "产物文件"
+        session.result.notes.append(f"删除{what}：{sb.rel(f)}（{size} 字节）")
         return (
             f"已删除：{sb.rel(f)}（原 {size} 字节）\n"
-            f"  删除不可撤销。要重新生成报告用 export_report。"
+            f"  删除不可撤销。"
+            + (
+                "重建 kb 索引后 RAG 不再召回该 POC。"
+                if what == "POC 文件"
+                else "要重新生成报告用 export_report。"
+            )
         )

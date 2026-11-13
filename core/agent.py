@@ -321,7 +321,7 @@ class Agent:
 
             # ── 有工具调用：先把这个 assistant 轮次按协议格式补全 ──
             norm_calls = []
-            for i, c in enumerate(tool_calls):
+            for i, c in enumerate(tool_calls): 
                 cid = c.get("id") or f"call_{step}_{i}"
                 name = c.get("name") or ""
                 norm_calls.append({"id": cid, "name": name, "arguments": c.get("arguments") or "{}"})

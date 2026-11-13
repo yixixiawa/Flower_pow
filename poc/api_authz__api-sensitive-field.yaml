@@ -18,8 +18,10 @@ tags:
 - api
 - disclosure
 - credential
+- post
 always_run: true
 request:
   method: GET
+  methods: [GET, POST]
   paths: ['']
 match: []

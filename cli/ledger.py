@@ -9,20 +9,20 @@ from cli.app import app
 from cli.app import console
 from cli.app import err
 from cli.boot import _cfg
-
-
 # ── sessions / report ─────────────────────────────────────────────
-
 
 @app.command()
 def sessions(
-    limit: int = typer.Option(15, "--limit", "-n"),
+    limit: int = typer.Option(15, "--limit", "-n", help="最多显示多少条"),
+    show_all: bool = typer.Option(False, "--all", "-a", help="显示全部（忽略 --limit）"),
     clean: bool = typer.Option(
         False, "--clean", help="先删掉空会话（没目标、没对话、没结果）"
     ),
     config: str = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """列出历史扫描会话。"""
+    """列出历史扫描会话（带标题、更新时间、阶段与结果规模）。"""
+    import time as _t
+
     from core.session import list_sessions, purge_empty_sessions
 
     cfg = _cfg(config)
@@ -35,31 +35,50 @@ def sessions(
         else:
             console.print("[dim]没有空会话需要清理[/dim]")
 
-    items = list_sessions(base, limit=limit)
+    # limit=None 才是"全量"：以前只列最近 N 条，会话一多老的就永远看不到
+    items = list_sessions(base, limit=None if show_all else limit)
+    total = len(list_sessions(base, limit=None))
     if not items:
         console.print("[yellow]暂无历史会话[/yellow]")
+        console.print(
+            f"[dim]会话目录：{base}（不存在或为空时，先跑一次 chat / scan）[/dim]"
+        )
         return
 
-    t = Table(title=f"历史会话（{len(items)} 条）")
+    t = Table(title=f"历史会话（显示 {len(items)} / 共 {total} 条）")
+    t.add_column("#", justify="right")
     t.add_column("会话", overflow="fold")
+    t.add_column("更新时间", overflow="fold")
+    t.add_column("阶段", overflow="fold")
     t.add_column("目标", overflow="fold")
     t.add_column("发现", justify="right")
     t.add_column("资产", justify="right")
-    for name, s in items:
+    for i, (name, s) in enumerate(items, 1):
         # 显示「目录名」而不是纯 id：目录名是 日期_标题，一眼能认出是哪次对话
         # （用 --resume <会话名> 即可续跑）。
         label = name
-        title = (s.conversations[0].title if s.conversations else "").strip()
+        title = (s.display_title or "").strip()
         if title and title not in label:
             label = f"{label}\n[dim]{title}[/dim]"
+        try:
+            when = _t.strftime(
+                "%Y-%m-%d %H:%M", _t.localtime(s.updated_at or s.created_at)
+            )
+        except (ValueError, OSError, OverflowError):
+            when = "?"
         t.add_row(
+            str(i),
             label,
+            when,
+            s.phase.label,
             s.target or "—",
             str(sum(s.counts().values())),
             str(len(s.result.assets)),
         )
     console.print(t)
-    console.print("[dim]用 --resume <会话名> 或会话内 /resume <Tab> 续跑[/dim]")
+    if len(items) < total:
+        console.print(f"[dim]还有 {total - len(items)} 个更早的会话，加 --all 看全量[/dim]")
+    console.print("[dim]用 --resume <会话名> 或会话内 /resume #编号 续跑[/dim]")
     console.print("[dim]--clean 可清掉空会话；会话内 /clean 同理[/dim]")
 
 

@@ -52,7 +52,6 @@ class Repl(
 ):
     """交互式终端——本类只把各命令域拼起来，不新增实现。"""
 
-
 # 必须放在 class 定义**之后**：entry.run_repl 要实例化 Repl，
 # 提前导入会在本模块还没定义完时去取 Repl，直接 ImportError。
 from core.repl.entry import run_repl  # noqa: E402

@@ -16,8 +16,14 @@
 不重试会把抖动误判成"接口鉴权生效"，产生假阴性——这比假阳性更危险，
 因为假阴性会让人以为系统没问题。
 
-只读约束：只发 GET。POST/PUT/DELETE 一律不发，
-因为探测不该改动业务数据，这是授权测试的基本边界。
+只读约束：GET 全量探测；POST 只探「查询型」接口。
+不少后端（尤其国内惯例）查询接口也走 POST（``POST /api/user/detail``
+＋ ``{"id": ...}``），只发 GET 会整类漏掉。POST 探测的边界：
+
+* 请求体只填 **id 类字段**（``orderId`` / ``user_id`` …），其余字段一律不带，
+  让服务端的参数校验替我们挡住副作用；
+* 路径/摘要命中 :data:`WRITE_RE`（创建/支付/删除/审批…）的 POST **一律跳过**；
+* PUT/DELETE 仍然不发。
 """
 
 from __future__ import annotations
@@ -45,6 +51,39 @@ SENSITIVE_RE = re.compile(
 OK_CODES = {200, 0, "200", "0"}
 # 只有这些键说明是纯错误响应，没有携带数据
 ERROR_ONLY_KEYS = {"code", "msg", "message", "success", "timestamp", "path", "error", "statusCode"}
+
+# POST 探测的黑名单：路径/摘要命中任一关键词的 POST 接口一律不发。
+# 往创建/支付/删除类接口塞探测体，轻则留脏数据，重则造成资金/状态变更——
+# 这比漏报更不可接受。GET 不受此名单约束（GET 天然无副作用，命中了也只是 405）。
+WRITE_RE = re.compile(
+    r"create|add\b|insert|save|update|edit|modify|del(?:ete)?\b|remove|"
+    r"upload|import|export|submit|apply|cancel|audit|approv|reject|review|"
+    r"bind|unbind|enable|disable|reset|toggle|switch|move|batch|"
+    r"login|logout|register|signin|signup|passwd|password|"
+    r"pay|refund|transfer|withdraw|recharge|send|push|notice",
+    re.I,
+)
+
+
+def _is_id_field(name: str) -> bool:
+    """判断 body 字段名是否是 id 类（``orderId`` / ``user_id`` / ``owner``…）。"""
+    n = str(name).strip().lower().replace("_", "")
+    return n.endswith("id") or n == "owner"
+
+
+def post_body(meta: dict, id_value: str = "") -> str:
+    """按接口元数据构造 POST 探测体（JSON 字符串）。
+
+    只填 id 类字段：查询型 POST（``POST /api/order/detail`` ＋ ``{"orderId":..}``）
+    是国内后端的常见形态，空体只会换来参数校验错误，等于白跑。
+    其余字段一律不带——不带值的服务端校验会挡住创建类副作用，这是
+    "探测不改动业务数据"边界在 POST 上的落点。没有 id 类字段就发空对象。
+    """
+    fields = meta.get("body_fields") or []
+    id_fields = [f for f in fields if _is_id_field(f)]
+    if id_fields and id_value:
+        return json.dumps({str(f): id_value for f in id_fields})
+    return "{}"
 
 
 def join_url(base: str, path: str) -> str:
@@ -136,17 +175,35 @@ class ApiAuthzDetector(Detector):
         self.failed_requests = 0
 
     # ── 请求（带重试）──────────────────────────────────────────────
-    async def _get(self, url: str, token: str | None = None, tries: int = 3) -> Evidence:
-        headers = {"Authorization": f"Bearer {token}"} if token else None
-        ev = Evidence(url=url, method="GET")
+    async def _send(
+        self, url: str, method: str = "GET", token: str | None = None,
+        body: str = "", tries: int = 3,
+    ) -> Evidence:
+        """GET/POST 统一出口：带可选凭证、JSON 体与网络抖动重试。"""
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if body and method.upper() != "GET":
+            headers["Content-Type"] = "application/json"
+        ev = Evidence(url=url, method=method)
         for i in range(tries):
-            ev = await self.send_request(url, method="GET", headers=headers)
+            ev = await self.send_request(
+                url, method=method, headers=headers or None, body=body
+            )
             if not ev.error:
                 return ev
             if i + 1 < tries:
                 await asyncio.sleep(0.6 + i * 1.2)
         self.failed_requests += 1
         return ev
+
+    async def _get(self, url: str, token: str | None = None, tries: int = 3) -> Evidence:
+        return await self._send(url, "GET", token=token, tries=tries)
+
+    async def _post(
+        self, url: str, token: str | None = None, body: str = "{}", tries: int = 3
+    ) -> Evidence:
+        return await self._send(url, "POST", token=token, body=body, tries=tries)
 
     def _poc(self, pid: str, fallback_name: str, sev: Severity) -> POC:
         p = self.poc_map.get(pid)
@@ -162,15 +219,19 @@ class ApiAuthzDetector(Detector):
     async def probe_missing_auth(
         self, base: str, ops: Iterable[dict], limit: int = 60, concurrency: int = 5
     ) -> tuple[list[Finding], int]:
-        """不带凭证访问「文档声明需要鉴权」的 GET 接口。"""
+        """不带凭证访问「文档声明需要鉴权」的 GET / 查询型 POST 接口。"""
         poc = self._poc("api-missing-auth", "接口未授权可访问", Severity.HIGH)
-        targets = self._rank(ops, only_auth=True, only_get=True)[:limit]
+        targets = self._rank(ops, only_auth=True, methods=("GET", "POST"))[:limit]
         sem = asyncio.Semaphore(concurrency)
 
         async def one(meta: dict) -> Finding | None:
             url = join_url(base, meta["path"])
             async with sem:
-                ev = await self._get(url)
+                if str(meta.get("method", "GET")).upper() == "POST":
+                    # 未授权阶段没有可信 id，探测体保持空对象
+                    ev = await self._post(url)
+                else:
+                    ev = await self._get(url)
             self.checked += 1
             if ev.error or ev.status_code != 200:
                 return None
@@ -211,7 +272,10 @@ class ApiAuthzDetector(Detector):
             他人 ID（比随机 UUID 命中率高得多）。
         """
         poc = self._poc("api-idor", "接口越权读取他人资源（IDOR）", Severity.HIGH)
-        cands = [m for m in self._rank(ops, only_auth=True, only_get=True) if m.get("has_id")]
+        cands = [
+            m for m in self._rank(ops, only_auth=True, methods=("GET", "POST"))
+            if self._idor_candidate(m)
+        ]
         cands = cands[:limit]
         others = self._idor_ids(seed=seed, candidate_ids=candidate_ids)
         sem = asyncio.Semaphore(concurrency)
@@ -220,8 +284,12 @@ class ApiAuthzDetector(Detector):
             filled = fill_path(meta["path"], others[0])
             if filled is None:
                 return None
+            url = join_url(base, filled)
             async with sem:
-                ev = await self._get(join_url(base, filled), token)
+                if str(meta.get("method", "GET")).upper() == "POST":
+                    ev = await self._post(url, token, body=post_body(meta, others[0]))
+                else:
+                    ev = await self._get(url, token)
             self.checked += 1
             if ev.error or ev.status_code != 200 or len(ev.body_excerpt) < 40:
                 return None
@@ -238,6 +306,21 @@ class ApiAuthzDetector(Detector):
 
         results = await asyncio.gather(*[one(m) for m in cands])
         return [r for r in results if r is not None], len(cands)
+
+    @staticmethod
+    def _idor_candidate(meta: dict) -> bool:
+        """能否对这条接口做 IDOR：资源 id 可被替换成「别人的」。
+
+        两条通道任一满足即可：路径占位符是 id 类（``/api/users/{id}``），
+        或查询型 POST 的 **body 字段里有 id 类**（``POST /api/order/detail``
+        ＋ ``{"orderId":..}``——POST-only 接口的资源标识在体里，只看路径
+        会把这类整块漏掉）。
+        """
+        if meta.get("has_id"):
+            return True
+        if str(meta.get("method", "")).upper() != "POST":
+            return False
+        return any(_is_id_field(f) for f in (meta.get("body_fields") or []))
 
     @staticmethod
     def _idor_ids(
@@ -260,17 +343,21 @@ class ApiAuthzDetector(Detector):
         self, base: str, ops: Iterable[dict], token: str, uid: str = "",
         limit: int = 60, concurrency: int = 5,
     ) -> tuple[list[Finding], int]:
-        """已登录视角遍历自身资源接口，找响应体里的凭据字段。"""
+        """已登录视角遍历自身资源接口（GET / 查询型 POST），找响应体里的凭据字段。"""
         poc = self._poc("api-sensitive-field", "接口响应体回传敏感字段", Severity.MEDIUM)
-        targets = self._rank(ops, only_auth=True, only_get=True)[:limit]
+        targets = self._rank(ops, only_auth=True, methods=("GET", "POST"))[:limit]
         sem = asyncio.Semaphore(concurrency)
 
         async def one(meta: dict) -> Finding | None:
             path = fill_path(meta["path"], uid) if meta.get("has_id") else meta["path"]
             if path is None:
                 return None
+            url = join_url(base, path)
             async with sem:
-                ev = await self._get(join_url(base, path), token)
+                if str(meta.get("method", "GET")).upper() == "POST":
+                    ev = await self._post(url, token, body=post_body(meta, uid))
+                else:
+                    ev = await self._get(url, token)
             self.checked += 1
             if ev.error or ev.status_code != 200:
                 return None
@@ -302,13 +389,27 @@ class ApiAuthzDetector(Detector):
     )
 
     @classmethod
-    def _rank(cls, ops: Iterable[dict], only_auth: bool = True, only_get: bool = True) -> list[dict]:
+    def _rank(
+        cls, ops: Iterable[dict], only_auth: bool = True,
+        methods: Iterable[str] = ("GET",),
+    ) -> list[dict]:
+        """按价值排序的候选接口。
+
+        ``methods`` 限定探测的 HTTP 方法集合；POST 额外过 :data:`WRITE_RE`
+        写操作黑名单——查询型 POST 才进队列，创建/支付/删除类一律不发。
+        """
+        allowed = {str(m).upper() for m in methods}
         out = []
         for m in ops:
             if only_auth and not m.get("auth", True):
                 continue      # 文档层面本就公开的不测
-            if only_get and m.get("method") != "GET":
-                continue      # 只读约束
+            method = str(m.get("method", "GET")).upper()
+            if method not in allowed:
+                continue      # 方法不在本批探测范围
+            if method == "POST" and WRITE_RE.search(
+                f"{m.get('path', '')} {m.get('summary', '')}"
+            ):
+                continue      # 写操作类 POST：探测体可能触发业务变更，跳过
             if "{" in m.get("path", "") and not m.get("has_id"):
                 continue      # 路径参数不是 id 类，填不了就不猜
             blob = f"{m.get('path','')} {m.get('summary','')}".lower()
@@ -329,4 +430,4 @@ def load_api_pocs(poc_dir: str = "./poc") -> dict[str, POC]:
     return pm
 
 
-__all__ = ["ApiAuthzDetector", "biz_ok", "fill_path", "SENSITIVE_RE"]
+__all__ = ["ApiAuthzDetector", "biz_ok", "fill_path", "SENSITIVE_RE", "WRITE_RE", "post_body"]

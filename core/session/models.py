@@ -12,6 +12,64 @@ from enum import Enum
 from core.session.redact import redact
 
 
+# ── 字段级容错解析 ────────────────────────────────────────────────
+#
+# 为什么要这一层：快照是**外部输入**——可能是旧版本写的、手改过的、
+# 写到一半被 Ctrl+C 截断的。以前 ``from_dict`` 里直接 ``int(...)`` /
+# ``Phase(...)``，任何一个字段对不上就抛异常；而 ``list_sessions`` 没有
+# 逐条兜底，一条坏快照能让整个 ``/sessions`` / ``flower_pow sessions``
+# 直接报错退出，用户看到的是"历史会话全都没了"。
+#
+# 现在的原则：**字段坏了退回默认值，快照还能用**。真读不出来（JSON 坏）
+# 才由 ``Session.load`` 返回 None 并在列表里被跳过。
+
+
+def as_phase(value: Any, default: "Phase | None" = None) -> "Phase":
+    """``"recon"`` / ``Phase.RECON`` / 中文标签 → ``Phase``；不认识退回默认。"""
+    if isinstance(value, Phase):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return default or Phase.RECON
+    for p in Phase:
+        if text == p.value:
+            return p
+    # 旧版/手改的快照可能存的是中文标签（"信息收集"）
+    for p in Phase:
+        if text == p.label:
+            return p
+    return default or Phase.RECON
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
+
+
+def as_list(value: Any) -> list:
+    """非列表一律当空——字符串尤其不能 ``list("abc")`` 成三个字符。"""
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def as_dict(value: Any) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
 class Phase(str, Enum):
     """测试阶段。顺序即推进方向。"""
 
@@ -76,17 +134,18 @@ class Turn:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Turn":
+        d = as_dict(d)
         return cls(
-            no=int(d.get("no") or 0),
-            phase=Phase(d.get("phase") or Phase.RECON.value),
-            intent=str(d.get("intent") or ""),
-            actions=list(d.get("actions") or []),
-            new_assets=int(d.get("new_assets") or 0),
-            new_findings=int(d.get("new_findings") or 0),
-            notes=list(d.get("notes") or []),
-            suggestions=list(d.get("suggestions") or []),
-            at=float(d.get("at") or time.time()),
-            elapsed=float(d.get("elapsed") or 0.0),
+            no=as_int(d.get("no"), 0),
+            phase=as_phase(d.get("phase")),
+            intent=as_str(d.get("intent")),
+            actions=[as_str(x) for x in as_list(d.get("actions"))],
+            new_assets=as_int(d.get("new_assets"), 0),
+            new_findings=as_int(d.get("new_findings"), 0),
+            notes=[as_str(x) for x in as_list(d.get("notes"))],
+            suggestions=[as_str(x) for x in as_list(d.get("suggestions"))],
+            at=as_float(d.get("at"), time.time()),
+            elapsed=as_float(d.get("elapsed"), 0.0),
         )
 
 
@@ -125,11 +184,12 @@ class ConversationTurn:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ConversationTurn":
+        d = as_dict(d)
         return cls(
-            no=int(d.get("no") or 0),
-            title=str(d.get("title") or ""),
-            at=float(d.get("at") or time.time()),
-            tools=[str(x) for x in (d.get("tools") or [])],
+            no=as_int(d.get("no"), 0),
+            title=as_str(d.get("title")),
+            at=as_float(d.get("at"), time.time()),
+            tools=[as_str(x) for x in as_list(d.get("tools"))],
         )
 
 
@@ -162,14 +222,15 @@ class BusinessModel:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "BusinessModel":
+        d = as_dict(d)
         return cls(
-            resources=list(d.get("resources") or []),
-            auth_domains=dict(d.get("auth_domains") or {}),
-            high_value=list(d.get("high_value") or []),
-            state_flows=list(d.get("state_flows") or []),
-            admin_ops=list(d.get("admin_ops") or []),
-            upload_ops=list(d.get("upload_ops") or []),
-            notes=list(d.get("notes") or []),
+            resources=[as_str(x) for x in as_list(d.get("resources"))],
+            auth_domains={as_str(k): as_int(v) for k, v in as_dict(d.get("auth_domains")).items()},
+            high_value=[as_str(x) for x in as_list(d.get("high_value"))],
+            state_flows=[as_str(x) for x in as_list(d.get("state_flows"))],
+            admin_ops=[as_str(x) for x in as_list(d.get("admin_ops"))],
+            upload_ops=[as_str(x) for x in as_list(d.get("upload_ops"))],
+            notes=[as_str(x) for x in as_list(d.get("notes"))],
         )
 
     def summary(self) -> str:

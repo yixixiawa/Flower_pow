@@ -1,0 +1,41 @@
+# Druid 监控台未授权访问
+# 类别：敏感路径探测　等级：高危
+#
+# 场景：同一软件（Alibaba Druid 连接池监控）部署在多台服务器上，
+# 用本条规则批量验证各台是否存在未授权访问。
+#
+# 探测方式：GET /druid/index.html。
+# - 未授权（漏洞存在）：200，页面 title 含 "Druid Stat Index"，
+#   可直接看到 SQL 监控 / URI 监控 / 数据源配置。
+# - 已开鉴权：302 跳 login.html，或 200 但内容是登录页
+#   （title 为 "Druid Monitor"，不含 Stat Index）→ 不命中。
+#
+# 匹配只用 "Druid Stat Index" 一个特征，宁可漏报不误报：
+# 登录页虽然也含 "Druid Monitor"，但那不代表漏洞。
+id: path-druid-unauth
+name: Druid 监控台未授权访问
+category: path_probe
+severity: high
+description: >-
+  Druid 连接池监控台未做鉴权即可访问，攻击者可查看 SQL 执行历史、
+  URI 请求统计、数据源连接配置（含数据库账号口令），并可能进一步
+  利用 /druid/sql.json 等接口获取内网信息。
+remediation: >-
+  在 web.xml / Spring 配置中为 /druid/* 开启 Servlet 认证
+  （StatViewServlet 的 loginUsername / loginPassword），
+  或直接对生产环境禁用监控页，并用网关封禁 /druid/ 路径。
+tags:
+- druid
+- monitor
+- unauthenticated
+- disclosure
+always_run: true
+request:
+  method: GET
+  paths:
+  - druid/index.html
+  expect_status:
+  - 200
+match:
+- patterns:
+  - Druid Stat Index

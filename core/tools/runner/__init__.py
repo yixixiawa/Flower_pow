@@ -32,6 +32,7 @@ r"""工具执行器——把模型的 tool_call 变成真实动作。
 ``export``              报告导出 handler（export_report）
 ``files``               文件操作 handler（read_file、write_file...）
 ``external``            外部 CLI 执行与 argv 闸门
+``tasks``               后台任务 handler（recon_ports_bg / background_run / list_tasks）
 ======================  ==========================================================
 
 :class:`ToolRunner` 由上述 mixin 多继承组装。对外只需要知道这一个名字：
@@ -49,6 +50,7 @@ from core.tools.runner.files import FileMixin
 from core.tools.runner.intel import IntelMixin
 from core.tools.runner.recon import ReconMixin
 from core.tools.runner.report import FindingMixin
+from core.tools.runner.tasks import TaskMixin
 from core.tools.runner.verify import VerifyMixin
 
 
@@ -62,6 +64,7 @@ class ToolRunner(
     ExportMixin,
     FileMixin,
     ExternalMixin,
+    TaskMixin,
     _ToolRunnerBase,
 ):
     """内置工具 + 外部进程的统一执行入口。

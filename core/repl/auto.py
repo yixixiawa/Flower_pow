@@ -5,12 +5,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import asyncio
 import time as _t
 from core.repl.consts import AUTO_WARN
 
 
-class _AutoMixin:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _AutoMixin(_Base):
     async def _autopilot(self) -> None:
         """一键跑完整条流水线：先给警告，确认后不再打断。
 

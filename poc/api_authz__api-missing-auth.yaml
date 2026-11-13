@@ -7,7 +7,8 @@
 # 产生海量假阳性。所以检测器里用「HTTP 200 且业务码属于成功 且响应含实际数据」
 # 三重判定，见 detectors/api_authz.py::biz_ok。
 #
-# 触发方式：只发 GET（只读），绝不因探测而改动业务数据。
+# 触发方式：GET 全量；查询型 POST（请求体只发空对象，不带任何业务字段）。
+# 绝不因探测而改动业务数据——写操作类 POST 在检测器里被 WRITE_RE 排除。
 id: api-missing-auth
 name: 接口未授权可访问
 category: api_authz
@@ -22,8 +23,10 @@ tags:
 - api
 - authz
 - unauthenticated
+- post
 always_run: true
 request:
   method: GET
+  methods: [GET, POST]
   paths: ['']
 match: []

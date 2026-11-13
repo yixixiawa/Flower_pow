@@ -151,6 +151,10 @@ class RequestSpec:
     """POC 的请求模板。对应 YAML 里的 ``request:``。"""
 
     method: str = "GET"
+    # 覆盖的请求方法集合（声明用：``methods: [GET, POST]`` 表示该漏洞类
+    # 在两种方法上都要探）。空列表 = 只有 ``method``。
+    # 执行仍以 ``method`` 为准；api_authz 探测器按自己的方法集合发请求。
+    methods: list[str] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
     params: dict[str, str] = field(default_factory=dict)
@@ -164,6 +168,7 @@ class RequestSpec:
         expect = d.get("expect_status") or d.get("expect")
         return cls(
             method=str(d.get("method") or "GET").upper(),
+            methods=[str(x).upper() for x in (d.get("methods") or [])],
             paths=[str(p) for p in paths],
             headers={str(k): str(v) for k, v in (d.get("headers") or {}).items()},
             params={str(k): str(v) for k, v in (d.get("params") or {}).items()},
@@ -175,6 +180,15 @@ class RequestSpec:
     def search_paths(self) -> list[str]:
         """至少要打一个请求（空路径 = 打站点根）。"""
         return self.paths or [""]
+
+    @property
+    def effective_methods(self) -> list[str]:
+        """声明的全部方法（去重保序，``method`` 永远在首位）。"""
+        seen: list[str] = [self.method]
+        for m in self.methods:
+            if m and m not in seen:
+                seen.append(m)
+        return seen
 
 
 @dataclass(slots=True)
@@ -241,6 +255,7 @@ class POC:
             " ".join(self.applies_to),
             " ".join(self.cve),
             self.category.value,
+            " ".join(self.request.effective_methods),
             " ".join(self.request.paths[:12]),
         ]
         for r in self.rules:

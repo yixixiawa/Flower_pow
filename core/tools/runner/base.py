@@ -140,6 +140,10 @@ class _ToolRunnerBase:
         # 主机级兜底（netloc）：拦"每 5 次换一个 path 绕端点检测"。
         self._host_signal: dict[str, str] = {}
         self._host_streak: dict[str, int] = {}
+        # 后台任务的 asyncio.Task 强引用（task_id -> Task）。
+        # ``create_task`` 只被事件循环**弱引用**，不自己存一份的话任务可能
+        # 执行到一半被 GC 掉（官方文档明确要求保留引用）。
+        self._bg_handles: dict[str, Any] = {}
 
     def reset_target_scope(self) -> None:
         """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
@@ -195,7 +199,8 @@ class _ToolRunnerBase:
             return (
                 f"【已拦截】{spec.key} 属于攻击性工具，当前为只读模式（scan.readonly=true）。\n"
                 f"原因：{spec.note or '可能对目标造成数据变更或业务影响。'}\n"
-                f"如确需使用，让用户改 config.yaml 的 scan.readonly: false 或设 POCS_READONLY=false 后重启。"
+                f"如确需使用，请用户在终端执行 /readonly off 放行"
+                f"（或改 config.yaml 的 scan.readonly: false）——目标必须已获书面授权。"
             )
         return None
 
@@ -276,7 +281,13 @@ class _ToolRunnerBase:
         # `undo="false"` 真的会撤销），也会把枚举写错大小写（`"MD"` → 判断全落空、
         # 静默什么都不做）。逐个 handler 打补丁治不了根，所以收在这一处。
         args = normalize_args(name, args)
-        if name not in {"extract_variable", "context_get"}:
+        # 变量展开的豁免清单只有 ``context_get``：它按**名字**查池，参数是
+        # 变量名而不是值——展开会把变量值当成名字去查，永远"变量不存在"。
+        # ``extract_variable`` 刻意**不豁免**：变量必须能链式组合
+        # （extract_variable(value="${token}-derived")）。豁免它的话组合式
+        # 会被静默存成字面量，后续请求带着 "${token}" 原文到处飞，
+        # 模型还以为链路已经打通——这种静默失效最难排查。
+        if name != "context_get":
             args = self._expand_context_vars(args, session.result.context_vars)
         status = "ok"
         try:
@@ -452,6 +463,22 @@ class _ToolRunnerBase:
             lines.append("上下文变量：" + "、".join(sorted(r.context_vars)))
         if r.attack_chains:
             lines.append(f"攻击链：{len(r.attack_chains)} 条（已记录步骤）")
+        # 后台任务：每轮开头必须让模型看见，否则它会忘了自己启动过什么、
+        # 或者一直干等一个早就完成的任务。列运行中的 id 是给它查询的抓手。
+        if session.tasks:
+            lines.append(session.tasks.summary_line())
+            running = session.tasks.running()
+            if running:
+                lines.append(
+                    "后台运行中：" + "、".join(
+                        f"{t.task_id}（{t.label}）" for t in running[:5]
+                    ) + "  → 完成后用 list_tasks 取结果，不要原地等"
+                )
+        # 收尾必须返回拼好的文本：这个函数曾经漏了这一行，导致
+        # ``session_state`` 工具永远回空串、系统提示里的"当前会话状态"
+        # 永远渲染成"（空白，还没有任何资产与发现）"——模型整场测试都没
+        # 看见过真实资产/发现，误以为每次都是从零开始。
+        return "\n".join(lines)
 
 
     # ── 会话合并 ──────────────────────────────────────────────────

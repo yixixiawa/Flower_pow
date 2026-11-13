@@ -5,12 +5,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import asyncio
 import time as _t
 from core.repl.consts import _call_name
 
 
-class _HistoryMixin:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _HistoryMixin(_Base):
     def _push_history(self, text: str) -> None:
         """记录输入历史，供上下键翻取。"""
         h = self.reader.history

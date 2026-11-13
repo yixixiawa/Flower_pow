@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from pathlib import Path
 from core.session import (
     Phase,
@@ -16,7 +18,13 @@ from core.session import (
 from core.repl.consts import _REPORT_NOTE_PREFIX
 
 
-class _SessionMixin:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _SessionMixin(_Base):
     def _sessions_dir(self) -> Path:
         """会话快照根目录（``data/sessions``）。
 
@@ -103,6 +111,45 @@ class _SessionMixin:
         for p in paths:
             print(f"  {p}")
 
+    def _pick_session(self, base: Path, ref: str) -> "Session | None":
+        """把用户给的引用解析成一个会话：``#3`` / 目录名 / id / 唯一子串。
+
+        支持编号是为了"看得见就能选"——``/sessions`` 里每条都有 ``#N``，
+        照着敲 ``/resume #N`` 即可，不用复制那一长串中文目录名。
+        注意纯数字目录名（``1791789725``）优先按**名字**匹配，不会被
+        误当成序号。
+        """
+        items = list_sessions(base, limit=None)
+        if not items:
+            return None
+        ref = (ref or "").strip()
+
+        if ref.startswith("#"):
+            try:
+                n = int(ref[1:])
+            except ValueError:
+                return None
+            return items[n - 1][1] if 1 <= n <= len(items) else None
+
+        for name, s in items:
+            if ref in (name, s.session_id):
+                return s
+
+        if ref.isdigit():
+            n = int(ref)
+            if 1 <= n <= len(items):
+                return items[n - 1][1]
+
+        low = ref.lower()
+        hits = [(name, s) for name, s in items if low in name.lower()]
+        if len(hits) == 1:
+            return hits[0][1]
+        if len(hits) > 1:
+            print(f"「{ref}」匹配到 {len(hits)} 个会话，请用编号或完整名字：")
+            for name, _s in hits[:8]:
+                print(f"  {name}")
+        return None
+
     def _resume(self, session_id: str = "") -> None:
         """恢复会话。``session_id`` 为空时取最近一次。
 
@@ -116,9 +163,10 @@ class _SessionMixin:
             print(f"（已清理 {len(gone)} 个空会话：{'、'.join(gone[:3])}…）"
                   if len(gone) > 3 else f"（已清理 {len(gone)} 个空会话：{'、'.join(gone)}）")
         if session_id:
-            prev = Session.load(base / session_id)
+            prev = self._pick_session(base, session_id)
             if prev is None:
-                print(f"没有找到会话 {session_id}（用 /sessions 看可恢复列表）")
+                print(f"没有找到会话 {session_id}（用 /sessions 看可恢复列表，"
+                      f"支持 /resume #编号）")
                 return
         else:
             prev = latest_session(base)
@@ -198,27 +246,57 @@ class _SessionMixin:
         left = len(list_sessions(base, limit=10**6))
         print(f"   剩余 {left} 个会话用 /sessions 查看")
 
-    def _sessions(self) -> None:
-        """列出可恢复的会话。"""
-        items = list_sessions(self._sessions_dir(), limit=10)
+    def _sessions(self, arg: str = "") -> None:
+        """``/sessions [N|all]``：列出可恢复的会话（默认全量，带序号）。
+
+        以前这里硬编码 ``limit=10`` 且只印名字：会话一多，老会话就永远
+        看不见，也无法"按编号挑"。现在：
+
+        * 默认**列出全部**，超过 20 条时提示可用 ``/sessions N`` 只看最近 N 条
+        * 每条带序号 ``#1``，``/resume #1`` 直接选
+        * 显示标题（第一轮对话）、更新时间、阶段、资产/发现/对话条数、目标
+        """
+        items = list_sessions(self._sessions_dir(), limit=None)
         if not items:
             print("（没有可恢复的会话）")
             return
         import time as _t
 
-        print(f"\n可恢复会话（最近 {len(items)} 个，用 /resume <id> 载入）：")
-        for name, s in items:
+        show = items
+        want = (arg or "").strip().lower()
+        if want and want not in ("all", "a"):
             try:
-                when = _t.strftime("%m-%d %H:%M", _t.localtime(s.updated_at))
-            except (ValueError, OSError):
+                n = int(want)
+                show = items[: max(1, n)]
+            except ValueError:
+                print("用法：/sessions [N|all]（N=只看最近 N 条，默认全部）")
+                return
+
+        total = len(items)
+        print(f"\n可恢复会话（共 {total} 个，用 /resume <编号|会话名> 载入）：")
+        for i, (name, s) in enumerate(show, 1):
+            try:
+                when = _t.strftime("%Y-%m-%d %H:%M", _t.localtime(s.updated_at))
+            except (ValueError, OSError, OverflowError):
                 when = "?"
             c = s.counts()
             nfind = sum(c.values())
             hist = f"对话 {len(s.history)} 条" if s.history else "无对话"
-            print(
-                f"  {name}  {when}  {s.phase.label:4} "
-                f"资产 {len(s.result.assets):3} 发现 {nfind:2} {hist}  {s.target or '（无目标）'}"
+            title = (s.display_title or "").strip()
+            # 目录名已经是 日期_标题、或标题就等于目标时不必重复印
+            extra = (
+                f"  {title}"
+                if title and title not in name and title != (s.target or "")
+                else ""
             )
+            print(
+                f"  #{i:<2} {name}{extra}\n"
+                f"      {when}  {s.phase.label:4}  "
+                f"资产 {len(s.result.assets):3} 发现 {nfind:2} {hist}  "
+                f"{s.target or '（无目标）'}"
+            )
+        if len(show) < total:
+            print(f"  （还有 {total - len(show)} 个更早的会话，用 /sessions all 看全量）")
 
     # ── 持久化 ────────────────────────────────────────────────────
     def _save(self) -> Path | None:

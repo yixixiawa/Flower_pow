@@ -7,6 +7,10 @@
 # 为什么用随机 UUID 而不是枚举真实 id：
 # 一是没有他人真实 id，二是**随机 id 若还能返回数据，反而更能证明
 # 服务端压根没校验归属**（连不存在的资源都返回了内容）。
+#
+# POST 接口同样覆盖：国内后端常见「查询也走 POST」（POST /api/order/detail
+# + {"orderId":..}）。探测体只填 id 类字段，其余不带；路径/摘要命中
+# 创建/支付/删除等写操作关键词的 POST 一律跳过（见 detectors/api_authz.py::WRITE_RE）。
 id: api-idor
 name: 接口越权读取他人资源（IDOR）
 category: api_authz
@@ -22,8 +26,10 @@ tags:
 - authz
 - idor
 - horizontal-privilege
+- post
 always_run: true
 request:
   method: GET
+  methods: [GET, POST]
   paths: ['']
 match: []

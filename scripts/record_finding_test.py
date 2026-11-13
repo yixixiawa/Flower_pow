@@ -14,6 +14,10 @@
   7. 流式 finish_reason=length 被识别并 yield error
   8. 系统提示包含「必须登记」纪律
   9. 目标归属拦截：域名会话里登记 IP（及反向）被拦，同形态放行
+ 10. 资产豁免：会话自己发现的主机（已入库资产）不再被形态一刀切拦掉
+ 11. 攻击链登记校验：幽灵 finding_id 拒绝 / 同 id 覆盖拒绝 / 幂等重放放行
+ 12. record_finding 的 chain_id 必须指向已登记的链，step_index 不得越界
+ 13. 变量链式展开：extract_variable 组合 ${var} 生效，context_get 仍按名查池
 
 运行：.venv/Scripts/python.exe scripts/test_record_finding.py
 """
@@ -232,7 +236,7 @@ async def main() -> int:
         "category": "idor",
     }, session)
     check("已拦截" in blocked, f"域名会话里登记 IP 被拦：{blocked[:60]}")
-    check("/target" in blocked, "拦截文案提示先切换目标")
+    check("set_target" in blocked, "拦截文案引导模型调 set_target 工具（/target 是 REPL 命令，模型调不了）")
     check(len(session.result.findings) == n_before, "被拦的没有入库")
 
     # 目标本身就是 IP 时，登记域名同样要拦（反过来的串线）
@@ -263,6 +267,107 @@ async def main() -> int:
         "category": "idor",
     }, session)
     check("已拦截" in bare, f"裸 IP 形态也能识别：{bare[:60]}")
+
+    print("\n场景10 资产豁免：会话自己发现的主机不拦（_scope_host 不再一刀切）")
+    from core.state import Asset
+
+    # 模型在测 juice.test 的过程中正当发现了 10.0.0.9（解析 IP / 邻站资产），
+    # 它已作为资产入库——往它上面登记发现不该被形态不一致一刀切拦掉
+    session.result.assets.append(Asset(kind="ip", value="http://10.0.0.9:9000"))
+    ok_ip = await runner.execute("record_finding", {
+        "name": "资产 IP 越权", "severity": "medium",
+        "matched_at": "http://10.0.0.9:9000/api",
+        "evidence": "越权读取", "payload": "GET /api",
+        "category": "idor",
+    }, session)
+    check("已登记" in ok_ip, f"资产里已有的主机放行：{ok_ip[:60]}")
+    # 没入库的主机照样拦：豁免只认"本会话发现的资产"
+    blocked3 = await runner.execute("record_finding", {
+        "name": "陌生 IP", "severity": "high",
+        "matched_at": "http://10.0.0.77/admin",
+        "evidence": "越权", "payload": "GET /admin",
+        "category": "idor",
+    }, session)
+    check("已拦截" in blocked3, f"不在资产里的陌生 IP 仍被拦：{blocked3[:50]}")
+
+    print("\n场景11 攻击链登记校验（chain.py 三道闸门）")
+    from core.state import Evidence, Finding, Severity as _Sev
+
+    session.result.findings.append(
+        Finding(
+            poc_id="probe_x1", name="探针发现", severity=_Sev.MEDIUM,
+            category=Category.HEADER_CHECK, matched_at="http://juice.test/x",
+            evidence=Evidence(url="http://juice.test/x", poc_id="probe_x1"),
+        )
+    )
+    # 引用不存在的 finding_id → 拒
+    ghost = await runner.execute("record_attack_chain", {
+        "title": "幽灵链", "entry_point": "e", "final_impact": "i",
+        "finding_ids": ["probe_x1", "no_such_finding"],
+    }, session)
+    check("登记失败" in ghost and "no_such_finding" in ghost,
+          f"不存在的 finding_id 被拒：{ghost[:70]}")
+    # 正常登记（自动编号 chain-1）
+    ok_chain = await runner.execute("record_attack_chain", {
+        "title": "从信息泄露到越权", "entry_point": "JS 硬编码", "final_impact": "接管后台",
+        "finding_ids": ["probe_x1"],
+    }, session)
+    check("已记录攻击链" in ok_chain, f"正常登记成功：{ok_chain[:50]}")
+    # 同 id 不同标题 → 拒（不得静默覆盖）
+    dup = await runner.execute("record_attack_chain", {
+        "chain_id": "chain-1", "title": "另一条链", "entry_point": "e", "final_impact": "i",
+        "finding_ids": ["probe_x1"],
+    }, session)
+    check("登记失败" in dup and "chain-1" in dup, f"同 id 不同标题被拒：{dup[:60]}")
+    # 同 id 同标题 → 幂等放行
+    replay = await runner.execute("record_attack_chain", {
+        "chain_id": "chain-1", "title": "从信息泄露到越权", "entry_point": "JS 硬编码",
+        "final_impact": "接管后台", "finding_ids": ["probe_x1"],
+    }, session)
+    check("未重复登记" in replay, f"同 id 同标题幂等放行：{replay[:50]}")
+
+    print("\n场景12 record_finding 的 chain_id 归属校验")
+    ghost_chain = await runner.execute("record_finding", {
+        "name": "编造链", "severity": "high",
+        "matched_at": "http://juice.test/chain", "evidence": "e", "payload": "GET /chain",
+        "chain_id": "chain-999",
+    }, session)
+    check("登记失败" in ghost_chain and "chain-999" in ghost_chain,
+          f"不存在的 chain_id 被拒：{ghost_chain[:70]}")
+    bad_idx = await runner.execute("record_finding", {
+        "name": "越界步骤", "severity": "high",
+        "matched_at": "http://juice.test/idx", "evidence": "e", "payload": "GET /idx",
+        "chain_id": "chain-1", "step_index": 9,
+    }, session)
+    check("登记失败" in bad_idx and "step_index" in bad_idx,
+          f"越界 step_index 被拒：{bad_idx[:60]}")
+    ok_link = await runner.execute("record_finding", {
+        "name": "链上第二步", "severity": "high",
+        "matched_at": "http://juice.test/step2", "evidence": "e", "payload": "GET /step2",
+        "chain_id": "chain-1", "step_index": 0,
+    }, session)
+    check("已登记" in ok_link, f"合法 chain 关联放行：{ok_link[:50]}")
+    linked = [f for f in session.result.findings if f.matched_at.endswith("/step2")][0]
+    check(linked.chain_id == "chain-1", f"发现挂上链 ID：{linked.chain_id}")
+
+    print("\n场景13 变量链式展开（extract_variable 不再被错误豁免）")
+    await runner.execute("extract_variable", {
+        "name": "token", "value": "abc123", "source": "场景13",
+    }, session)
+    chained = await runner.execute("extract_variable", {
+        "name": "combo", "value": "PREFIX-${token}", "source": "场景13",
+    }, session)
+    check("已记住变量 combo" in chained, f"链式提取成功：{chained[:50]}")
+    got = session.result.context_vars["combo"]["value"]
+    check(got == "PREFIX-abc123", f"组合式已展开（不再存字面量），实={got!r}")
+    # http_request 的参数展开不该被改坏（不真发请求，直接测展开函数）
+    expanded = runner._expand_context_vars(
+        {"headers": {"Authorization": "Bearer ${token}"}}, session.result.context_vars
+    )
+    check(expanded["headers"]["Authorization"] == "Bearer abc123",
+          f"http_request 参数展开路径未受影响，实={expanded['headers']['Authorization']!r}")
+    by_name = await runner.execute("context_get", {"name": "${token}"}, session)
+    check("变量不存在" in by_name, f"context_get 仍按名字查池（不展开）：{by_name[:50]}")
 
     print(f"\n{ok}/{total} 通过")
     return 0 if ok == total else 1

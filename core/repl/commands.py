@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import time as _t
 from core.repl.consts import _console
 
 
-class _CommandMixin:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+    from core.state import Finding
+else:
+    _Base = object
+
+
+class _CommandMixin(_Base):
     def _toggle_agent(self, on: bool) -> None:
         if on and self.agent is None:
             if not (self.cfg.llm.enabled and self.cfg.llm.api_key):
                 print("没有可用的 API Key，无法启用 Agent。先用 /key 配置。")
                 return
-            self._build_agent()
+            self.agent = self._build_agent()
             # 恢复出来的会话：把历史回填，模型才接得上之前聊的
             if self.session.history:
                 n = self.agent.restore(self.session.history)
@@ -48,6 +57,17 @@ class _CommandMixin:
         * ``runner.reset_target_scope()``：运行期缓存（最近一次 HTTP 响应
           快照、端点/主机连击计数）也是目标专属的——留着的话登记发现时
           可能把**上一个目标**的响应当成新目标的贴进报告。
+
+        除了上面这些，还有两处**不显眼但不清就等于白清**的：
+
+        * ``session.history`` / ``session.conversations``：上一目标的对话。
+        ``agent.reset()`` 只清 Agent 自己那份，``_toggle_agent`` 与重启后的
+        Agent 重建都会用 ``session.history`` 回填——不清这里，旧对话原封
+        不动灌回模型，"彻底失忆"就是一句空话。
+        * **重新发身份**（``session_id`` / ``_dir_name`` / ``created_at``）：
+        换目标后的进度是**新会话**。``Session._target_dir`` 见到已存在的
+        目录就沿用，不清身份的话下次 ``_save`` 会把旧目标的盘上快照
+        **整个覆盖**——"换目标不删旧快照、还能 /resume 回去"就破了功。
         """
         r = self.session.result
         r.assets.clear()
@@ -59,13 +79,36 @@ class _CommandMixin:
         r.errors.clear()
         self.session.credentials.clear()
         self.session.turns.clear()
+        # 对话历史属于上一目标（见 docstring），必须与 agent.reset() 同步清
+        self.session.history.clear()
+        self.session.conversations.clear()
         from core.session import BusinessModel
+        from core.session import TaskManager
 
         self.session.model = BusinessModel()
+        # 后台任务属于**上一目标**：任务跑完会把资产并进它闭包里的 session，
+        # 换目标后就是往新会话里灌旧目标的端口——报告直接串线。
+        # 所以先取消（此时台账还在，cancel 依赖它），再清空台账。
+        if self.runner is not None:
+            n = self.runner.cancel_background(self.session, "切换目标，后台任务已取消")
+            if n:
+                print(f"已取消 {n} 个后台任务（属于旧目标）。")
+        self.session.tasks = TaskManager()
         if self.agent is not None:
             self.agent.reset()
         if self.runner is not None:
             self.runner.reset_target_scope()
+        # 换目标 = 新会话身份：旧快照目录让给旧会话，新进度写到新目录。
+        # 同一秒内新建又切换的话秒级时间戳会撞旧 id，追加序号保证必不同。
+        base_id = str(int(_t.time()))
+        new_id = base_id
+        seq = 0
+        while new_id == self.session.session_id:
+            seq += 1
+            new_id = f"{base_id}-{seq}"
+        self.session.session_id = new_id
+        self.session._dir_name = ""
+        self.session.created_at = _t.time()
 
     def _reset(self, args: str = "") -> None:
         """彻底重置：销毁当前所有数据，开启全新会话。
@@ -89,6 +132,10 @@ class _CommandMixin:
             except OSError as exc:
                 print(f"（会话快照删除失败：{exc} —— 内存数据仍已清空）")
 
+        # 旧会话的后台任务必须先取消：它们闭包持有旧 session，继续跑
+        # 只会白占网络与事件循环（结果写进一个没人再看的对象）。
+        if self.runner is not None:
+            self.runner.cancel_background(old, "会话彻底重置，后台任务已取消")
         self.session = Session(target="", phase=Phase.RECON)
         # 规划器持有旧 session 引用，必须一起换掉
         self._planner = None
@@ -163,6 +210,46 @@ class _CommandMixin:
         print(f"✓ Key 已生效（{source}，{DEFAULT_ENV_PATH}）")
         if self.agent_on:
             print(f"Agent 已就绪：模型 {self.cfg.llm.model}，工具 {len(self.tools)} 个")
+
+    # ── 只读模式开关 ──────────────────────────────────────────────
+
+    def _set_readonly(self, raw: str = "") -> None:
+        """``/readonly [on|off]`` —— 运行期切换只读模式，不用改配置再重启。
+
+        为什么允许运行期切换：只读是"当前会话打多狠"的决策，不是部署期
+        常量。上一目标做无接触信息收集（只读），切到下一个已获授权的目标
+        要上攻击性工具——为此改 config.yaml 再重启，等于把会话状态全丢。
+
+        切换只改**本次运行**的 ``cfg.scan.readonly``，不写回 config.yaml：
+        配置文件是"下次启动的默认值"，会话内的临时放开不该泄漏到下次。
+        三处闸门（external_tool 拦截、POC 匹配过滤、planner）与 Agent 系统
+        提示每轮都**现读**这个值，切换即时生效，无需重建任何对象。
+        """
+        parts = (raw or "").split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+        cur = bool(getattr(self.cfg.scan, "readonly", True))
+        if arg in ("on", "1", "true", "开"):
+            want = True
+        elif arg in ("off", "0", "false", "关"):
+            want = False
+        else:
+            state = "攻击性外部工具被拦截" if cur else "已放开写操作"
+            print(
+                f"当前只读模式：{'开' if cur else '关'}（{state}）。"
+                "用 /readonly on|off 切换（只影响本次运行，不写回 config.yaml）。"
+            )
+            return
+        if want == cur:
+            print(f"只读模式已是{'开' if cur else '关'}，无变化。")
+            return
+        self.cfg.scan.readonly = want
+        if want:
+            print("✓ 已恢复只读模式：攻击性外部工具（sqlmap/hydra 等）重新拦截，"
+                  "POC 匹配只保留非破坏性验证。")
+        else:
+            print("⚠ 已放开写操作（readonly=off）：攻击性外部工具放行，"
+                  "破坏性 POC 会真实执行。")
+            print("  只对已获书面授权的目标这么做；/readonly on 可随时收回。")
 
     # ── 剧本模式动作 ──────────────────────────────────────────────
 
@@ -324,7 +411,7 @@ class _CommandMixin:
         if dismissed and not show_dismissed:
             print("\n  （已排除项由 Agent 的 dismiss_finding 工具管理，可撤销）")
 
-    def _finding_rows(self, *, show_dismissed: bool = False) -> list[tuple[int, object]]:
+    def _finding_rows(self, *, show_dismissed: bool = False) -> list[tuple[int, Finding]]:
         """``[(编号, Finding)]``。编号**始终按含已排除的全表算**。
 
         为什么编号要含已排除项：编号是用户和模型引用一条发现的唯一抓手，

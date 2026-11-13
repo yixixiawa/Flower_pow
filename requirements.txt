@@ -58,6 +58,10 @@ typing_extensions==4.16.0
 # ---- 可选增强（装了就用，不装自动降级）----
 #   nmap        —— 端口扫描改用 nmap -sV 拿服务指纹
 #   dirsearch   —— 路径爆破改用 dirsearch 大字典
+#   mcp         —— MCP Server 壳：`flower_pow mcp` / `flower-pow-mcp`
+#                  （会带进 uvicorn / starlette / cryptography / jsonschema 等
+#                   约 19 个包，主程序运行时不用，所以不逐个冻在这里；
+#                   需要 MCP 时单独装：pip install "mcp>=2"）
 #   pytest      —— 见 requirements-dev.txt
 # 两者都不在 PATH 时使用内置实现，功能不中断。
 

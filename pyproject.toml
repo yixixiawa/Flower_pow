@@ -20,9 +20,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff>=0.4.0"]
+# MCP 壳是可选能力：不装它主程序照常跑，只是没法 `flower_pow mcp`
+mcp = ["mcp>=2.0.0"]
 
 [project.scripts]
 flower-pow = "flower_pow:app"
+flower-pow-mcp = "mcp_server.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -38,6 +41,7 @@ include = [
     "detectors/**/*.py",
     "kb/**/*.py",
     "llm/**/*.py",
+    "mcp_server/**/*.py",
     "output/**/*.py",
     "poc/**/*.yaml",
 ]

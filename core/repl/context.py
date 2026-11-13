@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from pathlib import Path
 from core.completer import Completer, HOTKEY_FULL_AUTO, PromptReader
 from core.session import (
@@ -17,8 +19,15 @@ from core.session import (
 from core.repl.consts import COMMANDS
 
 
-class _ContextMixin:
-    def _session_ids(self, limit: int = 8) -> list[str]:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.agent import Agent
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _ContextMixin(_Base):
+    def _session_ids(self, limit: int = 20) -> list[str]:
         """可恢复的会话 id——用于 ``/resume <Tab>`` 补全。"""
         try:
             base = Path(self.cfg.data_dir) / "sessions"
@@ -40,6 +49,7 @@ class _ContextMixin:
             "poll": ["5", "8", "12", "20", "0"],
             "phase": ["recon", "model", "exploit", "iterate"],
             "agent": ["on", "off"],
+            "readonly": ["on", "off"],
             "resume": self._session_ids(),
             # 标题编号只列已存在的 + 下一个（避免补出一堆不存在的编号）
             "title": [str(i) for i in range(1, len(self.session.conversations) + 2)],
@@ -72,7 +82,7 @@ class _ContextMixin:
         except Exception:  # noqa: BLE001
             return []
 
-    def _build_agent(self) -> None:
+    def _build_agent(self) -> Agent:
         from core.agent import Agent
         from core.tools import ToolRunner
         from core.tools import llm_schemas
@@ -84,6 +94,7 @@ class _ContextMixin:
         self.agent = Agent(
             self.cfg, self.session, self.runner, self.tools, self.llm, probes=self.probes
         )
+        return self.agent
 
     @property
     def planner(self):

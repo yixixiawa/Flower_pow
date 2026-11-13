@@ -16,6 +16,8 @@ Ctrl+C 在这里有**两种语义**，必须分开处理：
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import asyncio
 
 from core.completer import Completer, HOTKEY_FULL_AUTO, PromptReader
@@ -51,7 +53,13 @@ def uncancel() -> None:
             pass
 
 
-class _LoopMixin:
+if TYPE_CHECKING:  # 类型检查期继承成员契约；运行期 _Base 是 object，MRO 与行为不变
+    from core.repl._contract import _ReplContract as _Base
+else:
+    _Base = object
+
+
+class _LoopMixin(_Base):
     async def loop(self) -> Session:
         print(BANNER_AGENT if self.agent_on else BANNER)
         if self.session.target:
@@ -274,12 +282,15 @@ class _LoopMixin:
                 except ValueError:
                     print("编号必须是数字（用 /chats 看有哪些）")
             return True
-        if low in ("/sessions", "/ls"):
-            self._sessions()
+        # 裸命令（不带 /）也认：「sessions」被当成自然语言喂给模型时，
+        # 模型并不知道磁盘上有什么会话，用户看到的就是"命令没反应"。
+        if low in ("/sessions", "/ls", "sessions"):
+            parts = raw.split(maxsplit=1)
+            self._sessions(parts[1] if len(parts) > 1 else "")
             return True
-        if low.startswith("/resume"):
-            parts = raw.split()
-            self._resume(parts[1] if len(parts) > 1 else "")
+        if low.startswith("/resume") or low == "resume" or low.startswith("resume "):
+            parts = raw.split(maxsplit=1)
+            self._resume(parts[1].strip() if len(parts) > 1 else "")
             return True
         if low.startswith("/backfill"):
             self._backfill()
@@ -306,6 +317,9 @@ class _LoopMixin:
             return True
         if low.startswith("/key"):
             self._set_key()
+            return True
+        if low.startswith("/readonly"):
+            self._set_readonly(raw)
             return True
         if low == "/auto":
             await self._autopilot()
