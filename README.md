@@ -83,6 +83,26 @@ Leads are a separate lifecycle, not a status: `flower-pow findings --pending`, t
 | Strength | reproducible, no token cost | does not stall when the site has no login page |
 | Cost | some wasted rounds | depends on model quality, hence the guardrails |
 
+#### Permission control (always on, config cannot turn it off)
+
+Every target-facing request (`http_request` / `external_tool` / `exploit_probe`) passes a ten-rule permission matrix (`policy/api_policy.py::rules_table_markdown()`) before the request is actually sent. Key rules:
+
+| Level | Commands | Condition |
+|---|---|---|
+| L0 | query detail / list | target + environment + identity bound, read-only |
+| L1 | create / update test data | **isolated_test only** |
+| L2 | upload test file | **dedicated_test only, per-request approval** |
+| L2 | delete test data | test env + per-request approval + ledger verdict |
+| L3 | batch delete / SQLi verify / command exec / scheduled task | **always denied, no approval path** |
+
+Hard constraints:
+
+* **Scope**: the request URL must fall inside the bound target — scheme, hostname **and port** are normalized and compared, and a path prefix on the bound target confines the authorized paths. Out-of-scope requests are treated as unbound → denied.
+* **No config-level approvals**: `policy.approvals` is ignored. Approval only exists at runtime, **per request, bound to the exact object URL** — changed parameters mean the approval must be obtained again.
+* **Ledger**: only objects that were actually created (execution succeeded **and** an object id was extracted from the response) are registered, keyed by target + run + identity + object id. Unknown objects without a per-request approval can never be deleted.
+* **Audit is a precondition, not a side-channel**: if the audit JSONL cannot be persisted, write operations and approvals are **refused**; read-only operations proceed with a visible warning.
+* **Identity**: credentials are bound as `cred:<header>:<fingerprint>` (+ declared role), so different tokens are distinct identities; unauthenticated requests are explicit `anonymous@<host>`.
+
 #### MCP server
 
 `mcp_server/` exposes the scanner to external AI clients over stdio or HTTP with **10 tools**: `doctor`, `poc_list`, `poc_show`, `kb_search`, `sessions`, `findings`, `scan_start`, `scan_status`, `scan_cancel`, `report`. Scans run as background jobs — `scan_start` returns a `job_id` immediately, `scan_status` polls, `report` exports.
@@ -304,6 +324,26 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 | 打法 | 固定几轮：侦察 → 业务建模 → 测试 → 迭代 | 看着当前状态决定下一步 |
 | 优点 | 可复现、不烧 token | 站点没有登录页也不会死板推进 |
 | 代价 | 会做无用功 | 依赖模型质量，故设了多道闸门 |
+
+#### 权限控制（恒生效，配置关不掉）
+
+所有面向目标的请求（`http_request` / `external_tool` / `exploit_probe`）在实际发出前过十条规则的权限矩阵（`policy/api_policy.py::rules_table_markdown()`）。要点：
+
+| 等级 | 命令 | 条件 |
+|---|---|---|
+| L0 | 查询详情 / 查询列表 | 目标 + 环境 + 账号身份已绑定，且只读 |
+| L1 | 创建 / 修改测试数据 | **仅隔离测试环境（isolated_test）** |
+| L2 | 上传测试文件 | **仅专门测试环境（dedicated_test）+ 逐请求审批** |
+| L2 | 删除测试数据 | 测试环境 + 逐请求审批 + 台账判定 |
+| L3 | 批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行 | **一律拒绝，审批不设出路** |
+
+硬约束：
+
+* **目标范围**：请求 URL 必须落在绑定目标的授权范围内——scheme、hostname、**端口**规范化比较，绑定目标带路径前缀时请求路径不得越出；出界按"未绑定"拒绝。
+* **没有配置级审批**：`policy.approvals` 不再生效。审批只存在于运行期，**逐请求、绑定具体对象 URL**——参数一变就必须重新审批。
+* **对象台账**：只有**执行成功并从响应取得对象标识**的创建/上传才会登记，按 目标 + 轮次 + 账号身份 + 对象标识 四元组匹配；未知对象没有绑定本次请求的审批就删不掉。
+* **审计是写操作的先决条件**：审计 JSONL 无法持久化时，写操作与审批**拒绝执行**；只读操作放行但状态行可见告警。
+* **账号身份**：凭证以 `cred:<头名>:<指纹>`（+ 显式声明的角色）绑定，不同 token 是不同身份；未认证请求显式记为 `anonymous@<host>`。
 
 #### MCP Server
 

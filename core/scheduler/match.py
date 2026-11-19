@@ -142,7 +142,7 @@ class _MatchMixin:
         if not cve_pocs:
             return
         try:
-            intel = get_intel(f"{self.cfg.data_dir}/intel")
+            intel = get_intel(f"{self.cfg.data_dir}/intel", cfg=self.cfg)
             found = 0
             for p in cve_pocs:
                 for cve in p.cve:

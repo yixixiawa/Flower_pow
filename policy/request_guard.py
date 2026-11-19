@@ -249,24 +249,58 @@ def _map_command(category: str, signals: list[str]) -> str:
 
 # ── Guard 本体 ────────────────────────────────────────────────────
 
-# 审批表**唯一**可作用的命令：L2「删除测试数据」（矩阵明文"需要单独审批"）。
-# L3 不在表内——P0 整改后 L3 无任何审批出路。
-_APPROVABLE_COMMANDS = frozenset({"删除测试数据"})
+# ── 统一目标范围校验（P0-①：全工程唯一的一把尺子）─────────────────
+# scheme + hostname + port 规范化比较（默认端口归一：http:80 / https:443
+# 与省略端口等价），路径按授权范围处理——绑定目标声明了非根路径前缀时
+# （如 http://host:8080/app），请求路径必须落在该前缀内。
+# runner 的 exploit_probe 等所有工具一律调这里，不得自行构造简化判定。
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
-def _same_host(url_a: str, url_b: str) -> bool:
-    """两个 URL 的主机名是否同源（P0-3：目标范围严格比对）。
-
-    只比 hostname（大小写不敏感），不比端口/路径——绑定目标是
-    ``http://host:8080/app`` 时，对 ``http://host:9999`` 的请求同样
-    算出界：换端口的服务是另一个攻击面，不在绑定范围内。
-    """
+def _endpoint(url: str) -> tuple[str, str, int, str] | None:
+    """URL → (scheme, hostname, port, path)，全部规范化。解析失败返回 None。"""
     try:
-        ha = (urlparse(url_a or "").hostname or "").lower()
-        hb = (urlparse(url_b or "").hostname or "").lower()
+        p = urlparse(url or "")
+        scheme = (p.scheme or "").lower()
+        host = (p.hostname or "").lower()
+        if not host:
+            return None
+        port = p.port  # 非法端口会抛 ValueError → 被外层捕获
     except ValueError:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme, 0)
+    return scheme, host, port, p.path or "/"
+
+
+def in_scope(url: str, bound_target: str) -> bool:
+    """请求 URL 是否落在绑定目标的授权范围内（P0-① 统一入口）。
+
+    * scheme 必须一致（绑定 http 就不得打 https 混淆）；
+    * hostname 大小写不敏感、**端口参与比较**（默认端口归一）——
+      修掉旧实现只比 hostname、``http://host:9999`` 也算同源的洞；
+    * 路径：绑定目标带非根路径前缀时，请求路径必须在该前缀内
+      （``http://host/app`` 授权范围不含 ``/other``）。
+    """
+    a = _endpoint(bound_target)
+    b = _endpoint(url)
+    if a is None or b is None:
         return False
-    return bool(ha) and bool(hb) and ha == hb
+    if a[0] != b[0] or a[1] != b[1] or a[2] != b[2]:
+        return False
+    base = a[3].rstrip("/")
+    if base:  # 绑定目标声明了具体路径前缀 → 授权范围含路径边界
+        req = b[3]
+        if req != base and req != base + "/" and not req.startswith(base + "/"):
+            return False
+    return True
+
+
+# 兼容旧名：项目内已有调用点与测试用 _same_host，语义即 in_scope。
+def _same_host(url_a: str, url_b: str) -> bool:
+    """统一的范围校验（P0-① 升级：scheme+host+port+路径前缀，详见 in_scope）。"""
+    return in_scope(url_a, url_b) or in_scope(url_b, url_a)
 
 
 @dataclass(slots=True)
@@ -284,12 +318,15 @@ class GuardContext:
     identity_bound: bool = False    # 账号身份是否已绑定（有凭证/已声明身份）
     identity: str = ""              # 账号身份上下文（审计与台账用，P1-7）
     target_bound: bool = False      # 兼容字段：仅表示"会话已有目标"
-    bound_target: str = ""          # **绑定的目标 URL**（P0-3：URL 必须同源才算绑定）
-    approved_commands: set[str] = field(default_factory=set)  # 显式审批过的命令
+    bound_target: str = ""          # **绑定的目标 URL**（P0-①：in_scope 全量校验）
 
 
 class RequestGuard:
     """请求前的权限检查入口。所有目标面请求都应过这一道。"""
+
+    # 统一范围校验挂成方法：runner 的所有分支（含 exploit_probe）都调
+    # ``guard.in_scope(url, bound)``——全工程同一把尺子，不许自带简化版。
+    in_scope = staticmethod(in_scope)
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
@@ -302,13 +339,12 @@ class RequestGuard:
         )
         # host 通配 → 环境的绑定表（目标维度的落地）
         self.environments: dict[str, str] = dict(getattr(p, "environments", None) or {})
-        # 显式审批表：只认配置里明确写的 true。**且只对 L2「删除测试数据」
-        # 生效**——L3 在决策引擎里已无任何审批出路（P0 整改），审批表里
-        # 混进 L3 命令名也不会被读取。
-        approvals = getattr(p, "approvals", None) or {}
-        self.approved: set[str] = {
-            cmd for cmd, v in approvals.items() if v is True
-        } & _APPROVABLE_COMMANDS
+        # P0-② 整改：**配置级命令审批放行已整体移除**。原 config
+        # ``policy.approvals`` 是命令级的静态白名单——命令写对了一次，
+        # 之后所有对象、所有参数的同类操作全部复用放行，审批根本没绑定
+        # 到具体请求上。现在审批**只存在于运行期**：逐请求、绑定对象
+        # URL、参数变化即重新审批（core/tools/runner 的 approver 通道）。
+        # 守卫层对 decide() 恒传 approved=False。
 
     # ── 目标 → 环境 ──────────────────────────────────────────────
     def environment_for(self, url: str) -> str:
@@ -357,18 +393,16 @@ class RequestGuard:
                 signals=cls.signals,
                 reason="接口未识别出已知命令，默认拒绝执行",
             )
-        # P0-3：目标范围严格比对——请求 URL 必须与绑定目标**同主机**，
-        # 只知道"会话有目标"不算绑定。跨主机请求视为未绑定 → 拒绝。
-        target_bound = bool(ctx.bound_target) and _same_host(url, ctx.bound_target)
-        approved = (
-            cls.command in self.approved or cls.command in ctx.approved_commands
-        ) and cls.command in _APPROVABLE_COMMANDS
+        # P0-①：目标范围校验走**统一入口** in_scope（scheme+host+port+路径前缀）。
+        # 只知道"会话有目标"不算绑定，范围外请求视为未绑定 → 拒绝。
+        target_bound = bool(ctx.bound_target) and in_scope(url, ctx.bound_target)
+        # P0-②：审批不在配置层——恒传 False，逐请求审批在运行期通道。
         d = decide(
             cls.command,
             environment=ctx.environment or self.environment_for(url),
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
-            approved=approved,
+            approved=False,
         )
         d.category = cls.category
         d.signals = cls.signals
@@ -389,21 +423,18 @@ class RequestGuard:
         # 工具未显式给目标时默认作用于绑定目标本身（与 runner 的回退一致）
         if not url and ctx.bound_target:
             url = ctx.bound_target
-        # P0-3：与 check_request 同一范围比对口径。显式给了不同目标的工具
-        # 调用按出界处理；未给目标且会话已绑定 → 视为在范围内。
+        # P0-①：与 check_request 同一统一入口（scheme+host+port+路径前缀）。
+        # 显式给了不同目标的工具调用按出界处理；未给目标且会话已绑定 → 视为在范围内。
         target_bound = bool(ctx.bound_target) and (
             not str(args.get("target") or args.get("url") or "")
-            or _same_host(url, ctx.bound_target)
+            or in_scope(url, ctx.bound_target)
         )
-        approved = (
-            command in self.approved or command in ctx.approved_commands
-        ) and command in _APPROVABLE_COMMANDS
         d = decide(
             command,
             environment=ctx.environment or self.environment_for(url),
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
-            approved=approved,
+            approved=False,  # P0-②：审批只在运行期逐请求发生
         )
         d.category = ApiCategory.EXECUTE
         return d

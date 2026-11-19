@@ -150,9 +150,9 @@ RULES: list[PolicyRule] = [
     PolicyRule(
         command="上传测试文件",
         level=PermissionLevel.L2,
-        allow_when="需要专门测试环境",
+        allow_when="需要专门测试环境，且逐请求审批",
         default_status="非专门测试环境默认拒绝",
-        deny_when="目标环境不是专门测试环境（含隔离测试环境不满足时的情形）",
+        deny_when="目标环境不是专门测试环境（隔离测试环境亦不满足），或未获逐请求审批",
     ),
     PolicyRule(
         command="删除测试数据",
@@ -323,16 +323,22 @@ def decide(
         return base
 
     if rule.command == "上传测试文件":
-        # 需要专门测试环境：dedicated_test 直接满足；isolated_test
-        # 属于"更严的测试环境"，视为满足（不算扩大——两者都不是生产）
-        if environment in Environment.TEST_ENVS:
-            base.decision = Decision.ALLOW
-            base.reason = f"{rule.command}（L2）目标为专门测试环境（{environment}）"
-        else:
+        # 需要专门测试环境（P1-③：**仅 dedicated_test**——隔离测试环境
+        # 不满足"专门"条件，不得因 TEST_ENVS 包含 isolated_test 而放行）。
+        # 且上传必须**逐请求审批**：dedicated_test 也先给 REVIEW，交
+        # 运行期审批通道（绑 URL 的逐请求审批），审批通过才放行。
+        if environment != Environment.DEDICATED_TEST:
             base.reason = (
                 f"{rule.command}（L2）目标环境为 {environment or '未知'}，"
-                "不是专门测试环境，拒绝执行"
+                "上传仅允许专门测试环境（dedicated_test），拒绝执行"
             )
+            return base
+        if not approved:
+            base.decision = Decision.REVIEW
+            base.reason = f"{rule.command}（L2）目标为专门测试环境，但上传需逐请求审批"
+            return base
+        base.decision = Decision.ALLOW
+        base.reason = f"{rule.command}（L2）专门测试环境 + 逐请求审批已通过"
         return base
 
     # L1：仅隔离测试环境

@@ -157,6 +157,10 @@ class _ToolRunnerBase:
             getattr(cfg, "data_dir", "./data"),
             enabled=bool(getattr(getattr(cfg, "policy", None), "audit", True)),
         )
+        # 待登记台账条目（P0-②）：闸门放行 ≠ 对象存在。放行的写操作先
+        # 挂到 pending，handler **执行成功**且能从响应取得对象标识后才
+        # 真正进台账——"创建成功并取得对象标识后登记"。
+        self._pending_ledger: dict[str, Any] | None = None
         # 账号身份上下文（P1-7）：set_target 初始化为匿名，请求带凭证头时
         # 升级为实名（_observe_identity）。绝不固定为 True——它是决策的
         # 真实入参，也进审计与台账。
@@ -349,6 +353,13 @@ class _ToolRunnerBase:
                 if text.startswith(marker):
                     status = st
                     break
+        # P0-②：台账登记只发生在**执行成功**之后。取走 pending（无论
+        # 成败都清掉，防止陈旧条目泄漏进下一次调用），成功且能取得
+        # 对象标识才真正落台账。
+        pend = self._pending_ledger
+        self._pending_ledger = None
+        if pend and status == "ok":
+            self._commit_pending_ledger(pend, text)
         if len(text) > MAX_TOOL_OUTPUT:
             if name == "external_tool":
                 # 外部工具的输出长度不可控（curl 拉一个 100KB 的库文件很正常），
@@ -535,7 +546,7 @@ class _ToolRunnerBase:
                 body = str(args.get("body") or "")
                 self._observe_identity(dict(args.get("headers") or {}) if isinstance(
                     args.get("headers"), dict
-                ) else {}, url, body)
+                ) else {}, url, body, session=session)
                 d = guard.check_request(
                     url, method=method, body=body,
                     params=args.get("params") if isinstance(args.get("params"), dict) else None,
@@ -544,18 +555,25 @@ class _ToolRunnerBase:
                     ctx=self._policy_ctx(session, url),
                 )
                 if d.allowed:
-                    # P0-5：删除操作在**真实请求发出之前**过对象台账。
-                    # 台账判不过 → 拒绝，绝不放行到 handler。
-                    ledger_deny = self._ledger_check(session, d, url)
+                    # P1-⑤：写操作的放行以审计可持久化为先决条件
+                    audit_block = self._audit_gate_for(d, session, url)
+                    if audit_block is not None:
+                        return audit_block
+                    ledger_deny = await self._ledger_check(session, d, url)
                     if ledger_deny is not None:
                         return ledger_deny
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
-                    # P0-1：L3 在决策引擎已无 REVIEW 出路；能到这里的
-                    # REVIEW 只有 L2 删除——走运行期审批通道。
+                    # P1-⑤：审批事件本身必须能持久化——审计不可持久化时
+                    # 审批通道整体关闭，拒绝执行（不用内存记录替代）。
+                    if not self.policy_audit.writable:
+                        return self._audit_deny_text(d, session, url)
+                    # P0-②：审批走运行期逐请求通道（绑定本次 URL）。
                     if await self._policy_review(d, session, url):
-                        ledger_deny = self._ledger_check(session, d, url)
+                        # 审批通过 = 本次请求的单独审批已绑定；台账未知对象
+                        # 因此放行。参数变化 → URL 变化 → 决策重来 → 重新审批。
+                        ledger_deny = await self._ledger_check(session, d, url, approved=True)
                         if ledger_deny is not None:
                             return ledger_deny
                         self._policy_allow(session, d, url=url)
@@ -588,12 +606,16 @@ class _ToolRunnerBase:
                     PermissionLevel.rank(rule_for_command(c).level) if rule_for_command(c) else -1
                 ))
                 _rule = rule_for_command(worst)
+                # P0-①：**不得自行构造简化决策上下文**——与 http_request /
+                # external_tool 同一份 _policy_ctx，目标范围校验走 guard 的
+                # 统一入口 in_scope（scheme+host+port+路径前缀）。
+                ctx = self._policy_ctx(session, url)
                 d = _decide(
                     worst,
-                    environment=self.policy_guard.environment_for(url),
-                    identity_bound=bool(self._current_identity(session)),
-                    target_bound=bool(getattr(session, "target", "")),
-                    approved=False,  # P0-1：L3 无审批出路，L2 删除不走探针
+                    environment=ctx.environment,
+                    identity_bound=ctx.identity_bound,
+                    target_bound=guard.in_scope(url, ctx.bound_target),
+                    approved=False,  # L3 无审批出路；上传的逐请求审批在 REVIEW 通道
                 )
                 d.category = {
                     "命令执行": "EXECUTE", "SQL 注入验证": "EXECUTE",
@@ -601,10 +623,18 @@ class _ToolRunnerBase:
                 }.get(worst, "READ")
                 d.signals = [f"探针类别：{kinds}（最高风险 → {worst}，{_rule.level if _rule else '?'}）"]
                 if d.allowed:
+                    audit_block = self._audit_gate_for(d, session, url)
+                    if audit_block is not None:
+                        return audit_block
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
+                    if not self.policy_audit.writable:
+                        return self._audit_deny_text(d, session, url)
                     if await self._policy_review(d, session, url):
+                        audit_block = self._audit_gate_for(d, session, url)
+                        if audit_block is not None:
+                            return audit_block
                         self._policy_allow(session, d, url=url)
                         return None
                 return self._policy_deny(session, d, url)
@@ -614,10 +644,18 @@ class _ToolRunnerBase:
                 url = str(args.get("target") or args.get("url") or session.target or "")
                 d = guard.check_tool(tool, dict(args), ctx=self._policy_ctx(session, url))
                 if d.allowed:
+                    audit_block = self._audit_gate_for(d, session, url)
+                    if audit_block is not None:
+                        return audit_block
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
+                    if not self.policy_audit.writable:
+                        return self._audit_deny_text(d, session, url)
                     if await self._policy_review(d, session, url):
+                        audit_block = self._audit_gate_for(d, session, url)
+                        if audit_block is not None:
+                            return audit_block
                         self._policy_allow(session, d, url=url)
                         return None
                 return self._policy_deny(session, d, url)
@@ -643,16 +681,34 @@ class _ToolRunnerBase:
         "fileupload": "上传测试文件",    # L2
     }
 
-    def _observe_identity(self, headers: dict, url: str, body: str = "") -> None:
-        """从真实请求里观察账号身份（P1-7：身份绑定是真实上下文，不固定 True）。
+    def _observe_identity(self, headers: dict, url: str, body: str = "", session=None) -> None:
+        """从真实请求观察账号身份（P1-④：**真实账号绑定**，非凭证类型标记）。
 
-        * 请求头带 Authorization / Cookie / X-API-Key / X-Auth-Token →
-          实名身份（只记头名不记值，凭证不进日志）；
-        * 其余情况维持 set_target 时的匿名身份。
+        旧实现的 ``cred:authorization`` 只记了"用了哪类凭证"，同一头名下
+        的管理员 token 和普通用户 token 身份完全混同。整改后：
+
+        * 凭证值指纹：``cred:<头名>:<sha256 前 10 位>`` —— 不同 token /
+          会话 = 不同身份，可区分同一头名下的多个账号；
+        * 角色以**显式声明**为准（不猜）：``session.credentials["role"]``
+          （登录流程或用户配置写入，如 admin / user）→ ``@<角色>`` 后缀；
+          其次认目标自定义角色头（X-User-Role / X-Role / X-Admin）的值；
+        * 无凭证 → ``anonymous@<host>``（由 _current_identity 现算）。
+        凭证值本身永不进身份标签（只进指纹）。
         """
-        for h in headers or {}:
+        for h, v in (headers or {}).items():
             if str(h).lower() in ("authorization", "cookie", "x-api-key", "x-auth-token", "x-token"):
-                self._identity = f"cred:{str(h).lower()}"
+                fp = hashlib.sha256(str(v or "").encode("utf-8")).hexdigest()[:10]
+                ident = f"cred:{str(h).lower()}:{fp}"
+                role = ""
+                if session is not None:
+                    role = str((getattr(session, "credentials", None) or {}).get("role") or "")
+                if not role:
+                    for rh in ("x-user-role", "x-role", "x-admin"):
+                        rv = (headers or {}).get(rh)
+                        if rv:
+                            role = str(rv)[:32]
+                            break
+                self._identity = f"{ident}@{role}" if role else ident
                 return
 
     def _history_hint(self, url: str) -> str:
@@ -673,12 +729,18 @@ class _ToolRunnerBase:
                 hits.append(o.action)
         return ",".join(sorted(set(hits)))
 
-    def _ledger_check(self, session, d, url: str) -> str | None:
+    async def _ledger_check(
+        self, session, d, url: str, *, approved: bool = False,
+    ) -> str | None:
         """删除类操作的真实请求前置台账检查（P0-5）。
 
         返回拒绝文本（含【已拦截】前缀）或 None 放行。检查发生在
         gate 内、handler 执行之前——台账判不过的删除请求**根本不会
         被发出去**。
+
+        ``approved`` 只能来自**绑定本次请求**的运行期审批（P0-②）：
+        配置级审批已移除，参数变化 → URL 变化 → 决策重来 → 审批重来，
+        不存在"命令审批一次、所有对象复用"的放行。
         """
         if d.command != "删除测试数据":
             return None
@@ -687,8 +749,9 @@ class _ToolRunnerBase:
             url,
             run_id=rid,
             target_id=tid,
+            identity=self._current_identity(session),
             environment=self.policy_guard.environment_for(url),
-            approved="删除测试数据" in self.policy_guard.approved,
+            approved=approved,
         )
         if ok:
             return None
@@ -700,11 +763,79 @@ class _ToolRunnerBase:
         lines = [
             "【已拦截】（策略）删除操作未通过测试对象台账检查，请求未发出。",
             f"  理由：{reason}",
-            "  删除范围只能覆盖本次测试生命周期内建立/修改过的对象；",
-            "  删除预置测试数据需在 config.yaml 的 policy.approvals 显式声明"
-            "（且仅测试环境生效）。",
+            "  台账按目标 + 轮次 + 账号身份 + 对象标识四元组匹配：",
+            "  只放行本次测试**执行成功并取得对象标识**后登记的对象；",
+            "  删除预置测试数据需对**本次请求**逐次审批（运行期审批通道，",
+            "  参数变化后不会复用）。",
         ]
         return "\n".join(lines)
+
+    def _audit_gate_for(self, d, session, url: str) -> str | None:
+        """审计持久化前置（P1-⑤）。返回拒绝文本或 None。
+
+        * 写操作（创建/修改/上传/删除）→ 审计不可持久化 = 拒绝执行：
+          不能用内存记录替代持久化审计（内存随进程死，复盘无从谈起）；
+        * 只读操作 → 放行但必须告警（warn 事件 + 状态行可见）。
+        ``audit.enabled=false`` 同样视为不可持久化——要执行写操作，
+        持久化审计必须在工作。
+        """
+        if self.policy_audit.writable:
+            return None
+        tid, rid = self._policy_scope(session)
+        if self._LEDGER_ACTIONS.get(d.command):
+            self.policy_audit.warn(
+                "审计不可持久化，写操作拒绝执行（P1-⑤）",
+                command=d.command, url=url, target_id=tid, run_id=rid,
+            )
+            return (
+                "【已拦截】（策略）审计日志当前无法持久化（磁盘不可写或 audit 已关闭），"
+                f"写操作「{d.command}」按 P1-⑤ 拒绝执行。\n"
+                "  审计是写操作的先决条件，不是旁路——不能用内存记录替代持久化审计。\n"
+                "  修复 data 目录可写性（或恢复 policy.audit: true）后重试。"
+            )
+        # 只读：放行 + 告警
+        self.policy_audit.warn(
+            "审计不可持久化，只读操作放行（告警不拦截）",
+            command=d.command, url=url, target_id=tid, run_id=rid,
+        )
+        return None
+
+    def _audit_deny_text(self, d, session, url: str) -> str:
+        """审批前置失败（审计不可持久化）的拒绝文本。审批必须留痕。"""
+        tid, rid = self._policy_scope(session)
+        self.policy_audit.warn(
+            "审计不可持久化，审批通道关闭，拒绝执行（P1-⑤）",
+            command=d.command, url=url, target_id=tid, run_id=rid,
+        )
+        return (
+            "【已拦截】（策略）审批事件无法持久化审计，按 P1-⑤ 拒绝执行"
+            f"（{d.command or '未知操作'}）。\n"
+            "  未留痕的审批等于没审批——先恢复审计落盘（data 目录可写、"
+            "policy.audit: true）再发起需要审批的操作。"
+        )
+
+    def _commit_pending_ledger(self, pend: dict[str, Any], response_text: str) -> None:
+        """执行成功后把 pending 台账条目真正落账（P0-②）。
+
+        对象标识提取：创建/上传打在集合端点（URL 尾段是集合名）→
+        响应优先；修改/资源型端点 → URL 尾段优先。
+        **创建/上传取不到标识就不登记**——之后删除按未知对象走
+        逐请求审批，宁可误拦不盲放。
+        """
+        from policy.test_transaction import extract_object_id
+
+        # 取走 pending（幂等：无论登记与否都消费掉，防陈旧条目泄漏）
+        self._pending_ledger = None
+        action = pend.get("action") or ""
+        url = pend.get("url") or ""
+        obj_id = extract_object_id(url, response_text, url_first=action == "update")
+        self.test_ledger.record(
+            url, action,
+            run_id=pend.get("run_id") or "",
+            target_id=pend.get("target_id") or "",
+            identity=pend.get("identity") or "",
+            object_id=obj_id,
+        )
 
     async def _policy_review(self, d, session, url: str) -> bool:
         """REVIEW 决策的运行期审批：有审核通道就问人，没有就拒绝。"""
@@ -731,7 +862,12 @@ class _ToolRunnerBase:
         return ok
 
     def _policy_allow(self, session, d, url: str = "") -> None:
-        """放行留痕 + 写操作进测试对象台账（生命周期约束的数据来源）。"""
+        """放行留痕 + 写操作挂 pending 台账（P0-②：**放行 ≠ 登记**）。
+
+        台账登记延迟到 handler 执行成功之后（execute →
+        _commit_pending_ledger）：闸门放行的创建可能执行失败，"执行
+        成功并取得对象标识"才登记。删除不登记（删除不产生对象）。
+        """
         tid, rid = self._policy_scope(session)
         self.policy_audit.log(
             "allow", command=d.command, level=d.level, decision=d.decision,
@@ -739,12 +875,16 @@ class _ToolRunnerBase:
             reason=d.reason, extra={"signals": list(d.signals)[:6]} if d.signals else None,
         )
         action = self._LEDGER_ACTIONS.get(d.command)
-        if action and url:
-            # 台账统一隔离口径（P1-8）：target_id / run_id / identity 一起落，
-            # 判"对象已知"时三个维度都要对得上。
-            self.test_ledger.record(
-                url, action, run_id=rid, target_id=tid, identity=self._current_identity(session),
-            )
+        if action and url and action != "delete":
+            # 台账统一隔离口径（P1-8）：target_id / run_id / identity 一起挂，
+            # 执行成功后落账时三个维度都要对得上才认"已知"。
+            self._pending_ledger = {
+                "url": url,
+                "action": action,
+                "run_id": rid,
+                "target_id": tid,
+                "identity": self._current_identity(session),
+            }
 
     def _policy_deny(self, session, d, url: str = "") -> str:
         """DENY/UNKNOWN 决策的留痕 + 拒绝文本。拒绝也必须能对账。"""
@@ -783,9 +923,10 @@ class _ToolRunnerBase:
             # 目标没变就不开——重复 set_target 不该把正在跑的一轮扫描腰斩。
             session.result.target_id = session.target
             session.result.new_run(f"目标 {session.target}")
-            # 身份随目标走（P1-7）：新目标从匿名开始，凭证由该目标的请求
-            # 重新声明，避免把上一个目标的会话凭证算到新目标头上。
-            self._identity = "anonymous"
+            # 身份随目标走（P1-④）：新目标回到匿名（由 _current_identity
+            # 现算 anonymous@<host>），凭证由该目标的请求重新声明，避免把
+            # 上一个目标的会话凭证算到新目标头上。
+            self._identity = ""
         return f"目标已设定：{session.target}"
 
     async def _h_session_state(self, session, **_: Any) -> str:

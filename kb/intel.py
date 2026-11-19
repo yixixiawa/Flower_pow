@@ -112,9 +112,15 @@ class CveIntel:
 class IntelStore:
     """pocindex 情报的本地缓存。"""
 
-    def __init__(self, cache_dir: str | Path = "./data/intel", timeout: float = 20.0) -> None:
+    def __init__(
+        self, cache_dir: str | Path = "./data/intel", timeout: float = 20.0,
+        cfg=None,
+    ) -> None:
         self.cache_dir = Path(cache_dir)
         self.timeout = timeout
+        # P1-⑥：持有 cfg 以便 HTTP 出口走 core/proxy.build_client_kwargs
+        # （统一代理出口）。None 时退回本地默认（离线/无配置场景）。
+        self.cfg = cfg
         self._cves: dict[str, CveIntel] = {}
         self._loaded = False
         self.errors: list[str] = []
@@ -337,7 +343,16 @@ class IntelStore:
 
         url = ENDPOINTS[name]
         try:
-            with httpx.Client(timeout=self.timeout, follow_redirects=True) as c:
+            # P1-⑥：全工程唯一 HTTP 出口——代理决策收敛到 core/proxy.py
+            # （这里查的是 CVE 情报端点，不是被测目标，但出口纪律一致：
+            # 任何裸 httpx.Client 都是无审计的独立出口）。
+            if self.cfg is not None:
+                from core.proxy import build_client_kwargs
+
+                client_kw = build_client_kwargs(self.cfg, url)
+            else:
+                client_kw = {"timeout": self.timeout, "follow_redirects": True}
+            with httpx.Client(**client_kw) as c:
                 resp = c.get(url)
                 resp.raise_for_status()
                 data = resp.json()
@@ -416,8 +431,15 @@ class IntelStore:
 _default: IntelStore | None = None
 
 
-def get_intel(cache_dir: str | Path = "./data/intel") -> IntelStore:
+def get_intel(
+    cache_dir: str | Path = "./data/intel", cfg=None,
+) -> IntelStore:
+    """取情报存储单例。``cfg`` 用于统一 HTTP 出口代理（P1-⑥）——
+    None 时退回直连兜底（离线场景），拿到配置后仍是裸出口就属违规。"""
     global _default
-    if _default is None:
-        _default = IntelStore(cache_dir)
+    if _default is None or (cfg is not None and _default.cfg is None):
+        if _default is None:
+            _default = IntelStore(cache_dir, cfg=cfg)
+        else:
+            _default.cfg = cfg
     return _default

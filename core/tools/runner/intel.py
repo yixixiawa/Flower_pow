@@ -64,7 +64,7 @@ class IntelMixin:
         if not cve:
             return "缺少 cve 参数"
         try:
-            store = get_intel(str(Path(self.cfg.data_dir) / "intel"))
+            store = get_intel(str(Path(self.cfg.data_dir) / "intel"), cfg=self.cfg)
             info = store.lookup(cve.upper())
         except Exception as exc:  # noqa: BLE001
             return f"情报查询失败（可能无网络）：{type(exc).__name__}: {exc}"

@@ -193,9 +193,9 @@ class PolicyConfig(BaseModel):
     default_environment: str = Field(default="unknown")
     # host 通配 → 环境，如 {"192.168.*": "isolated_test", "10.0.2.*": "dedicated_test"}
     environments: dict[str, str] = Field(default_factory=dict)
-    # 单独审批表：**只对 L2「删除测试数据」生效**（矩阵明文"需要单独审批"）。
-    # L3 命令（批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行）写进这里
-    # 不会有任何效果——P0 整改后 L3 一律拒绝，审批不设出路。
+    # 【已废弃，P0-② 整改】配置级命令审批已整体移除——guard 不读本字段，
+    # 字段仅为兼容旧配置文件保留。审批只存在于运行期：逐请求、绑定具体
+    # 对象 URL、参数变化即重新审批（runner 的 approver 通道）。
     approvals: dict[str, bool] = Field(default_factory=dict)
     # 审计日志开关（policy/audit_logger）
     audit: bool = Field(default=True)
