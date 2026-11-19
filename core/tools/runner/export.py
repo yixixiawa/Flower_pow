@@ -50,6 +50,12 @@ class ExportMixin:
         s.result.notes.insert(0, f"\x00report:交互式会话 {s.session_id}，共 {len(s.turns)} 轮")
         if s.model.resources:
             s.result.notes.insert(1, f"\x00report:业务模型：{s.model.summary()}")
+        # **导出前复核**：手工登记的发现按七字段契约再查一遍。放在这里而不是
+        # 只放在 writer 里，是为了把"拦了几条"回显给 Agent——它需要知道有
+        # 东西没进报告，否则会以为报告已经完整。
+        from core.validation import audit_for_report
+
+        audit = audit_for_report(s.result, base_url=s.target or "")
         outdir = Path(self.cfg.output_dir)
         outdir.mkdir(parents=True, exist_ok=True)
         # **一次性**决定这次要写的所有路径：overwrite=False 时如果让三个
@@ -81,6 +87,7 @@ class ExportMixin:
             "共用同一个文件名主干，反复导出不会堆出 _2/_3 副本。"
             f"{'' if overwrite else '（本次 overwrite=false，同名时会另存新文件）'}"
         )
+        lines.append("  " + audit.line().replace("\n", "\n  "))
         if overwritten and overwrite:
             # 这条必须说出来：导报告是**整篇重新生成**，之前用 edit_file
             # 打的补丁会被这次的内容盖掉。不说的话，模型会以为"改完再导一次"

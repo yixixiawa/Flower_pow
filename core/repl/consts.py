@@ -14,7 +14,7 @@ from core.session import (
 
 
 COMMANDS = [
-    "/help", "/status", "/assets", "/findings", "/model",
+    "/help", "/status", "/assets", "/findings", "/clues", "/model",
     "/title", "/chats", "/reset", "/report", "/sessions", "/resume",
     "/backfill", "/clean", "/agent", "/target", "/tools", "/key", "/turns",
     "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/readonly", "/quit",
@@ -44,6 +44,7 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
   /status       当前状态概览
   /assets [类型] 资产清单（port|path|api|endpoint|secret|internal|js）
   /findings     发现列表（按严重度，带编号）
+  /clues        待验证线索（被质量闸门拦下的提交，不计入漏洞数）
   /model        查看当前业务模型
   /chats        对话索引：每轮对话的标题与用到的工具
   /title <编号> <标题>    手工改某轮对话的标题

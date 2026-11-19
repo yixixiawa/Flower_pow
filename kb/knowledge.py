@@ -42,8 +42,12 @@ KNOWLEDGE_VERSION = 1
 
 # 只有这些等级值得沉淀。INFO 是「观察」不是「漏洞」，沉淀它只会稀释召回。
 DEFAULT_MIN_SEVERITY = Severity.MEDIUM
-# 默认要求 LLM 研判确认过（confidence >= 0.6），否则标记为待人工复核
+# 默认要求 LLM 研判确认过（confidence >= 0.6）——**仅当没有证据分时**才用这条。
+# 有证据分时以证据分为准：模型置信度不是漏洞概率，拿它当入库门槛会误伤
+# 「未配置 LLM 但证据很硬」的发现（confidence=0 一律被挡）。
 DEFAULT_MIN_CONFIDENCE = 0.6
+# 证据分门槛（与 quality.CONFIRM_SCORE 对齐）：低于它的不沉淀
+DEFAULT_MIN_EVIDENCE = 0.7
 # 单库容量上限：超了按时间淘汰最旧的（避免无限膨胀）
 DEFAULT_MAX_ENTRIES = 2000
 
@@ -65,6 +69,7 @@ def finding_to_record(
     *,
     min_severity: Severity = DEFAULT_MIN_SEVERITY,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_evidence_score: float = DEFAULT_MIN_EVIDENCE,
     require_triage: bool = False,
 ) -> dict[str, Any] | None:
     """把一条发现转成知识记录；不合格返回 ``None``。
@@ -74,17 +79,21 @@ def finding_to_record(
     * ``verdict`` 不是 ``false_positive``
     * 等级不低于 ``min_severity``
     * 有证据（``matched_at`` 非空）——没有位置的「知识」检索时毫无用处
+    * **证据分达标**（``evidence_score >= min_evidence_score``）
 
-    ``require_triage=True`` 时额外要求 ``confidence >= min_confidence``
-    （**不做 falsy 豁免**）。用于「本次没跑研判」的场景：此时所有
-    ``confidence`` 都是 0，若按默认规则会被``if f.confidence and ...`` 的
-    falsy 判断整体放过，等于把未过滤的原始命中全灌进知识库。
+    为什么门槛从「模型置信度」换成「证据分」：``confidence`` 是模型对自己
+    判断的信心，不是漏洞概率；用它当入库门槛会出现两种荒谬结果——证据很硬
+    但未配置 LLM 的发现（confidence=0）全被挡在门外，而模型随口 0.9 的
+    误报却被吸进召回。有证据分时一律以证据分为准。
+
+    ``require_triage=True`` 只对**没有证据分**的旧数据生效（退回按
+    ``confidence >= min_confidence`` 严格判断，不做 falsy 豁免）。
     """
     sev = f.severity if isinstance(f.severity, Severity) else Severity.parse(str(f.severity))
     if sev.rank < min_severity.rank:
         return None
     # 人工排除为误报的一律不沉淀。**必须显式判 dismissed**：人工排除刻意
-    # 不改 verdict/confirmed（那两个是探针与 LLM 的客观结论，改了撤销就有损），
+    # 不改 verdict（那是探针与 LLM 的客观结论，改了撤销就有损），
     # 所以只靠下面两条是拦不住人工排除项的。
     if getattr(f, "dismissed", False):
         return None
@@ -94,8 +103,12 @@ def finding_to_record(
         return None
     if not (f.matched_at or "").strip():
         return None
-    if require_triage:
-        # 严格：0 也算不达标
+    score = float(getattr(f, "evidence_score", 0.0) or 0.0)
+    if score > 0:
+        if score < min_evidence_score:
+            return None
+    elif require_triage:
+        # 旧数据回退路径：严格，0 也算不达标
         if f.confidence < min_confidence:
             return None
     elif f.confidence and f.confidence < min_confidence:
@@ -159,7 +172,8 @@ class IngestReport:
     rejected_false_positive: int = 0
     rejected_dismissed: int = 0   # 人工排除为误报（与 LLM 判误报分开统计）
     rejected_no_evidence: int = 0
-    rejected_low_confidence: int = 0
+    rejected_low_confidence: int = 0  # 仅用于没有证据分的旧数据
+    rejected_low_evidence: int = 0    # 证据分不达标
     updated: int = 0# 已存在→更新的条数
     evicted: int = 0          # 因超容量被淘汰的条数
 
@@ -173,6 +187,7 @@ class IngestReport:
             ("误报", self.rejected_false_positive),
             ("人工排除", self.rejected_dismissed),
             ("无证据", self.rejected_no_evidence),
+            ("证据不足", self.rejected_low_evidence),
             ("置信度低", self.rejected_low_confidence),
         ]
         detail = "、".join(f"{k} {v}" for k, v in bits if v)
@@ -254,13 +269,14 @@ class KnowledgeStore:
         *,
         min_severity: Severity = DEFAULT_MIN_SEVERITY,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+        min_evidence_score: float = DEFAULT_MIN_EVIDENCE,
         boost_terms: int = 3,
         require_triage: bool = False,
     ) -> IngestReport:
         """把一批发现沉淀进库。返回统计报告。
 
-        ``require_triage=True`` 用于未跑研判的场景（见
-        :func:`finding_to_record` 同名参数的说明）。
+        门槛按**证据分**判（有证据分时），没有证据分才退回模型置信度
+        （见 :func:`finding_to_record`）。``require_triage`` 只对后者生效。
         """
         if not self._loaded:
             self._load()
@@ -288,7 +304,12 @@ class KnowledgeStore:
             if not (f.matched_at or "").strip():
                 rep.rejected_no_evidence += 1
                 continue
-            if require_triage:
+            score = float(getattr(f, "evidence_score", 0.0) or 0.0)
+            if score > 0:
+                if score < min_evidence_score:
+                    rep.rejected_low_evidence += 1
+                    continue
+            elif require_triage:
                 if f.confidence < min_confidence:
                     rep.rejected_low_confidence += 1
                     continue
@@ -300,6 +321,7 @@ class KnowledgeStore:
                 f, target,
                 min_severity=min_severity,
                 min_confidence=min_confidence,
+                min_evidence_score=min_evidence_score,
                 require_triage=require_triage,
             )
             if rec is None:
@@ -391,6 +413,7 @@ __all__ = [
     "finding_to_record",
     "KNOWLEDGE_VERSION",
     "DEFAULT_MIN_SEVERITY",
+    "DEFAULT_MIN_EVIDENCE",
     "DEFAULT_MIN_CONFIDENCE",
     "DEFAULT_MAX_ENTRIES",
 ]

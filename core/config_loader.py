@@ -176,6 +176,30 @@ class IntelConfig(BaseModel):
     publish_dir: str = Field(default="./poc/community")
 
 
+class PolicyConfig(BaseModel):
+    """接口测试生命周期权限控制（policy/）配置。
+
+    环境判定的原则是**判不出就是 unknown，不猜**：unknown 在决策里
+    等价于拒绝（L1/L2 条件不满足），安全方向不会错。所以默认没有
+    任何环境绑定——要让 L1/L2 通过，必须在 ``environments`` 里显式
+    把目标 host 绑到隔离/专门测试环境。
+    """
+
+    # 权限控制总开关。关掉 = 回到"只有 readonly 一道闸"的旧行为
+    enabled: bool = Field(default=True)
+    # 未命中 host 绑定表时的默认环境：unknown / production /
+    # dedicated_test / isolated_test。默认 unknown（保守方向）
+    default_environment: str = Field(default="unknown")
+    # host 通配 → 环境，如 {"192.168.*": "isolated_test", "10.0.2.*": "dedicated_test"}
+    environments: dict[str, str] = Field(default_factory=dict)
+    # 显式审批表：{"删除测试数据": true}。L3 命令只有出现在这里
+    # （且目标为测试环境 + readonly off）才有一条明示的出路；
+    # 生产环境的危险操作不因审批解锁（Hybrid 规则）
+    approvals: dict[str, bool] = Field(default_factory=dict)
+    # 审计日志开关（policy/audit_logger）
+    audit: bool = Field(default=True)
+
+
 class LLMConfig(BaseModel):
     """大模型接入配置（OpenAI 兼容协议）。
 
@@ -209,6 +233,7 @@ class Config(BaseModel):
     rag: RAGConfig = Field(default_factory=RAGConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     intel: IntelConfig = Field(default_factory=IntelConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
     output_dir: str = Field(default="./output")
     data_dir: str = Field(default="./data")
 
@@ -405,6 +430,7 @@ def load_config(path: str | Path | None = None) -> Config:
         # 兼容旧配置里的 `ai:` 段
         _apply_section(cfg.llm, raw.get("llm") or raw.get("ai") or {})
         _apply_section(cfg.intel, raw.get("intel") or {})
+        _apply_section(cfg.policy, raw.get("policy") or {})
         for k in ("output_dir", "data_dir"):
             if raw.get(k) is not None:
                 setattr(cfg, k, raw[k])
@@ -440,6 +466,11 @@ def load_config(path: str | Path | None = None) -> Config:
     s.second_pass_retest = _env_bool("POCS_SECOND_PASS_RETEST", s.second_pass_retest)
     s.verify_tls = _env_bool("POCS_VERIFY_TLS", s.verify_tls)
     s.readonly = _env_bool("POCS_READONLY", s.readonly)
+
+    p = cfg.policy
+    p.enabled = _env_bool("POCS_POLICY_ENABLED", p.enabled)
+    p.default_environment = _env_str("POCS_POLICY_ENV", p.default_environment)
+    p.audit = _env_bool("POCS_POLICY_AUDIT", p.audit)
 
     r = cfg.rag
     r.enabled = _env_bool("POCS_RAG_ENABLED", r.enabled)

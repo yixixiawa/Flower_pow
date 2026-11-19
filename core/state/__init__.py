@@ -39,7 +39,9 @@ from core.state.models import (
     Evidence,
     Finding,
     Fingerprint,
+    PendingClue,
     ScanResult,
+    ScanRun,
     dismiss_finding,
     restore_finding,
 )
@@ -52,7 +54,8 @@ __all__ = [
     "EvidenceQuality", "decide_status",
     "MatchTarget", "MatchOp", "MatchRule", "RequestSpec", "POC",
    "Evidence", "Fingerprint", "Asset", "AttackStep", "AttackChain", "Finding",
+    "PendingClue",
     "dismiss_finding", "restore_finding",
-    "ScanResult",
+    "ScanResult", "ScanRun",
     "re_search", "safe_name", "dataclass_to_dict",
 ]

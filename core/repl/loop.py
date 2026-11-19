@@ -235,6 +235,10 @@ class _LoopMixin(_Base):
         if low in ("/findings", "/f"):
             self._findings()
             return True
+        if low.startswith("/clues"):
+            parts = raw.split()
+            self._clues(any(p.lower() in ("--all", "-a", "all") for p in parts[1:]))
+            return True
         if low in ("/turns", "/history"):
             self._turns()
             return True

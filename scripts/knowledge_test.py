@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.state import Category, Finding, Severity  # noqa: E402
+from core.state import Category, Finding, FindingStatus, Severity  # noqa: E402
 from kb.indexer import VectorStore  # noqa: E402
 from kb.knowledge import KnowledgeStore, finding_to_record  # noqa: E402
 
@@ -37,12 +37,18 @@ def F(
     verdict: str = "true_positive",
     conf: float = 0.9,
     confirmed: bool = True,
+    status: FindingStatus | None = None,
     poc_id: str = "p_x",
     tags: list[str] | None = None,
 ) -> Finding:
     return Finding(
         poc_id=poc_id, name=name, severity=sev, category=cat, matched_at=at,
-        verdict=verdict, confidence=conf, confirmed=confirmed,
+        verdict=verdict, confidence=conf,
+        # 三档定级是权威口径：旧用例用 confirmed=False 表达的"未确认"，
+        # 现在显式写成 REJECTED（待复核/误报都不该进知识库）。
+        status=status if status is not None else (
+            FindingStatus.CONFIRMED if confirmed else FindingStatus.REJECTED
+        ),
         description=f"{name}描述", tags=tags if tags is not None else [cat.value],
     )
 
@@ -85,7 +91,7 @@ def main() -> int:
     rec = finding_to_record(
         F("未确认", Severity.HIGH, Category.PATH_PROBE, "http://t/a", confirmed=False)
     )
-    check(rec is None, "confirmed=False 被拒")
+    check(rec is None, "未确认（REJECTED）被拒")
     rec = finding_to_record(
         F("误报", Severity.HIGH, Category.PATH_PROBE, "http://t/b",
           verdict="false_positive", conf=0.05)

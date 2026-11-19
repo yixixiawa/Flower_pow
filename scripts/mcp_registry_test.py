@@ -253,6 +253,10 @@ def main() -> int:
         proc = subprocess.Popen(
             [sys.executable, "flower_pow.py", "mcp"],
             cwd=str(root),
+            # stdin **必须**用管道而不是继承父进程：run_tests.py 把 stdin
+            # 重定向成 DEVNULL，stdio server 读到 EOF 会正常退出（这是对的），
+            # 于是"常驻"断言会误判成失败。管道一直开着 == 客户端在线。
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

@@ -23,6 +23,15 @@ def write_json(
 ) -> Path:
     if path is None:
         path = _target(outdir, _report_stem(result, outdir), ".json", overwrite)
+    # ── 三层隔离：报告只属于当前目标 + 当前扫描轮次 ─────────────
+    # 不能再直接用整个会话的发现列表——换目标或开了新一轮扫描后，
+    # 旧目标/旧轮次的发现混进来就是串台。scoped_view 返回浅拷贝，
+    # Finding 对象本身共享，后面的导出前复核仍写回原对象。
+    result = result.scoped_view()
+    # 出口兜底：见 markdown.py 同位置注释（core/validation/gate.py）
+    from core.validation.gate import ensure_reportable
+
+    ensure_reportable(result)
     # 见 markdown.py 同位置注释：建 path.parent，覆盖显式 path 的新目录。
     path.parent.mkdir(parents=True, exist_ok=True)
     data = result.to_dict()

@@ -89,8 +89,14 @@ class SecondPassVerifier:
             "retested": 0,
             "retest_skipped": 0,
             "baseline_failed": 0,
+            "skipped_dismissed": 0,
         }
         for f in findings:
+            # 已被人工/公开性核验排除的项不动：它的 status 已是 REJECTED，
+            # 再按证据重算会把它"复活"成已确认，与排除动作自相矛盾。
+            if f.dismissed:
+                stats["skipped_dismissed"] += 1
+                continue
             try:
                 await self.evaluate(f)
             except Exception as exc:  # noqa: BLE001

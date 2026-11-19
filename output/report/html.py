@@ -35,6 +35,13 @@ def write_html(
     """把 Markdown 做最小转换输出自包含 HTML（无外部依赖）。"""
     if path is None:
         path = _target(outdir, _report_stem(result, outdir), ".html", overwrite)
+    # ── 三层隔离：报告只属于当前目标 + 当前扫描轮次 ─────────────
+    # 见 json.py 同位置注释。
+    result = result.scoped_view()
+    # 出口兜底：见 markdown.py 同位置注释（core/validation/gate.py）
+    from core.validation.gate import ensure_reportable
+
+    ensure_reportable(result)
     # 见 markdown.py 同位置注释：建 path.parent，覆盖显式 path 的新目录。
     path.parent.mkdir(parents=True, exist_ok=True)
 

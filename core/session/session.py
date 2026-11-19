@@ -59,6 +59,12 @@ class Session:
         # ``result.target``，不补上的话文件名会退化成 report_<日期>_target。
         if self.target and not self.result.target:
             self.result.target = self.target
+        # 三层隔离：会话一有目标就必须有扫描轮次，之后所有工具调用、
+        # 证据与发现都继承这个 run_id（换目标 / 新一轮扫描时再开新的）。
+        # 载入的新版快照已带 runs，不重复开；旧快照没有 runs，补一个——
+        # 老发现不带 run_id，报告过滤按历史数据放行，互不影响。
+        if self.target and not self.result.runs:
+            self.result.new_run(f"会话 {self.target}")
         self.model = model or BusinessModel()
         self.turns: list[Turn] = turns or []
         self.credentials = credentials or {}   # 测试用凭证，仅内存 + 快照，不进报告
@@ -131,11 +137,23 @@ class Session:
             f"目标 {self.target} | 第 {self.turn_no} 轮 | 阶段 {self.phase.label} | "
             f"资产 {len(self.result.assets)} | 发现 {sum(c.values())}"
             + (f"（{' '.join(top)}）" if top else "")
+            # 线索单列：它不是漏洞，混进"发现"会虚增战果；但完全不提，
+            # 用户又会以为"没有别的可疑项了"
+            + (
+                f" | 待验证线索 {len(self.result.active_clues())}"
+                if self.result.active_clues()
+                else ""
+            )
             + (f" | 后台 {running} 运行中" if running else "")
         )
 
     # ── 持久化 ────────────────────────────────────────────────────
     def to_dict(self) -> dict[str, Any]:
+        # 线索只进**会话快照**，不进报告 JSON：``ScanResult.to_dict`` 是
+        # 报告正文的数据源，按设计不能带线索；这里显式补一份。
+        result = self.result.to_dict()
+        if self.result.pending_clues:
+            result["pending_clues"] = self.result.clues_dict()
         return {
             "version": self.VERSION,
             "target": self.target,
@@ -143,7 +161,7 @@ class Session:
             "phase": self.phase.value,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "result": self.result.to_dict(),
+            "result": result,
             "model": self.model.to_dict(),
             "turns": [t.to_dict() for t in self.turns],
             # 凭证只记"有没有"，不记内容——快照可能被分享出去

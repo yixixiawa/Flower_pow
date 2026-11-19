@@ -190,19 +190,36 @@ class FindingMixin:
         # 同一个编号指向的永远是同一条发现。
         full = self._finding_list(session, include_dismissed=True)
         idx = {id(f): i + 1 for i, f in enumerate(full)}
+        sc = session.result.status_counts()
+        clues = len(session.result.active_clues())
         lines = [
-            f"发现 {len(active)} 条有效"
-            + (f"（另有 {len(dismissed)} 条已排除，未计入）" if dismissed else "")
+            f"发现 {len(active)} 条已确认"
+            + f"（另有待复核 {sc['needs_review']} 条、"
+              f"误报/无效命中 {sc['rejected']} 条，均不计入漏洞数）"
+            + (f"；另有 {clues} 条待验证线索，见 list_clues" if clues else "")
             + f"，下表 {len(fs)} 条："
         ]
         for f in fs[:30]:
-            flag = "　[已排除]" if f.dismissed else ""
-            lines.append(f"  [{idx.get(id(f), '?')}] [{f.severity.label}] {f.poc_id} {f.name}{flag}")
+            if f.dismissed:
+                flag = "　[误报·人工排除]"
+            elif f.status.value == "confirmed":
+                flag = "　[已确认]"
+            elif f.status.value == "needs_review":
+                flag = "　[待复核]"
+            else:
+                flag = "　[误报/无效命中]"
+            score = f" 证据分 {f.evidence_score:.2f}" if f.evidence_score else ""
+            lines.append(
+                f"  [{idx.get(id(f), '?')}] [{f.severity.label}] {f.poc_id} {f.name}{flag}{score}"
+            )
             lines.append(f"    位置：{f.matched_at[:110]}")
             if f.dismissed and f.dismiss_reason:
                 lines.append(f"    排除原因：{f.dismiss_reason[:120]}")
+            elif f.status_reason:
+                lines.append(f"    定级依据：{f.status_reason[:140]}")
             elif f.rationale:
                 lines.append(f"    研判：{f.verdict}({f.confidence:.2f}) {f.rationale[:120]}")
+        lines.append("  待复核项不是漏洞：证据不足（缺基线对照/复测/专属特征），补证后可升级")
         lines.append("  排除误报：dismiss_finding(ref=<编号>, reason=<依据>)")
         return "\n".join(lines)
 

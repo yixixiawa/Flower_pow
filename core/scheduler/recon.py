@@ -34,6 +34,11 @@ class _ReconMixin:
             session_id=f"{int(time.time())}",
             llm_enabled=self.llm.available,
         )
+        # 三层隔离：每次执行扫描都开新的 run——本次流水线产出的所有
+        # 资产、证据与发现都继承这个 run_id，报告导出按 target+run 过滤，
+        # 与其他扫描轮次互不串台。
+        result.target_id = result.target
+        result.new_run(f"扫描 {target}")
 
         if verbose:
             self._log(f"目标：{target}")

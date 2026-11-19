@@ -258,8 +258,8 @@ def decide_status(
     if v == "false_positive" and score < CONFIRM_WITH_LLM_SCORE:
         return (
             FindingStatus.NEEDS_REVIEW,
-            f"模型判为误报（置信度 {llm_confidence:.0%}），但客观证据分 {score:.2f}"
-            f" 尚未达到可反驳程度，转人工复核",
+            f"模型判为误报（自评信心 {llm_confidence:.0%}，不是漏洞为真的概率），"
+            f"但客观证据分 {score:.2f} 尚未达到可反驳程度，转人工复核",
         )
 
     # 6) 证据足以确认：高分 + （复测一致 或 影响可证）

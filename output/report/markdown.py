@@ -108,6 +108,15 @@ def write_markdown(
 ) -> Path:
     if path is None:
         path = _target(outdir, _report_stem(result, outdir), ".md", overwrite)
+    # ── 三层隔离：报告只属于当前目标 + 当前扫描轮次 ─────────────
+    # 见 json.py 同位置注释。过滤必须在导出前复核之前做，复核与统计
+    # 才都只面对当前作用域的发现。
+    result = result.scoped_view()
+    # 出口兜底：绕开 record_finding 进来的手工发现也在这里被复核（见
+    # core/validation/gate.py）。放在建目录之前，被拦下的不会留下空文件。
+    from core.validation.gate import ensure_reportable
+
+    ensure_reportable(result)
     # 报告住在自己的文件夹里，显式 path（plan_reports 定好的）同样可能
     # 指向还没建过的目录——建的是 path.parent，不是 outdir。
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +220,8 @@ def write_markdown(
             "recon": "① 侦察（指纹/端口/JS）",
             "match": "② RAG 检索 + 重排",
             "verify": "③ 批量验证",
+            "exploit": "③.5 高危探针（SQLi/RCE/文件读）",
+            "second_pass": "③.6 二次验证（完整性/基线/复测/定级）",
             "triage": "④ LLM 降误报",
         }
         for k, v in result.phases.items():
@@ -255,12 +266,21 @@ def write_markdown(
                 f"RAG 得分：{f.rag_score:.3f}"
             )
             L.append(f"- 命中：{unescape_md(f.matched_at)}")
+            # 手工登记的发现带这两项（七字段契约的一部分）：报告读者要能
+            # 分清「什么前提下会触发」与「触发了到底能造成什么」——
+            # 只有等级没有影响，等于让甲方自己猜危害。
+            if f.trigger:
+                L.append(f"- 触发条件：{unescape_md(f.trigger)}")
+            if f.impact:
+                L.append(f"- 实际影响：{unescape_md(f.impact)}")
             L.append(f"- 定级：**{f.status.label}**（{unescape_md(f.status_reason or '—')}）")
             q = f.quality
             if q is not None:
                 L.append(f"- 证据质量：{q.summary()}　{q.line()}")
             elif f.evidence_score:
                 L.append(f"- 证据质量：{f.evidence_score:.2f}（未保存六维明细）")
+            else:
+                L.append("- 证据质量：未评估（手工登记或未跑二次独立验证）")
             if f.cve:
                 L.append(f"- CVE：{', '.join(f.cve)}")
             if f.verdict:

@@ -167,6 +167,21 @@ POCS_AUTO_MAX_ROUNDS=12
 # 报告 PoC 段直接引用。默认 <output_dir>/evidence；=off 关闭落盘
 # （报告退回用字段重建，响应体只有 4KB 截断版）。
 POCS_EVIDENCE_DIR=
+# 第二次独立验证：证据完整性检查 + 反向验证（随机路径/首页基线比对）
+# + 独立复测，再按证据评分定级。关掉则命中只凭首次响应定级。
+POCS_SECOND_PASS=true
+
+# ── 接口测试生命周期权限控制（policy/）────────────────────────
+# 权限控制总开关；关掉 = 回到"只有 readonly 一道闸"的旧行为
+POCS_POLICY_ENABLED=true
+# 未命中 host 绑定表时的默认环境：unknown / production /
+# dedicated_test / isolated_test。unknown 在决策里等价于拒绝（不猜）
+POCS_POLICY_ENV=unknown
+# 审计日志（data/policy/audit.jsonl）：允许、拒绝、审批全部留痕
+POCS_POLICY_AUDIT=true
+# 独立复测开关。只对 GET/HEAD 生效；POST/PUT 等非幂等方法永远跳过，
+# 重放上传/删除请求等于再打一次目标。
+POCS_SECOND_PASS_RETEST=true
 POCS_VERIFY_TLS=false
 POCS_READONLY=true
 POCS_PORT_SCAN=true

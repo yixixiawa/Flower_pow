@@ -49,9 +49,31 @@ A finding that hands you a token, an ID or a credential can be registered as an 
 
 Every finding carries a description, a PoC section and a recommendation. The PoC section always states: which rule fired, what response was expected, what actually matched, status/size/latency, and the raw request and response in Burp format. Requests are complete; responses are truncated to the first 6,000 characters, with the full traffic kept in `output/evidence/`. A finding that has a request but no response is flagged loudly rather than silently looking complete.
 
-#### False-positive control
+#### Evidence grading, not a coin flip
 
-Four layers: a soft-404 content baseline (anything at or above 0.85 Jaccard similarity to a random 404 page is dropped), per-rule exclusion markers, an origin check that dismisses things the site itself publishes (demo sites, public directories), and evidence-only LLM adjudication. Exclusions persist per target and are reported with their reason — negative evidence is still evidence.
+A raw hit is not a finding. Every hit goes through a **second, independent verification pass** before it counts: completeness check (status line, headers, body, URL, real length) → reverse verification (compare against a random nonexistent path and the site root; a near-identical response is the site's generic page, not evidence) → independent retest (GET/HEAD only — replaying an upload or a delete is a second attack, so non-idempotent hits are recorded as "not retested" instead of replayed) → grading.
+
+Each finding is scored by a standalone `EvidenceQuality` evaluator on six independent dimensions — `response_valid`, `baseline_different`, `signature_specific`, `evidence_complete`, `reproducible`, `impact_proven` — weighted 5/20/25/10/20/20. The resulting status is one of three, and only the first is a vulnerability:
+
+| Status | Meaning | Where it lands |
+|---|---|---|
+| **Confirmed** | evidence meets the bar | main list, counts, knowledge base |
+| **Needs Review** | suspicious, under-evidenced | appendix, **not** counted, not a false positive |
+| **Rejected** | generic response / no real evidence | appendix, kept as a review record |
+
+`evidence_score` and `llm_confidence` are **two different numbers**. The latter is the model's self-assessed confidence in its own reading of the evidence — not the probability that the finding is real. It can downgrade a finding, never upgrade one: 0.95 from the model cannot lift a 0.60 evidence score into Confirmed.
+
+The soft-404 baseline, per-rule exclusion markers and the origin check (demo sites, public directories) still run underneath. Exclusions persist per target and are reported with their reason — negative evidence is still evidence.
+
+#### Submission gate: seven fields, or it does not ship
+
+The agent can only *submit* a vulnerability; the report decides what counts. Every `record_finding` call goes through a standalone `FindingValidator` before it becomes a finding. Seven things must be present, specific and checkable:
+
+**vulnerability type · affected URL · trigger condition · raw request · raw response · why it proves the bug · actual impact**
+
+Anything missing, a placeholder ("TBD"), a platitude ("there is a security risk") or unverifiable (no status line, no request line, a "response" that is just the write-up pasted back) is **blocked**, recorded as a **pending lead**, and never reaches the report, the counts, the knowledge base — or even the findings list. The tool returns the exact missing fields and why each one failed; resubmitting the same URL + type with the gaps filled promotes the lead into a finding and closes it automatically.
+
+Leads are a separate lifecycle, not a status: `flower-pow findings --pending`, the in-session `/clues` command and the `list_clues` tool show them, they are persisted in session snapshots, and they are deliberately **absent from the JSON report**. Automatic probes are not subject to this text contract — their evidence chain is graded by the second-pass evaluator above — but the report writers re-run the gate over manually registered findings as a last line of defence, so a session restored from an old snapshot or patched by a script cannot slip an incomplete "confirmed" finding into a deliverable.
 
 #### Two ways to drive it
 
@@ -101,13 +123,14 @@ flower_pow ask "shiro deserialization"         # retrieval only, no network traf
 
 #### In-session commands
 
-All 25 are tab-completable.
+All 26 are tab-completable.
 
 ```
 /target [URL]     set or show the target      /status          current state
 /tools            available tools             /assets [type]   asset list
-/findings [sev]   findings                    /model           business model
-/turns            turn log                    /report [fmt]    export a report
+/findings [sev]   findings                    /clues           pending leads (not vulns)
+/model            business model              /report [fmt]    export a report
+/turns            turn log
 /agent on|off     agent / scripted mode       /phase NAME      jump to a phase
 /next  /run       advance / one more round    /poll            run until exhausted
 /backfill         backfill raw traffic        /auto            fully automatic
@@ -248,9 +271,31 @@ poc/builtin/           built-in rules    poc/community/  pulled rules
 
 每条发现固定三节：漏洞描述、PoC、安全建议。PoC 节一定写清：命中的是哪条规则、预期看到什么、实际命中了什么、状态码/体量/耗时，以及 Burp 格式的原始请求与响应。请求给完整，响应截到前 6000 字符，完整报文留在 `output/evidence/`。只有请求没有响应的，会显著标出来，而不是看起来像齐了。
 
-#### 降误报
+#### 证据定级，不是抛硬币
 
-四层：软 404 正文基线（与随机 404 页 Jaccard 相似度 ≥ 0.85 的直接丢弃）、每条规则自带的排除特征、回源核验（站点自己公开的演示站/资料目录判为误报）、只认证据的模型研判。排除项按目标持久化，报告里带理由——反向证据也是证据。
+**原始命中不等于漏洞。** 每条命中在计入之前都要过一遍**第二次独立验证**：证据完整性检查（状态行、响应头、响应体、URL、实际长度）→ 反向验证（拿随机不存在路径与站点首页做基线，正文几乎一致说明是站点通用页，不是这条路径的证据）→ 独立复测（只对 GET/HEAD 重放；重放上传/删除请求等于再打一次目标，非幂等命中记「未复测」而不是硬发）→ 定级。
+
+每条发现由独立的 `EvidenceQuality` 评估器按六个维度打分：`response_valid`、`baseline_different`、`signature_specific`、`evidence_complete`、`reproducible`、`impact_proven`，权重 5/20/25/10/20/20。定级只有三档，**只有第一档是漏洞**：
+
+| 状态 | 含义 | 去向 |
+|---|---|---|
+| **Confirmed 已确认漏洞** | 有明确证据，满足判定条件 | 正式列表、数量统计、知识库 |
+| **Needs Review 待人工复核** | 有可疑现象但证据不足 | 附录，**不计入**数量，也不是误报 |
+| **Rejected 误报或无效命中** | 通用响应 / 证据无效 | 附录，保留复核记录 |
+
+`evidence_score` 与 `llm_confidence` 是**两个不同的数**：后者是模型对「自己这段判断」的信心，不是「这条漏洞为真的概率」。它只能把发现**降级**，不能升级——模型给 0.95，也抬不动 0.60 的证据分。
+
+底层的软 404 基线、规则自带排除特征、回源公开性核验照旧生效；排除项按目标持久化，报告里带理由——反向证据也是证据。
+
+#### 提交闸门：七项信息，缺一不进报告
+
+Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_finding` 都要先过独立的 `FindingValidator`，七项信息必须齐全、具体、可核实：
+
+**漏洞类型 · 受影响 URL · 触发条件 · 原始请求 · 原始响应 · 成立依据 · 实际影响**
+
+缺项、占位（「待补充」）、套话（「存在安全风险」）、无法核实（没有状态行、没有请求行、把说明文字当响应体贴回来）——一律**拦截**，登记成**待验证线索**，不进报告、不计数量、不沉淀知识库，连 `findings` 列表都不进。拦截返回里会点名缺哪几项、每项为什么不达标；用同一 URL + 同一漏洞类型补齐重提，线索自动升级为正式发现并销案。
+
+线索是**独立的生命周期**，不是一个状态档：`flower-pow findings --pending`、会话内 `/clues`、`list_clues` 工具都能看，会话快照里保存，但**刻意不进 JSON 报告**。自动探针不受这套文本契约约束（它的证据链由上面的第二次验证评分把关）；三个报告 writer 会对**手工登记**的发现再复核一遍作为最后防线——从旧快照恢复的会话、或被脚本改过的结果，都不能把一条信息不全的"已确认漏洞"塞进交付物。
 
 #### 两种驱动
 
@@ -300,13 +345,14 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 
 #### 会话内命令
 
-25 个，全部 Tab 可补全。
+26 个，全部 Tab 可补全。
 
 ```
 /target [URL]    设定或查看目标              /status          当前状态
 /tools           可用工具清单                /assets [类型]   资产清单
-/findings [等级] 发现列表                    /model           业务模型
-/turns           轮次记录                    /report [格式]   导出报告
+/findings [等级] 发现列表                    /clues           待验证线索（不算漏洞）
+/model           业务模型                    /report [格式]   导出报告
+/turns           轮次记录
 /agent on|off    切换 Agent / 剧本           /phase 名称      跳到某个阶段
 /next  /run      推进 / 再跑一轮             /poll            跑到穷尽
 /backfill        从历史回填原始报文           /auto            一键全自动

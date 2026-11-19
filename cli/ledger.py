@@ -97,6 +97,10 @@ def findings(
     excluded: bool = typer.Option(
         False, "--excluded", "-e", help="查看已持久化的误报排除清单"
     ),
+    pending: bool = typer.Option(
+        False, "--pending", "-p",
+        help="查看待验证线索（被质量闸门拦下的提交，不计入漏洞数）",
+    ),
     auto: bool = typer.Option(
         False, "--auto", help="回源站根目录核验公开性，站点自己公开的自动排除"
     ),
@@ -174,6 +178,50 @@ def findings(
             where = "该 POC 全部命中" if not e.get("matched_at") else str(e["matched_at"])
             t.add_row(str(e.get("poc_id") or ""), where, str(e.get("reason") or "—"))
         console.print(t)
+        return
+
+    # ── 待验证线索视图 ───────────────────────────────────────────
+    if pending:
+        clues = [c for c in sess.result.pending_clues if c.status != "promoted"]
+        if as_json:
+            console.print_json(
+                _json.dumps(
+                    {
+                        "target": sess.target,
+                        "session": sess.session_id,
+                        "pending": len(clues),
+                        "clues": [c.to_dict() for c in clues],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return
+        total = len(sess.result.pending_clues)
+        console.print(
+            f"[cyan]待验证线索[/cyan] {len(clues)} 条"
+            + (f"（累计 {total} 条，含已升级销案）" if total > len(clues) else "")
+            + " —— 不计入漏洞数，也不会出现在报告里"
+        )
+        if not clues:
+            console.print("[dim]（没有待补填的线索）[/dim]")
+            return
+        t = Table(title="待验证线索（补全七项信息后才进报告）")
+        t.add_column("线索", overflow="fold")
+        t.add_column("类型/位置", overflow="fold")
+        t.add_column("缺失字段", overflow="fold")
+        t.add_column("来源", overflow="fold")
+        for c in clues:
+            t.add_row(
+                c.clue_id,
+                f"{c.vuln_type or c.name}\n{c.url[:60]}",
+                "、".join(c.missing) or "-",
+                c.source,
+            )
+        console.print(t)
+        console.print(
+            '[dim]补齐后：在 Agent 里用同一 URL + 同一漏洞类型重新 record_finding'
+            "（会自动销案）[/dim]"
+        )
         return
 
     # ── 公开性核验（回源取证）────────────────────────────────────
@@ -288,6 +336,12 @@ def findings(
         "[dim]待复核项不是漏洞：它只是证据不足（缺基线对照/复测/专属特征），"
         "补足取证后才会升级为已确认[/dim]"
     )
+    clue_n = len(sess.result.active_clues())
+    if clue_n:
+        console.print(
+            f"[dim]另有 {clue_n} 条待验证线索（被质量闸门拦下，"
+            "不计入漏洞数）：flower_pow findings --pending[/dim]"
+        )
 
 
 @app.command()

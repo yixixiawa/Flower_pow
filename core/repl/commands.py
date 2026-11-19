@@ -72,11 +72,18 @@ class _CommandMixin(_Base):
         r = self.session.result
         r.assets.clear()
         r.findings.clear()
+        # 线索也是目标独有的：换目标后留着，会把上一个目标的可疑项带进新会话
+        r.pending_clues.clear()
         r.fingerprints.clear()
         r.context_vars.clear()
         r.attack_chains.clear()
         r.notes.clear()
         r.errors.clear()
+        # 三层隔离的作用域字段同样属于上一目标：target_id / run_id 台账
+        # 不清的话，新目标的发现可能被打上旧目标的 target_id（串台复活）。
+        r.target_id = ""
+        r.current_run_id = ""
+        r.runs.clear()
         self.session.credentials.clear()
         self.session.turns.clear()
         # 对话历史属于上一目标（见 docstring），必须与 agent.reset() 同步清
@@ -168,6 +175,10 @@ class _CommandMixin(_Base):
             self._purge_target_scope()
         self.session.target = norm
         self.session.result.target = norm
+        self.session.result.target_id = norm
+        # 换目标 = 开新的扫描轮次：之后所有工具调用、证据与发现都继承
+        # 这个 run_id（三层隔离的第二层），报告导出按 target+run 过滤。
+        self.session.result.new_run(f"目标 {norm}")
         print(f"✓ 目标已设定为：{norm}，上下文已完全重置。")
         self._refresh_completer()
 
@@ -390,9 +401,14 @@ class _CommandMixin(_Base):
             return
         active = self.session.result.active_findings()
         dismissed = self.session.result.dismissed_findings()
-        head = f"\n发现 {len(active)} 条有效"
+        sc = self.session.result.status_counts()
+        head = (
+            f"\n发现 {len(active)} 条已确认"
+            f"（待复核 {sc['needs_review']}、误报/无效命中 {sc['rejected']}，"
+            f"均不计入漏洞数）"
+        )
         if dismissed:
-            head += f"（另有 {len(dismissed)} 条已排除）"
+            head += f"，其中人工排除 {len(dismissed)} 条"
         print(head + "：")
         from core.state import Severity
 
@@ -403,13 +419,56 @@ class _CommandMixin(_Base):
                 continue
             print(f"\n  [{sev.label}] {len(group)} 项")
             for i, f in group[:10]:
-                flag = " [已排除]" if f.dismissed else ""
-                print(f"    {i}. {f.poc_id}: {f.name}{flag}")
+                if f.dismissed:
+                    flag = " [误报·人工排除]"
+                elif f.status.value == "confirmed":
+                    flag = " [已确认]"
+                elif f.status.value == "needs_review":
+                    flag = " [待复核]"
+                else:
+                    flag = " [误报/无效命中]"
+                score = f" 证据分 {f.evidence_score:.2f}" if f.evidence_score else ""
+                print(f"    {i}. {f.poc_id}: {f.name}{flag}{score}")
                 print(f"       {f.matched_at[:90]}")
                 if f.dismissed and f.dismiss_reason:
                     print(f"       排除原因：{f.dismiss_reason[:70]}")
+                elif f.status_reason and f.status.value != "confirmed":
+                    print(f"       定级依据：{f.status_reason[:70]}")
         if dismissed and not show_dismissed:
             print("\n  （已排除项由 Agent 的 dismiss_finding 工具管理，可撤销）")
+
+    def _clues(self, include_promoted: bool = False) -> None:
+        """待验证线索——**与正式发现分开列**，避免被误读成漏洞。"""
+        r = self.session.result
+        items = r.pending_clues if include_promoted else r.active_clues()
+        if not items:
+            if r.pending_clues:
+                print(
+                    f"当前没有待补填的线索（累计 {len(r.pending_clues)} 条，均已升级销案）。"
+                    "用 /clues --all 看历史。"
+                )
+            else:
+                print("（暂无待验证线索：所有提交都通过了质量闸门）")
+            return
+        print(
+            f"\n待验证线索 {len(items)} 条 —— **不计入漏洞数，也不会出现在报告里**："
+        )
+        for c in items[:30]:
+            tag = "已升级" if c.status == "promoted" else "待补填"
+            print(f"\n  · {c.clue_id} [{tag}] {c.label}")
+            if c.severity:
+                print(f"      等级：{c.severity}　来源：{c.source}")
+            if c.missing:
+                print("      缺失字段：" + "、".join(c.missing))
+            for reason in c.reasons[:4]:
+                print(f"      - {reason[:130]}")
+            if c.status == "promoted":
+                print(f"      已升级为：{c.promoted_to}")
+            else:
+                print("      补齐后：在 Agent 里重新 record_finding（同 URL + 同类型）")
+        if len(items) > 30:
+            print(f"\n  …另有 {len(items) - 30} 条")
+        print("\n  这些只是线索，不是漏洞；补全七项信息后才会进报告。")
 
     def _finding_rows(self, *, show_dismissed: bool = False) -> list[tuple[int, Finding]]:
         """``[(编号, Finding)]``。编号**始终按含已排除的全表算**。

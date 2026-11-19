@@ -144,6 +144,19 @@ class _ToolRunnerBase:
         # ``create_task`` 只被事件循环**弱引用**，不自己存一份的话任务可能
         # 执行到一半被 GC 掉（官方文档明确要求保留引用）。
         self._bg_handles: dict[str, Any] = {}
+        # ── 接口测试生命周期权限控制（policy/，111.md 四模块）─────────
+        # api_policy 定义矩阵 / request_guard 请求前检查 /
+        # test_transaction 约束测试对象生命周期 / audit_logger 审计留痕。
+        from policy.audit_logger import PolicyAudit
+        from policy.request_guard import RequestGuard
+        from policy.test_transaction import TestLedger
+
+        self.policy_guard = RequestGuard(cfg)
+        self.test_ledger = TestLedger()
+        self.policy_audit = PolicyAudit(
+            getattr(cfg, "data_dir", "./data"),
+            enabled=bool(getattr(getattr(cfg, "policy", None), "audit", True)),
+        )
 
     def reset_target_scope(self) -> None:
         """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
@@ -157,6 +170,8 @@ class _ToolRunnerBase:
           检测的信号与连击次数。换目标后它们对新手目标毫无意义，
           还会让新目标的第一次探测就撞上"连击 5 次"的误拦。
         * ``_host_signal`` / ``_host_streak``：主机级兜底，同理。
+        * ``test_ledger``：测试对象台账。台账里的对象属于上一个目标，
+          不清的话新目标的删除操作会误认"对象已知"而放行。
 
         注意**不动** ``_det_cache``（探测器缓存）：它按工具+参数索引，
         与目标无关，清了只会白白多跑一遍探测。
@@ -166,6 +181,7 @@ class _ToolRunnerBase:
         self._endpoint_streak.clear()
         self._host_signal.clear()
         self._host_streak.clear()
+        self.test_ledger.clear()
 
 
 
@@ -296,10 +312,18 @@ class _ToolRunnerBase:
                 out = f"【未知工具】{name}。可用工具见系统提示中的清单。"
                 status = "unknown"
             else:
-                # 一律 **args 展开——按位置整个传进去会把参数字典
-                # 当成第一个形参的值（external_tool 因此收到过 tool={...} 这种
-                # 荒谬输入，报"未知外部工具"），这个 bug 真发生过。
-                out = await handler(session, **args)
+                # ── 接口测试生命周期权限控制（policy/request_guard）────
+                # 面向目标的请求在执行前过权限矩阵：拒绝文本直接回灌模型，
+                # 状态记 blocked。检查自身异常也按"拒绝执行"处理（fail-closed）。
+                verdict = await self._policy_gate(name, args, session)
+                if verdict is not None:
+                    out = verdict
+                    status = "blocked"
+                else:
+                    # 一律 **args 展开——按位置整个传进去会把参数字典
+                    # 当成第一个形参的值（external_tool 因此收到过 tool={...} 这种
+                    # 荒谬输入，报"未知外部工具"），这个 bug 真发生过。
+                    out = await handler(session, **args)
         except ToolBlocked as exc:
             out = f"【已拦截】{exc}"
             status = "blocked"
@@ -345,6 +369,13 @@ class _ToolRunnerBase:
                 "status": status,
                 "ms": int((time.perf_counter() - started) * 1000),
                 "chars": len(text),
+                # 三层隔离：工具调用也归属当前目标与扫描轮次。报告与审计
+                # 按 run 过滤时，调用记录与发现必须能对得上。
+                "target_id": getattr(session, "target", "") or "",
+                "run_id": getattr(
+                    getattr(session, "result", None), "current_run_id", ""
+                )
+                or "",
             }
         )
         return text
@@ -420,14 +451,221 @@ class _ToolRunnerBase:
 
     # ── 编排类 ────────────────────────────────────────────────────
 
+    # 受权限矩阵管辖的面向目标工具。本地产物读写（files/fsops）、
+    # 会话管理、报告导出不在"接口测试生命周期"范围内，不过闸门。
+    _POLICY_TOOLS = frozenset({"http_request", "external_tool", "exploit_probe"})
+
+    _LEDGER_ACTIONS = {
+        "创建测试数据": "create",
+        "修改测试数据": "update",
+        "上传测试文件": "upload",
+        "删除测试数据": "delete",
+    }
+
+    def _policy_ctx(self, session, url: str):
+        """决策上下文：目标、环境、账号身份三要素的绑定。
+
+        ``target_bound`` = 会话已有目标（/target 或 set_target 已执行）；
+        ``identity_bound`` = 会话即身份——REPL 由运行者启动并授权，
+        运行者身份随会话绑定（审计里单独留 target_id/run_id 可对账）。
+        真正的牙齿在 L1/L2/L3 的**环境门**上：判不出环境就是 unknown，
+        一律按条件不满足拒绝执行。
+        """
+        from policy.request_guard import GuardContext
+
+        r = getattr(session, "result", None)
+        return GuardContext(
+            target_id=(getattr(r, "target_id", "") or getattr(session, "target", "")),
+            run_id=getattr(r, "current_run_id", "") or "",
+            environment=self.policy_guard.environment_for(url),
+            target_bound=bool(getattr(session, "target", "")),
+            identity_bound=True,
+        )
+
+    def _policy_scope(self, session) -> tuple[str, str]:
+        r = getattr(session, "result", None)
+        return (
+            getattr(r, "target_id", "") or getattr(session, "target", ""),
+            getattr(r, "current_run_id", "") or "",
+        )
+
+    async def _policy_gate(self, name: str, args: dict[str, Any], session) -> str | None:
+        """执行前的权限检查。返回拒绝文本（含【已拦截】前缀）或 None 放行。
+
+        fail-closed：检查自身抛异常时按"条件不满足→拒绝执行"处理——
+        权限控制坏了不能变成全放行。
+        """
+        if name not in self._POLICY_TOOLS:
+            return None
+        guard = self.policy_guard
+        try:
+            if name == "http_request":
+                url = self._normalize_target(str(args.get("url") or session.target or ""))
+                method = str(args.get("method") or "GET")
+                body = str(args.get("body") or "")
+                d = guard.check_request(
+                    url, method=method, body=body, ctx=self._policy_ctx(session, url)
+                )
+                if d.allowed:
+                    self._policy_allow(session, d, url=url)
+                    return None
+                if d.decision == "REVIEW":
+                    if d.level == "L3":
+                        # L3 的 REVIEW 来自 config approvals 的显式授权——
+                        # 授权即审批，不再逐次打断（环境门已在 check 内兜住）
+                        self.policy_audit.log(
+                            "approval", command=d.command, level=d.level,
+                            decision="ALLOW", category=d.category, url=url,
+                            target_id=self._policy_scope(session)[0],
+                            run_id=self._policy_scope(session)[1],
+                            reason=d.reason,
+                        )
+                        self._policy_allow(session, d, url=url)
+                        return None
+                    if await self._policy_review(d, session, url):
+                        self._policy_allow(session, d, url=url)
+                        return None
+                return self._policy_deny_text(d, url)
+
+            if name == "exploit_probe":
+                kinds = str(args.get("kinds") or "rce,fileread")
+                url = self._normalize_target(str(args.get("url") or session.target or ""))
+                # 探针类别 → 矩阵命令，取风险最高的一条判定：
+                # rce → 命令执行（L3）、upload → 上传测试文件（L2）、
+                # fileread → 查询详情（L0）
+                command = None
+                if "rce" in kinds:
+                    command = "命令执行"
+                elif "upload" in kinds:
+                    command = "上传测试文件"
+                else:
+                    command = "查询详情"
+                from policy.api_policy import decide as _decide
+
+                d = _decide(
+                    command,
+                    environment=self.policy_guard.environment_for(url),
+                    identity_bound=True,
+                    target_bound=bool(getattr(session, "target", "")),
+                    approved=command in guard.approved,
+                )
+                d.category = "EXECUTE" if command == "命令执行" else (
+                    "UPLOAD" if command == "上传测试文件" else "READ"
+                )
+                if d.allowed:
+                    self._policy_allow(session, d, url=url)
+                    return None
+                if d.decision == "REVIEW":
+                    if d.level == "L3":
+                        _, run_id = self._policy_scope(session)
+                        self.policy_audit.log(
+                            "approval", command=d.command, level=d.level,
+                            decision="ALLOW", category=d.category, url=url,
+                            run_id=run_id, reason=d.reason,
+                        )
+                        self._policy_allow(session, d, url=url)
+                        return None
+                    if await self._policy_review(d, session, url):
+                        self._policy_allow(session, d, url=url)
+                        return None
+                return self._policy_deny_text(d, url)
+
+            if name == "external_tool":
+                tool = str(args.get("tool") or "")
+                url = str(args.get("target") or args.get("url") or session.target or "")
+                d = guard.check_tool(tool, dict(args), ctx=self._policy_ctx(session, url))
+                if d.allowed:
+                    self._policy_allow(session, d, url=url)
+                    return None
+                if d.decision == "REVIEW":
+                    if d.level == "L3":
+                        self.policy_audit.log(
+                            "approval", command=d.command, level=d.level,
+                            decision="ALLOW", category=d.category, url=url,
+                            run_id=self._policy_scope(session)[1], reason=d.reason,
+                        )
+                        self._policy_allow(session, d, url=url)
+                        return None
+                    if await self._policy_review(d, session, url):
+                        self._policy_allow(session, d, url=url)
+                        return None
+                return self._policy_deny_text(d, url)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            tid, rid = self._policy_scope(session)
+            self.policy_audit.log(
+                "error", command=name, target_id=tid, run_id=rid,
+                reason=f"权限检查异常：{type(exc).__name__}: {exc}",
+            )
+            return (
+                "【已拦截】（策略）权限检查异常，按「条件不满足 → 拒绝执行」处理：\n"
+                f"  {type(exc).__name__}: {exc}\n"
+                "  修复 policy 配置或用 /readonly 查看当前状态后重试。"
+            )
+
+    async def _policy_review(self, d, session, url: str) -> bool:
+        """REVIEW 决策的运行期审批：有审核通道就问人，没有就拒绝。"""
+        tid, rid = self._policy_scope(session)
+        if self.approver is None:
+            self.policy_audit.log(
+                "deny", command=d.command, level=d.level, decision=d.decision,
+                category=d.category, url=url, target_id=tid, run_id=rid,
+                reason=d.reason + "；无审批通道，拒绝执行",
+            )
+            return False
+        ok = bool(
+            await self.approver(
+                f"策略审批：{d.command}（{d.level}）针对 {url[:80]}\n  {d.reason}"
+            )
+        )
+        self.policy_audit.log(
+            "approval" if ok else "deny",
+            command=d.command, level=d.level,
+            decision="ALLOW" if ok else "DENY",
+            category=d.category, url=url, target_id=tid, run_id=rid,
+            reason=("运行期审批通过：" + d.reason) if ok else ("运行期审批拒绝：" + d.reason),
+        )
+        return ok
+
+    def _policy_allow(self, session, d, url: str = "") -> None:
+        """放行留痕 + 写操作进测试对象台账（生命周期约束的数据来源）。"""
+        tid, rid = self._policy_scope(session)
+        self.policy_audit.log(
+            "allow", command=d.command, level=d.level, decision=d.decision,
+            category=d.category, url=url, target_id=tid, run_id=rid,
+            reason=d.reason, extra={"signals": list(d.signals)[:6]} if d.signals else None,
+        )
+        action = self._LEDGER_ACTIONS.get(d.command)
+        if action and url:
+            self.test_ledger.record(url, action, run_id=rid, target_id=tid)
+
+    def _policy_deny_text(self, d, url: str = "") -> str:
+        lines = [f"【已拦截】（策略）{d.command or '未知接口'} 被权限控制拒绝执行。"]
+        lines.append(f"  判定：{d.decision}（等级 {d.level or '-'} / 分类 {d.category or '-'}）")
+        lines.append(f"  理由：{d.reason}")
+        if d.signals:
+            lines.append("  识别信号：" + "；".join(d.signals[:5]))
+        lines.append(
+            "  条件不满足统一拒绝执行。如确属已授权的测试环境，请在 config.yaml 的"
+            " policy 段绑定环境（environments: {\"<host 通配>\": \"isolated_test\"}"
+            " 或 dedicated_test）；L3 命令还必须在 approvals 里显式审批。"
+        )
+        return "\n".join(lines)
+
     async def _h_set_target(self, session, url: str = "") -> str:
-        norm = self._normalize_target(url)
-        session.target = norm.rstrip("/")
+        norm = self._normalize_target(url).rstrip("/")
+        changed = session.target != norm
+        session.target = norm
         # 必须同步 result.target：报告命名（report_<日期>_<主域名>）读的是
         # result.target。只改 session.target 的话，导出报告时它还是空串，
         # 文件名就退化成 report_<日期>_target——和 repl 的 /target 命令
         # （repl.py _set_target，两处都改）行为不一致。
         session.result.target = session.target
+        if changed:
+            # 三层隔离：换目标必须开新的扫描轮次，与 repl /target 保持一致。
+            # 目标没变就不开——重复 set_target 不该把正在跑的一轮扫描腰斩。
+            session.result.target_id = session.target
+            session.result.new_run(f"目标 {session.target}")
         return f"目标已设定：{session.target}"
 
     async def _h_session_state(self, session, **_: Any) -> str:
@@ -455,6 +693,14 @@ class _ToolRunnerBase:
         ]
         if r.fingerprints:
             lines.insert(2, f"指纹：{r.fingerprints[0].summary()}")
+        # 权限控制状态：Agent 必须知道当前环境判定与策略口径，
+        # 否则它发起的写操作被拦时完全摸不着头脑（拦截文本只到单次调用）
+        if getattr(self, "policy_guard", None) is not None and self.policy_guard.enabled:
+            env = self.policy_guard.environment_for(session.target or "")
+            lines.append(
+                f"策略：已启用 | 目标环境 {env or '未知'}"
+                "（L1 仅隔离测试环境、L2 需专门测试环境/审批、L3 默认禁止）"
+            )
         api = [a for a in r.assets if a.kind == "api"]
         if api:
             no_auth = sum(1 for a in api if not a.meta.get("auth"))

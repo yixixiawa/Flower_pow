@@ -112,7 +112,11 @@ class _AutoMixin(_Base):
         # 以前这里自己按 (poc_id, name, matched_at) 去重，与 toolrun 的
         # (poc_id, matched_at) 不一致——同一目标同一位置换个 name 就漏过重复，
         # 而"误报排除"这种策略更是完全轮不到执行。
-        s.result.add_findings(list(result.findings))
+        # restamp=True：这次扫描是**代表当前会话**跑的，发现归属必须改判到
+        # 会话当前作用域（target_id + run_id）。不带 restamp 的话，发现留着
+        # 扫描任务自己的 run_id 进来，报告按 run 过滤时会被当成"别的轮次"
+        # 整体漏掉——/auto 跑完导出的报告一条发现都没有。
+        s.result.add_findings(list(result.findings), restamp=True)
 
         have_fp = {fp.summary() for fp in s.result.fingerprints}
         for fp in result.fingerprints:

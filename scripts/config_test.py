@@ -196,7 +196,7 @@ def main() -> int:
     unknown_repo = [
         k
         for k in (repo or {})
-        if k not in ("scan", "rag", "llm", "intel", "output_dir", "data_dir")
+        if k not in ("scan", "rag", "llm", "intel", "policy", "output_dir", "data_dir")
         and k not in aliases
     ]
     check(not unknown_repo, f"config.yaml 顶层没有多余段（多出：{unknown_repo}）")

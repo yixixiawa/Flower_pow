@@ -13,13 +13,25 @@ from cli.app import _SEV_STYLE
 
 def _print_summary(result: ScanResult) -> None:
     counts = result.counts()
+    sc = result.status_counts()
     t = Table(title=f"扫描结果 — {result.target}")
     t.add_column("等级")
     t.add_column("数量", justify="right")
     for s in Severity:
         t.add_row(s.label, str(counts.get(s.value, 0)))
-    t.add_row("[bold]合计[/bold]", f"[bold]{len(result.findings)}[/bold]")
+    # 合计只算**已确认**：待复核与误报不是漏洞，加进来会虚增战果
+    t.add_row("[bold]合计[/bold]", f"[bold]{sc['confirmed']}[/bold]")
     console.print(t)
+    console.print(
+        f"[dim]定级：已确认 {sc['confirmed']} · 待人工复核 {sc['needs_review']}"
+        f"（不计入漏洞数） · 误报/无效命中 {sc['rejected']}[/dim]"
+    )
+    clue_n = len(result.active_clues())
+    if clue_n:
+        console.print(
+            f"[dim]另有 {clue_n} 条待验证线索（被质量闸门拦下，未进报告）："
+            "flower_pow findings --pending[/dim]"
+        )
 
     info: list[str] = [
         f"POC库 {result.pocs_loaded}",
@@ -31,23 +43,39 @@ def _print_summary(result: ScanResult) -> None:
     ]
     console.print("[dim]" + "  ".join(info) + "[/dim]")
 
-    if result.findings:
-        ft = Table(title=f"发现明细（{len(result.findings)} 条）")
+    confirmed = result.confirmed_findings()
+    if confirmed:
+        ft = Table(title=f"发现明细（已确认 {len(confirmed)} 条）")
         ft.add_column("等级", no_wrap=True)
         ft.add_column("编号", style="cyan", no_wrap=True)
         ft.add_column("名称")
         ft.add_column("命中位置")
+        ft.add_column("证据分", justify="right", no_wrap=True)
         ft.add_column("研判", style="dim")
-        for f in result.findings[:30]:
+        for f in confirmed[:30]:
             verdict = f.verdict or "-"
+            score = f"{f.evidence_score:.2f}" if f.evidence_score else "-"
             ft.add_row(
                 f"[{_SEV_STYLE[f.severity]}]{f.severity.label}[/]",
                 f.poc_id,
                 f.name,
                 f.matched_at[:52],
+                score,
                 verdict,
             )
         console.print(ft)
+
+    review = result.needs_review_findings()
+    if review:
+        console.print(
+            f"[yellow]待人工复核 {len(review)} 条[/yellow]"
+            f"[dim]（证据不足，不计入漏洞数；详见报告附录）[/dim]"
+        )
+        for f in review[:8]:
+            console.print(
+                f"  [dim]· {f.poc_id} @ {f.matched_at[:60]}"
+                f"（{f.evidence_score:.2f}）{f.status_reason[:60]}[/dim]"
+            )
 
     assets = result.assets
     if assets:

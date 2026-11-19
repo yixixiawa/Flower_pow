@@ -49,6 +49,29 @@ class FakeCfg:
         poc_dir = "./poc"
 
 
+def RF(**over) -> dict:
+    """一组**能过质量闸门**的登记参数：用例只覆盖自己关心的字段。
+
+    七字段契约（类型/URL/触发条件/原始请求/原始响应/成立依据/实际影响）
+    是 2026-11 新增的准入条件，默认值必须全部达标，否则每个用例都会被
+    "缺原始响应"之类的拦截理由盖住，测不到它本来要测的东西。
+    """
+    base = {
+        "trigger": "未认证用户在查询参数里注入 UNION 语句即可触发，无需任何凭证",
+        "impact": "读取数据库版本号与 users 表内容，实测拿到 3 个用户的口令哈希",
+        "evidence": (
+            "响应 data[0].id 回显 3.44.2（SQLite 版本号），"
+            "与正常查询返回的 id=1 不同，证明 UNION 注入成立"
+        ),
+        "response": (
+            "HTTP/1.1 200 OK\nContent-Type: application/json\n"
+            "Content-Length: 26\n\n{\"data\":[{\"id\":\"3.44.2\"}]}"
+        ),
+    }
+    base.update(over)
+    return base
+
+
 async def main() -> int:
     ok = total = 0
 
@@ -70,20 +93,22 @@ async def main() -> int:
     names = [b.name for b in BUILTINS]
     check("record_finding" in names, "record_finding 在工具清单里")
     spec = [b for b in BUILTINS if b.name == "record_finding"][0]
-    check(set(spec.params.get("required") or []) >=
-          {"name", "severity", "matched_at", "evidence", "payload"},
+    required = set(spec.params.get("required") or [])
+    check(required >= {"name", "severity", "matched_at", "evidence", "payload"},
           "必填参数含证据与 payload")
+    check(required >= {"trigger", "impact"},
+          f"七字段契约里的触发条件/实际影响是必填参数，实={sorted(required)}")
 
     print("\n场景2 登记手工发现（原 bug 的核心）")
-    r = await runner.execute("record_finding", {
+    r = await runner.execute("record_finding", RF(**{
         "name": "SQL 注入", "severity": "critical",
         "matched_at": "http://juice.test/rest/products/search?q=test')) UNION SELECT 1--",
-        "evidence": "id 字段回显 3.44.2（SQLite 版本号），UNION 注入成立",
+        "evidence": "id 字段回显 3.44.2（SQLite 版本号），与正常查询的 id=1 不同，UNION 注入成立",
         "payload": "GET /rest/products/search?q=test')) UNION SELECT sqlite_version()--",
         "expected": "响应 data[0].id 等于数据库版本号",
         "remediation": "改用参数化查询",
         "category": "sqli",
-    }, session)
+    }), session)
     check("已登记" in r, f"登记成功：{r[:60]}")
     check(len(session.result.findings) == 1, f"findings 有 1 项，实={len(session.result.findings)}")
     f = session.result.findings[0]
@@ -94,11 +119,12 @@ async def main() -> int:
     check(f.verdict == "true_positive" and f.confidence == 1.0, "手工验证默认已确认")
 
     print("\n场景3 重复登记不累加")
-    again = await runner.execute("record_finding", {
+    again = await runner.execute("record_finding", RF(**{
         "name": "SQL 注入", "severity": "critical",
         "matched_at": "http://juice.test/rest/products/search?q=test')) UNION SELECT 1--",
-        "evidence": "重复验证", "payload": "GET /x", "category": "sqli",
-    }, session)
+        "evidence": "再次请求同样回显 3.44.2（SQLite 版本号），与首轮结果一致，注入可复现",
+        "payload": "GET /x", "category": "sqli",
+    }), session)
     check(len(session.result.findings) == 1, f"仍是 1 项，实={len(session.result.findings)}")
     check("已存在" in again, "明确告知已存在")
 
@@ -125,20 +151,20 @@ async def main() -> int:
              ("lfi", Category.FILE_OP), ("rce", Category.RCE),
              ("info_disclosure", Category.HEADER_CHECK)]
     for cat, want in cases:
-        r2 = await runner.execute("record_finding", {
+        r2 = await runner.execute("record_finding", RF(**{
             "name": f"{cat} 测试", "severity": "medium",
-            "matched_at": f"http://juice.test/{cat}", "evidence": "evidence",
+            "matched_at": f"http://juice.test/{cat}",
             "payload": f"GET /{cat}", "category": cat,
-        }, session)
+        }), session)
         check("已登记" in r2, f"{cat} 登记成功")
     got = [x.category for x in session.result.findings[1:]]
     check(got == [w for _, w in cases], f"category 映射正确，实={got}")
     # 未知category 不应抛异常
-    r3 = await runner.execute("record_finding", {
+    r3 = await runner.execute("record_finding", RF(**{
         "name": "未知分类", "severity": "low",
-        "matched_at": "http://juice.test/u", "evidence": "e",
+        "matched_at": "http://juice.test/u",
         "payload": "GET /u", "category": "zzz",
-    }, session)
+    }), session)
     check("已登记" in r3, "未知 category 回落而不报错")
 
     print("\n场景6 手工发现进入导出报告（原 bug 的验证点）")
@@ -251,12 +277,12 @@ async def main() -> int:
     check(len(ip_session.result.findings) == 0, "被拦的没有入库")
 
     # 同形态不同主机（子域名 / 多主机业务）必须放行——那是正常业务形态
-    sub = await runner.execute("record_finding", {
+    sub = await runner.execute("record_finding", RF(**{
         "name": "子域越权", "severity": "high",
         "matched_at": "http://api.juice.test/admin",
-        "evidence": "越权读取", "payload": "GET /admin",
-        "category": "idor",
-    }, session)
+        "evidence": "普通用户 token 请求 /admin 返回 200 与管理面板 HTML，与匿名访问的 403 不同，越权成立",
+        "payload": "GET /admin", "category": "idor",
+    }), session)
     check("已登记" in sub, f"同形态不同主机放行：{sub[:60]}")
 
     # 裸主机（没 scheme）也要能识别形态
@@ -274,12 +300,12 @@ async def main() -> int:
     # 模型在测 juice.test 的过程中正当发现了 10.0.0.9（解析 IP / 邻站资产），
     # 它已作为资产入库——往它上面登记发现不该被形态不一致一刀切拦掉
     session.result.assets.append(Asset(kind="ip", value="http://10.0.0.9:9000"))
-    ok_ip = await runner.execute("record_finding", {
+    ok_ip = await runner.execute("record_finding", RF(**{
         "name": "资产 IP 越权", "severity": "medium",
         "matched_at": "http://10.0.0.9:9000/api",
-        "evidence": "越权读取", "payload": "GET /api",
-        "category": "idor",
-    }, session)
+        "evidence": "普通用户 token 请求 /api 返回 200 与全部订单数据，匿名访问返回 401，越权成立",
+        "payload": "GET /api", "category": "idor",
+    }), session)
     check("已登记" in ok_ip, f"资产里已有的主机放行：{ok_ip[:60]}")
     # 没入库的主机照样拦：豁免只认"本会话发现的资产"
     blocked3 = await runner.execute("record_finding", {
@@ -341,11 +367,13 @@ async def main() -> int:
     }, session)
     check("登记失败" in bad_idx and "step_index" in bad_idx,
           f"越界 step_index 被拒：{bad_idx[:60]}")
-    ok_link = await runner.execute("record_finding", {
+    ok_link = await runner.execute("record_finding", RF(**{
         "name": "链上第二步", "severity": "high",
-        "matched_at": "http://juice.test/step2", "evidence": "e", "payload": "GET /step2",
+        "matched_at": "http://juice.test/step2",
+        "evidence": "带上第一步拿到的 token 请求 /step2 返回 200 与内部配置，匿名访问 403，越权成立",
+        "payload": "GET /step2",
         "chain_id": "chain-1", "step_index": 0,
-    }, session)
+    }), session)
     check("已登记" in ok_link, f"合法 chain 关联放行：{ok_link[:50]}")
     linked = [f for f in session.result.findings if f.matched_at.endswith("/step2")][0]
     check(linked.chain_id == "chain-1", f"发现挂上链 ID：{linked.chain_id}")

@@ -122,6 +122,9 @@ class EvidenceMixin:
         chain_id: str = "",
         step_index: int = 0,
         exploit_payload: str = "",
+        vuln_type: str = "",
+        trigger: str = "",
+        impact: str = "",
     ) -> str:
         """登记一条手工验证的漏洞。
 
@@ -141,6 +144,11 @@ class EvidenceMixin:
         * 单行 payload（``GET /api/x?id=1'--``）；
         * 整段原始请求（请求行 + 头 + 空行 + 体）——会被拆成结构化字段，
           报告里就是一份可粘贴到 Burp Repeater 的完整请求。
+
+        **本工具是"提交"，不是"入库"**：七项信息（漏洞类型 / URL / 触发条件 /
+        原始请求 / 原始响应 / 成立依据 / 实际影响）缺一项、含糊一项、无法核实
+        一项，都会被 Finding Validator 拦下并登记成**待验证线索**——不进报告、
+        不计入漏洞数。拦截文案会写明缺什么，补齐后重提即可升级。
         """
         import hashlib
 
@@ -264,6 +272,43 @@ class EvidenceMixin:
 
         body = resp.body or ""
 
+        # ── 质量闸门：七项信息齐全才允许成为"正式漏洞发现" ──────────
+        #
+        # 为什么拦在**构造 Finding 之前**：一旦进了 result.findings，报告、
+        # 数量统计、知识库沉淀就都会认它；事后再删，已经扩散出去的结论
+        # 收不回来（而且"先入库再删"会让快照里留下自相矛盾的痕迹）。
+        try:
+            sev = Severity.parse(severity)
+        except Exception:  # noqa: BLE001
+            sev = Severity.MEDIUM
+
+        from core.validation import FindingValidator, Submission
+
+        validator = FindingValidator()
+        sub = Submission(
+            vuln_type=(vuln_type or "").strip() or name.strip(),
+            url=matched_at.strip(),
+            trigger=str(trigger or "").strip(),
+            raw_request=request_text,
+            raw_response=self._response_for_gate(resp, response_raw),
+            # 成立依据就是 evidence 参数：它的定义本来就是"证据 + 为什么成立"
+            basis=evidence.strip(),
+            impact=str(impact or "").strip(),
+            name=name.strip(),
+            severity=sev.label,
+            category=str(category or ""),
+            cve=[c.strip() for c in (cve or "").split(",") if c.strip()],
+            base_url=str(getattr(session, "target", "") or ""),
+        )
+        verdict = validator.validate(sub)
+        if not verdict.ok:
+            clue = validator.to_clue(sub, verdict, source="agent")
+            stored = session.result.add_clue(clue)
+            return verdict.block_message(
+                stored.clue_id,
+                headline=f"[{sev.label}] {name.strip()} @ {matched_at.strip()[:80]}",
+            )
+
         def _clip(text: str, field: str) -> str:
             if len(text) <= self._MANUAL_FIELD_CAP:
                 return text
@@ -283,10 +328,6 @@ class EvidenceMixin:
             "cve": Category.CVE_PROBE,
         }
         cat = cat_map.get(str(category).lower(), Category.PATH_PROBE)
-        try:
-            sev = Severity.parse(severity)
-        except Exception:  # noqa: BLE001
-            sev = Severity.MEDIUM
 
         # poc_id 用 manual_ 前缀：与探针登记的区分开，便于报告里识别来源
         poc_id = f"manual_{str(category).lower()}_{abs(hash(name)) % 10000:04d}"
@@ -339,16 +380,27 @@ class EvidenceMixin:
             chain_id=chain_id,
             step_index=max(0, int(step_index or 0)),
             exploit_payload=str(exploit_payload or "").strip(),
+            trigger=sub.trigger,
+            impact=sub.impact,
+            # 过了闸门只是一个**信息完整性**结论，不代表漏洞为真——
+            # 真假由证据与人工复核决定，别把它当"可信度"
+            validated=True,
+            validation_note=verdict.reason,
         )
         added = self._merge_findings(session, [f])
         if not added:
             return f"该发现已存在（{poc_id} @ {matched_at[:60]}），未重复登记"
+        # 先前被拦下的同一条线索现在补齐了：销案（保留记录，标记 promoted）
+        promoted = session.result.resolve_clue(validator.clue_id_for(sub), poc_id)
 
         out = [
-            f"已登记：[{sev.label}] {name.strip()}",
+            f"已登记（通过质量闸门）：[{sev.label}] {name.strip()}",
             f"  位置：{matched_at.strip()}",
             f"  payload：{payload_raw[:120]}",
+            f"  校验：{verdict.reason}",
         ]
+        if promoted:
+            out.append("  此前登记过的同名线索已升级为正式发现（线索销案）。")
         if ev.status_code is not None:
             src = f"（来自{attached_from}）" if attached_from else ""
             art = f"，报文已落盘 {ev.artifact}" if ev.artifact else ""
@@ -368,6 +420,24 @@ class EvidenceMixin:
             "  提醒：继续登记其余手工验证的漏洞，全部登记完再调用 export_report。",
         ]
         return "\n".join(out)
+
+    @staticmethod
+    def _response_for_gate(resp, response_raw: str) -> str:
+        """给质量闸门用的响应报文：优先用**解析结果**重建成规范形态。
+
+        模型常把"请求 + 响应"整段塞进 ``response``，直接拿原文去判断
+        "首行是不是状态行"会失真；解析后的对象已经是干净的响应，重建一份
+        更可靠。解析不出状态码（``status_code is None``）时**回退原文**——
+        让闸门看到模型到底给了什么，而不是拿空串替它判"没填"。
+        """
+        if resp is not None and resp.status_code is not None:
+            head = f"HTTP/1.1 {resp.status_code} {resp.reason or ''}".rstrip()
+            lines = [head]
+            lines += [f"{k}: {v}" for k, v in (resp.headers or {}).items()]
+            if resp.body:
+                lines += ["", resp.body]
+            return "\n".join(lines)
+        return str(response_raw or "").strip()
 
     @staticmethod
     def _request_text_for(url: str, method: str) -> str:
@@ -434,6 +504,46 @@ class EvidenceMixin:
         except Exception:  # noqa: BLE001
             return
         del self._recent_http[: -self._RECENT_HTTP_KEEP]
+
+    async def _h_list_clues(self, session, include_promoted: bool = False) -> str:
+        """列出待验证线索——正式发现与线索的**处理路径必须一眼可辨**。"""
+        clues = (
+            list(session.result.pending_clues)
+            if include_promoted
+            else session.result.active_clues()
+        )
+        all_count = len(session.result.pending_clues)
+        if not clues:
+            if all_count:
+                return (
+                    f"当前没有待补填的线索（累计 {all_count} 条，均已升级销案）。"
+                    "传 include_promoted=true 可查看历史记录。"
+                )
+            return (
+                "当前没有待验证线索：所有提交都通过了质量闸门（七项信息齐全）。"
+            )
+        head = (
+            f"待验证线索 {len(clues)} 条——**不计入漏洞数量，也不会出现在报告里**："
+        )
+        lines = [head]
+        for c in clues[:20]:
+            tag = "已升级" if c.status == "promoted" else "待补填"
+            lines.append(f"  · {c.clue_id} [{tag}] {c.label}")
+            if c.severity:
+                lines.append(f"    等级：{c.severity}　来源：{c.source}")
+            if c.missing:
+                lines.append("    缺失字段：" + "、".join(c.missing))
+            for r in c.reasons[:4]:
+                lines.append(f"    - {r[:140]}")
+            if c.status == "promoted":
+                lines.append(f"    已升级为：{c.promoted_to}")
+            else:
+                lines.append(
+                    "    补齐后：record_finding（同一 URL + 同一漏洞类型）→ 自动销案"
+                )
+        if len(clues) > 20:
+            lines.append(f"  …另有 {len(clues) - 20} 条，见 /clues")
+        return "\n".join(lines)
 
     async def _h_backfill_evidence(self, session, **_: Any) -> str:
         """从会话历史回填发现的原始报文（老报告缺响应时用）。

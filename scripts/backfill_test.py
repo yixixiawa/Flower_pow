@@ -127,12 +127,19 @@ def main() -> int:
     print("场景1 record_finding 不再截断长文本")
     sess = Session(target="https://lab.test")
     runner = ToolRunner(FakeCfg(root, evidence_dir=str(root / "evidence")), [], str(tmp))
-    long_ev = "攻击链分步说明：" + "A" * 3000
+    long_ev = (
+        "攻击链分步说明：响应回显 root:x:0:0，与首页内容不同，路径穿越成立。"
+        + "A" * 3000
+    )
     long_fix = "修复建议：" + "B" * 1200
     asyncio.run(runner.execute("record_finding", {
         "name": "长文本发现", "severity": "high", "matched_at": "https://lab.test/a?x=1",
         "evidence": long_ev, "payload": "GET /a?x=1 HTTP/1.1", "remediation": long_fix,
         "category": "lfi",
+        # 七字段契约（2026-11）：触发条件/实际影响必须显式给，响应必须有头有体
+        "trigger": "未认证用户控制 file 参数即可穿越目录，无需任何凭证",
+        "impact": "读取容器内任意文件，实测下载到 94070 字节的 SQLite 库",
+        "response": "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nroot:x:0:0:root:/root:/bin/bash",
     }, sess))
     f = sess.result.findings[0]
     check(len(f.description) == len(long_ev),
@@ -148,7 +155,13 @@ def main() -> int:
                       "content-type: application/json", "", '{"ok":true}'])
     asyncio.run(runner.execute("record_finding", {
         "name": "结构化", "severity": "medium", "matched_at": "https://lab.test/api/x",
-        "evidence": "证据", "payload": req, "response": resp, "category": "authz",
+        "evidence": (
+            "以普通用户 token 请求该接口返回 201 与业务数据，"
+            "匿名访问返回 401，说明鉴权缺失"
+        ),
+        "payload": req, "response": resp, "category": "authz",
+        "trigger": "携带任意已登录用户的 token 调用该接口，无需管理员角色",
+        "impact": "越权创建他人名下的工单，实测新建记录成功并可读取其内容",
     }, sess))
     ev = sess.result.findings[1].evidence
     check(ev.status_code == 201, f"状态行解析出状态码（实={ev.status_code}）")
@@ -195,23 +208,31 @@ def main() -> int:
     })
     out = asyncio.run(r3.execute("record_finding", {
         "name": "IDOR", "severity": "high", "matched_at": "https://lab.test/api/cases/1049",
-        "evidence": "未授权可读", "payload": "GET /api/cases/1049", "category": "idor",
+        "evidence": "以普通用户身份直接请求该 ID 返回 200 与内部备注，未做归属校验",
+        "payload": "GET /api/cases/1049", "category": "idor",
+        "trigger": "任意已登录用户把 URL 里的案件 ID 换成他人 ID 即可越权读取",
+        "impact": "读取他人案件的内部备注，实测拿到 flag{x} 这条内部记录",
     }, s3))
     ev3 = s3.result.findings[0].evidence
     check(ev3.status_code == 200, f"自动补上状态码（实={ev3.status_code}）")
     check("flag{x}" in ev3.body_excerpt, "自动补上响应正文")
     check("最近一次同 URL" in out, "返回值里说明响应来源")
 
-    print("\n场景5 完全没响应时如实报缺，不编造")
+    print("\n场景5 完全没响应时不编造——直接拦成待验证线索")
     s4 = Session(target="https://lab.test")
     r4 = ToolRunner(FakeCfg(root, evidence_dir=str(root / "evidence")), [], str(tmp))
     out = asyncio.run(r4.execute("record_finding", {
         "name": "孤立发现", "severity": "low", "matched_at": "https://lab.test/none",
-        "evidence": "只有一句话", "payload": "GET /none", "category": "other",
+        "evidence": "响应内容与基线不同，疑似存在信息泄露，但当时没保存响应",
+        "payload": "GET /none", "category": "other",
+        "trigger": "直接访问该路径无需认证，参数可控",
+        "impact": "疑似泄露内部配置，尚未确认具体字段",
     }, s4))
-    ev4 = s4.result.findings[0].evidence
-    check(ev4.status_code is None, "不猜状态码")
-    check("没有原始响应报文" in out, "登记结果里明确警告缺响应")
+    # 没有原始响应 = 无法核对，按七字段契约不得成为正式发现
+    check(len(s4.result.findings) == 0, "没有响应就不入库")
+    check(len(s4.result.pending_clues) == 1, "登记为待验证线索")
+    check("原始响应" in out and "已拦截" in out, "返回里点名缺原始响应")
+    check(s4.result.pending_clues[0].raw_response == "", "线索如实记录空响应，不猜状态码")
 
     print("\n场景6 回填：解析历史里的 http_request 结果")
     hist = fake_history([

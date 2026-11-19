@@ -112,5 +112,26 @@ llm:
   disable_thinking: true # 结构化抽取不需要思考链，开它只增加延迟与 token
   reasoning_effort: high # 仅 disable_thinking=false 时生效（low|medium|high）
 
+# ── 接口测试生命周期权限控制（policy/，默认保守：判不出环境一律拒绝 L1/L2）──
+# 规则矩阵见 policy/api_policy.py 的 rules_table_markdown()。
+policy:
+  # 权限控制总开关。关掉 = 回到"只有 readonly 一道闸"的旧行为
+  enabled: true
+  # 未命中 host 绑定表时的默认环境：unknown / production /
+  # dedicated_test / isolated_test。默认 unknown（L1/L2 条件不满足 → 拒绝执行）
+  default_environment: unknown
+  # host 通配 → 环境绑定。要让 L1（创建/修改测试数据）通过，
+  # 目标必须绑到 isolated_test；L2 上传要 dedicated_test 或 isolated_test
+  # environments:
+  #   "192.168.*": isolated_test
+  #   "10.0.2.*": dedicated_test
+  # 显式审批表：L3 命令（批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行）
+  # 只有出现在这里（且目标为测试环境 + readonly off）才有明示出路；
+  # 生产环境的危险操作不因审批解锁
+  # approvals:
+  #   "SQL 注入验证": true
+  # 审计日志（data/policy/audit.jsonl）：允许、拒绝、审批全部留痕
+  audit: true
+
 output_dir: ./output
 data_dir: ./data

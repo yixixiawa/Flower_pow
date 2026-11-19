@@ -38,6 +38,11 @@ class Evidence:
     error: str = ""
     # 证据落盘后的相对路径
     artifact: str = ""
+    # ── 三层隔离（Target → ScanRun → Finding）────────────────────
+    # 证据必须继承**产生它时的扫描轮次**：换目标或新开一轮扫描后，
+    # 旧证据不能再被当成新目标的 PoC 贴进报告（串台事故的真实路径）。
+    # 没有显式指定时由 ``ScanResult.add_findings`` 按当前作用域统一打标。
+    run_id: str = ""
     # ── POC 执行过程（报告里的「怎么执行的」就靠这三个字段）──
     # 触发的 POC 定义 id（manual_ 前缀的表示手工登记）
     poc_id: str = ""
@@ -69,6 +74,7 @@ class Evidence:
             "elapsed_ms": self.elapsed_ms,
             "error": self.error,
             "artifact": self.artifact,
+            "run_id": self.run_id,
             "poc_id": self.poc_id,
             "poc_name": self.poc_name,
             "payload_sent": self.payload_sent,
@@ -93,6 +99,7 @@ class Evidence:
             elapsed_ms=int(d.get("elapsed_ms") or 0),
             error=str(d.get("error") or ""),
             artifact=str(d.get("artifact") or ""),
+            run_id=str(d.get("run_id") or ""),
             poc_id=str(d.get("poc_id") or ""),
             poc_name=str(d.get("poc_name") or ""),
             payload_sent=str(d.get("payload_sent") or ""),
@@ -239,6 +246,87 @@ def _status_from_dict(d: dict[str, Any]) -> FindingStatus:
 
 
 @dataclass(slots=True)
+class PendingClue:
+    """一条**待验证线索**——被 Finding Validator 拦下的提交。
+
+    为什么不能直接丢掉：模型看到的"可疑现象"往往是真的，只是还没验证到
+    能写进报告的程度。丢掉等于让下一轮从头再找；留着并写清缺什么，人工
+    或模型补一次就能升级成正式发现。
+
+    为什么不能塞进 ``findings`` 只把 status 设成待复核：两者的**生命周期
+    不同**。正式发现要出现在漏洞列表、报告章节、知识库与数量统计里；
+    线索只活在会话里，供复核与补填。混在一起，下游任何一处忘了过滤就会
+    把线索当成漏洞（"待复核"那一档至少还有证据与定级，线索可能连响应都
+    没有）。
+    """
+
+    clue_id: str
+    created_at: float
+    vuln_type: str = ""
+    name: str = ""
+    severity: str = ""
+    url: str = ""
+    trigger: str = ""
+    raw_request: str = ""
+    raw_response: str = ""
+    basis: str = ""
+    impact: str = ""
+    # 拦截原因：缺失/模糊的字段标签 + 逐条明细（报告外可查，便于补填）
+    missing: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    # agent = 提交时被拦；report-audit = 导出前复核被拦
+    source: str = "agent"
+    # pending 待补填 / promoted 已升级为正式发现
+    status: str = "pending"
+    promoted_to: str = ""
+
+    @property
+    def label(self) -> str:
+        return f"{self.vuln_type or self.name or '未命名线索'} @ {self.url or '-'}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "clue_id": self.clue_id,
+            "created_at": self.created_at,
+            "vuln_type": self.vuln_type,
+            "name": self.name,
+            "severity": self.severity,
+            "url": self.url,
+            "trigger": self.trigger,
+            "raw_request": self.raw_request,
+            "raw_response": self.raw_response,
+            "basis": self.basis,
+            "impact": self.impact,
+            "missing": list(self.missing),
+            "reasons": list(self.reasons),
+            "source": self.source,
+            "status": self.status,
+            "promoted_to": self.promoted_to,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PendingClue":
+        return cls(
+            clue_id=str(d.get("clue_id") or "clue_unknown"),
+            created_at=float(d.get("created_at") or 0.0),
+            vuln_type=str(d.get("vuln_type") or ""),
+            name=str(d.get("name") or ""),
+            severity=str(d.get("severity") or ""),
+            url=str(d.get("url") or ""),
+            trigger=str(d.get("trigger") or ""),
+            raw_request=str(d.get("raw_request") or ""),
+            raw_response=str(d.get("raw_response") or ""),
+            basis=str(d.get("basis") or ""),
+            impact=str(d.get("impact") or ""),
+            missing=[str(x) for x in (d.get("missing") or [])],
+            reasons=[str(x) for x in (d.get("reasons") or [])],
+            source=str(d.get("source") or "agent"),
+            status=str(d.get("status") or "pending"),
+            promoted_to=str(d.get("promoted_to") or ""),
+        )
+
+
+@dataclass(slots=True)
 class Finding:
     """一条漏洞发现。"""
 
@@ -249,6 +337,13 @@ class Finding:
     description: str = ""
     remediation: str = ""
     matched_at: str = ""
+    # ── 三层隔离：Target → ScanRun → Finding ─────────────────────
+    # ``target_id`` 目标归属、``run_id`` 扫描归属。为什么不放在 evidence
+    # 上就够了：定级、统计、报告过滤都要按作用域算，逐条查 evidence 太脆。
+    # 两个都留空 = 旧快照（历史数据），报告过滤时视为属于当前作用域，
+    # 不然老会话一恢复就什么都导不出来。
+    target_id: str = ""
+    run_id: str = ""
     evidence: Evidence | None = None
     references: list[str] = field(default_factory=list)
     cve: list[str] = field(default_factory=list)
@@ -285,10 +380,26 @@ class Finding:
     dismissed: bool = False
     dismiss_reason: str = ""
     dismissed_at: float = 0.0
+    # 排除前的定级——撤销时原样恢复（"撤销"就该是撤销，不是重新判一遍）。
+    # 旧快照没有这个字段，restore 时退回"按证据重算"。
+    status_before_dismiss: str = ""
     # ── 攻击链关联 ──────────────────────────────────────────────
     chain_id: str = ""
     step_index: int = 0
     exploit_payload: str = ""
+    # ── 七字段契约里"必须由人/模型判断"的两项 ────────────────────
+    # 其余五项能从证据推（URL / 请求 / 响应 / 依据），这两项推不出来：
+    # 触发前提与真实影响是结论，不是数据。报告正文会原样展示它们。
+    trigger: str = ""
+    impact: str = ""
+    # ── 准入检查结论 ─────────────────────────────────────────────
+    # ``validated`` = 已通过**其适用的**准入检查：手工发现过七字段闸门
+    # （core/validation），自动探针过二次验证的证据评分（core/state/quality）。
+    # 它只说明"报告所需的信息/证据到位"，**不代表漏洞一定为真**。
+    # 旧快照没有这个字段，默认 False：导出前复核会重新判定，不靠一个
+    # 可能过期的标记放行。
+    validated: bool = False
+    validation_note: str = ""
 
     @property
     def active(self) -> bool:
@@ -327,6 +438,8 @@ class Finding:
             "description": self.description,
             "remediation": self.remediation,
             "matched_at": self.matched_at,
+            "target_id": self.target_id,
+            "run_id": self.run_id,
             "evidence": self.evidence.to_dict() if self.evidence else None,
             "references": self.references,
             "cve": self.cve,
@@ -346,9 +459,14 @@ class Finding:
             "dismissed": self.dismissed,
             "dismiss_reason": self.dismiss_reason,
             "dismissed_at": self.dismissed_at,
+            "status_before_dismiss": self.status_before_dismiss,
             "chain_id": self.chain_id,
             "step_index": self.step_index,
             "exploit_payload": self.exploit_payload,
+            "trigger": self.trigger,
+            "impact": self.impact,
+            "validated": self.validated,
+            "validation_note": self.validation_note,
         }
 
     @classmethod
@@ -361,6 +479,8 @@ class Finding:
             description=str(d.get("description") or ""),
             remediation=str(d.get("remediation") or ""),
             matched_at=str(d.get("matched_at") or ""),
+            target_id=str(d.get("target_id") or ""),
+            run_id=str(d.get("run_id") or ""),
             evidence=Evidence.from_dict(d.get("evidence")),
             references=[str(x) for x in (d.get("references") or [])],
             cve=[str(x) for x in (d.get("cve") or [])],
@@ -379,9 +499,15 @@ class Finding:
             dismissed=bool(d.get("dismissed", False)),
             dismiss_reason=str(d.get("dismiss_reason") or ""),
             dismissed_at=float(d.get("dismissed_at") or 0.0),
+            status_before_dismiss=str(d.get("status_before_dismiss") or ""),
             chain_id=str(d.get("chain_id") or ""),
             step_index=int(d.get("step_index") or 0),
             exploit_payload=str(d.get("exploit_payload") or ""),
+            trigger=str(d.get("trigger") or ""),
+            impact=str(d.get("impact") or ""),
+            # 旧快照没有这两项：validated 按 False 处理，导出前会重新校验
+            validated=bool(d.get("validated", False)),
+            validation_note=str(d.get("validation_note") or ""),
         )
 
 
@@ -400,6 +526,8 @@ def dismiss_finding(f: Finding, reason: str) -> None:
     f.dismissed = True
     f.dismiss_reason = (reason or "").strip() or "误报"
     f.dismissed_at = time.time()
+    if not f.status_before_dismiss:
+        f.status_before_dismiss = f.status.value
     f.status = FindingStatus.REJECTED
     f.status_reason = f"人工判定误报：{f.dismiss_reason}"
     if "dismissed" not in f.tags:
@@ -409,14 +537,20 @@ def dismiss_finding(f: Finding, reason: str) -> None:
 def restore_finding(f: Finding) -> None:
     """撤销误报排除，让它重新计入有效发现。
 
-    定级按**证据重新计算**（:func:`core.state.quality.decide_status`），
-    不复原到"排除前的那个值"：证据评分可能在此期间被补算过，
-    记一个陈旧快照反而会让撤销后的状态失真。
+    优先恢复到**排除前记录的档位**（"撤销"的语义就是撤销）；老快照没记过
+    那一档时，按当前证据重新算一遍（:func:`core.state.quality.decide_status`），
+    而不是硬塞一个 ``CONFIRMED``——那等于绕过证据门槛。
     """
+    prev = (f.status_before_dismiss or "").strip()
     f.dismissed = False
     f.dismiss_reason = ""
     f.dismissed_at = 0.0
+    f.status_before_dismiss = ""
     f.tags = [t for t in f.tags if t != "dismissed"]
+    if prev:
+        f.status = FindingStatus.parse(prev)
+        f.status_reason = f"撤销人工排除，恢复为排除前的档位：{f.status.label}"
+        return
     f.status, f.status_reason = decide_status(
         f.quality,
         verdict=f.verdict,
@@ -450,16 +584,74 @@ def _mark_if_excluded(target: str, f: Finding) -> bool:
 
 
 @dataclass(slots=True)
+class ScanRun:
+    """一次扫描任务（三层隔离的第二层：Target → ScanRun → Finding）。
+
+    每次**执行扫描**都开一个新的 run：工具调用、证据、漏洞发现都继承
+    当前 run_id。它的价值在于把"这批发现是哪一次扫描跑出来的"变成
+    结构化事实，而不是靠"会话没换过目标"这种约定——约定总有被忘记的
+    时候（``/target`` 串台事故就是这么来的）。
+    """
+
+    run_id: str
+    target_id: str
+    started_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+    # running | done | aborted
+    status: str = "running"
+    # 人可读的标签（"目标 <url>"、"第 3 轮剧本"……），只用于展示
+    label: str = ""
+
+    def finish(self, status: str = "done") -> None:
+        self.finished_at = time.time()
+        self.status = status
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "target_id": self.target_id,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "status": self.status,
+            "label": self.label,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ScanRun":
+        d = d or {}
+        return cls(
+            run_id=str(d.get("run_id") or ""),
+            target_id=str(d.get("target_id") or ""),
+            started_at=float(d.get("started_at") or 0.0),
+            finished_at=float(d.get("finished_at") or 0.0),
+            status=str(d.get("status") or "done"),
+            label=str(d.get("label") or ""),
+        )
+
+
+@dataclass(slots=True)
 class ScanResult:
     """一次扫描的完整状态快照——会话文件就是它的序列化。"""
 
     target: str
     session_id: str = ""
+    # ── 三层隔离的作用域字段 ─────────────────────────────────────
+    # ``target_id`` 归一后的当前目标；``current_run_id`` 当前扫描轮次。
+    # ``runs`` 保存本会话所有扫描任务的台账（含历史轮次，供追溯）。
+    # 旧快照没有这些字段——缺省为空，报告过滤按"历史数据放行"处理。
+    target_id: str = ""
+    current_run_id: str = ""
+    runs: list[ScanRun] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
     fingerprints: list[Fingerprint] = field(default_factory=list)
     assets: list[Asset] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    # ── 待验证线索（被 Finding Validator 拦下的提交）─────────────────
+    # **刻意不写进 ``to_dict()``**：那份字典同时是 JSON 报告的正文，
+    # 线索按设计不得进入正式报告。快照另走 ``clues_dict()``
+    # （见 core/session/session.py），保证"看得到、但不算漏洞"。
+    pending_clues: list[PendingClue] = field(default_factory=list)
     # Agent 主动提取并复用的上下文变量，如 jobNumber / authCode / tmpToken。
     context_vars: dict[str, Any] = field(default_factory=dict)
     attack_chains: list[AttackChain] = field(default_factory=list)
@@ -480,6 +672,76 @@ class ScanResult:
     @property
     def duration(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
+
+    # ── 三层隔离：Target → ScanRun → Finding ─────────────────────
+    def _scope_target(self) -> str:
+        return self.target_id or self.target
+
+    def current_run(self) -> ScanRun | None:
+        for r in self.runs:
+            if r.run_id == self.current_run_id:
+                return r
+        return None
+
+    def new_run(self, label: str = "") -> ScanRun:
+        """开一个新的扫描轮次：之后所有工具调用、证据与发现都归它。
+
+        为什么要 uuid 而不是时间戳：同一秒内可能连开两轮（自动轮询、
+        连续切换目标），秒级 id 会撞车，隔离就成了摆设。
+        """
+        import uuid
+
+        run = ScanRun(
+            run_id=uuid.uuid4().hex[:12],
+            target_id=self._scope_target(),
+            label=label or f"扫描 {self._scope_target()}",
+        )
+        # 上一轮还没收尾就开新一轮：如实标记为中止，而不是留个假"running"
+        prev = self.current_run()
+        if prev is not None and prev.status == "running":
+            prev.finish(status="aborted")
+        self.runs.append(run)
+        self.current_run_id = run.run_id
+        return run
+
+    def scoped_findings(self) -> list[Finding]:
+        """**报告导出的唯一取数口**：只留 target 与 run 都对得上当前
+        作用域的发现。
+
+        过滤规则（宽容旧数据）：
+
+        * 发现带 ``target_id`` 且与当前目标不同 → 剔除（串台的主体路径）；
+        * 发现带 ``run_id`` 且不是当前轮次 → 剔除（上一轮扫描的残留）；
+        * 两个都为空 = 旧快照 / 未打标的历史数据 → 放行，否则老会话
+          一恢复就什么都导不出来。
+
+        新数据走 ``add_findings`` 时必然被打上完整标记，所以对新会话
+        这等价于严格等值过滤（``target_id == 当前 and run_id == 当前``）。
+        """
+        cur_t = self._scope_target()
+        cur_r = self.current_run_id
+        out: list[Finding] = []
+        for f in self.findings:
+            if f.target_id and cur_t and f.target_id != cur_t:
+                continue
+            if f.run_id and cur_r and f.run_id != cur_r:
+                continue
+            out.append(f)
+        return out
+
+    def scoped_view(self) -> "ScanResult":
+        """报告 writer 专用的浅拷贝视图：findings 过滤到当前作用域。
+
+        浅拷贝意味着 Finding 对象本身是共享的——writer 里的导出前复核
+        （改状态、登记线索）仍然写回原对象，会话快照能如实记录；而
+        ``counts()`` / ``by_severity()`` / ``to_dict()`` 这些全部基于
+        过滤后的列表运算，报告不会再把别的目标/别的轮次算进来。
+        """
+        import copy
+
+        view = copy.copy(self)
+        view.findings = self.scoped_findings()
+        return view
 
     # ── 三档状态：正式列表 vs 待复核 vs 误报 ─────────────────────
     #
@@ -524,6 +786,39 @@ class ScanResult:
             c[f.severity.value] += 1
         return c
 
+    # ── 待验证线索 ────────────────────────────────────────────────
+    def active_clues(self) -> list[PendingClue]:
+        """仍未升级的线索（已升级的保留记录，但不再需要补填）。"""
+        return [c for c in self.pending_clues if c.status != "promoted"]
+
+    def add_clue(self, clue: PendingClue) -> PendingClue:
+        """登记线索：同一 ID 覆盖而不是追加。
+
+        为什么覆盖：同一条线索通常会被反复提交（模型补一次、又不全、再补），
+        每次追加会在清单里堆出一串同名条目，复核时根本分不清哪条是最新的。
+        ``created_at`` 保留**第一次**看到它的时间——那才是"这条线索多久没
+        查清"的真实起点。
+        """
+        for i, old in enumerate(self.pending_clues):
+            if old.clue_id == clue.clue_id:
+                clue.created_at = old.created_at or clue.created_at
+                self.pending_clues[i] = clue
+                return clue
+        self.pending_clues.append(clue)
+        return clue
+
+    def resolve_clue(self, clue_id: str, poc_id: str) -> bool:
+        """线索升级为正式发现：打上 promoted，保留原始记录备查。"""
+        for c in self.pending_clues:
+            if c.clue_id == clue_id:
+                c.status = "promoted"
+                c.promoted_to = poc_id
+                return True
+        return False
+
+    def clues_dict(self) -> list[dict[str, Any]]:
+        return [c.to_dict() for c in self.pending_clues]
+
     def by_severity(self) -> dict[str, list[Finding]]:
         """按严重度分组，**只含已确认漏洞**（待复核/误报另有附录）。"""
         out: dict[str, list[Finding]] = {}
@@ -533,8 +828,8 @@ class ScanResult:
             out.setdefault(f.severity.value, []).append(f)
         return out
 
-    def add_findings(self, incoming: list[Finding]) -> int:
-        """发现进入会话的**唯一收口**：去重 → 套用误报排除 → 重排。
+    def add_findings(self, incoming: list[Finding], *, restamp: bool = False) -> int:
+        """发现进入会话的**唯一收口**：去重 → 打标 → 套用误报排除 → 重排。
 
         为什么要有这个收口：以前各处直接 ``result.findings.extend(...)``
         （planner 6 处、scheduler、repl 各一处），于是任何"入库策略"都只能
@@ -542,8 +837,16 @@ class ScanResult:
         策略——本该在第一轮就自动挂上"历史误报"标记的发现，从 planner 那条
         路径进来时会被当成新发现重新报出来。
 
+        ``restamp=True`` 用于**并入外部扫描结果**（如 /auto 把 Scheduler.scan
+        的结果并回会话）：那次扫描是代表当前会话执行的，发现归属必须改判到
+        当前作用域，否则它们带着扫描任务的 run_id 进来，报告按 run 过滤时
+        会被当成"别的轮次"整体漏掉。默认 False——带异构标记进来的发现视为
+        串台数据，保留原标记，由报告过滤剔除。
+
         返回真正新增的条数。
         """
+        cur_t = self._scope_target()
+        cur_r = self.current_run_id
         seen = {(f.poc_id, f.matched_at) for f in self.findings}
         added = 0
         for f in incoming:
@@ -551,6 +854,18 @@ class ScanResult:
             if k in seen:
                 continue
             seen.add(k)
+            # ── 三层隔离打标：发现的归属在**入库时**固定下来 ─────────
+            # 这是发现进会话的唯一收口，在这里打标才能保证"漏一处就串台"
+            # 不可能发生。已有标记的（显式带作用域进来的）默认不覆盖——
+            # 带着别的目标/轮次标记进来的发现，会在报告过滤时被剔除，
+            # 而不是被改写归属后混进当前报告；restamp 场景例外（见上）。
+            if restamp or not f.target_id:
+                f.target_id = cur_t
+            if restamp or not f.run_id:
+                f.run_id = cur_r
+            # 证据同样继承扫描轮次：报告里的报文必须能回答"哪一轮跑出来的"
+            if f.evidence is not None and (restamp or not f.evidence.run_id):
+                f.evidence.run_id = f.run_id
             _mark_if_excluded(self.target, f)
             self.findings.append(f)
             added += 1
@@ -582,6 +897,9 @@ class ScanResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "target": self.target,
+            "target_id": self._scope_target(),
+            "current_run_id": self.current_run_id,
+            "runs": [r.to_dict() for r in self.runs],
             "session_id": self.session_id,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -610,11 +928,20 @@ class ScanResult:
         r = cls(
             target=str(d.get("target") or ""),
             session_id=str(d.get("session_id") or ""),
+            target_id=str(d.get("target_id") or ""),
+            current_run_id=str(d.get("current_run_id") or ""),
+            runs=[ScanRun.from_dict(x) for x in (d.get("runs") or []) if isinstance(x, dict)],
             started_at=float(d.get("started_at") or time.time()),
             finished_at=float(d.get("finished_at") or 0.0),
             fingerprints=[Fingerprint.from_dict(x) for x in (d.get("fingerprints") or [])],
             assets=[Asset(**x) for x in (d.get("assets") or []) if isinstance(x, dict)],
             findings=[Finding.from_dict(x) for x in (d.get("findings") or [])],
+            # 线索只来自会话快照（报告 JSON 不含这个键）
+            pending_clues=[
+                PendingClue.from_dict(x)
+                for x in (d.get("pending_clues") or [])
+                if isinstance(x, dict)
+            ],
             context_vars=dict(d.get("context_vars") or {}),
             attack_chains=[AttackChain.from_dict(x) for x in (d.get("attack_chains") or [])],
             phases={str(k): float(v) for k, v in (d.get("phases") or {}).items()},

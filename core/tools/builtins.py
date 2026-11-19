@@ -485,35 +485,60 @@ BUILTINS: list[BuiltinTool] = [
             "需要特定闭合语法的注入、需要 null byte 的文件读取等）"
             "必须用这个工具登记，否则它只存在于对话里——"
             "报告和 findings 列表都看不到，等于没测。"
+            "**这是「提交」不是「入库」**：漏洞类型、受影响 URL、触发条件、"
+            "原始请求、原始响应、成立依据、实际影响七项必须齐全、具体、可核实；"
+            "缺一项或写套话会被拦下并转成「待验证线索」（不进报告、不计漏洞数），"
+            "返回里会写明缺什么，补齐后重提即可。"
             "**report 的 PoC 段直接取自这里登记的原始报文**："
             "把 http_request 的响应整段填进 response、请求填进 payload，"
             "报告里就是一份可直接粘贴复现的 Burp 式报文；"
-            "不填 response 时报告那条发现只有请求没有响应，"
-            "（会自动尝试附上最近一次同 URL 的 http_request 响应）。"
+            "不填 response 时报告那条发现只有请求没有响应。"
         ),
         params=_obj(
             {
                 "name": {"type": "string", "description": "漏洞名，如「SQL 注入」"},
+                "vuln_type": {
+                    "type": "string",
+                    "description": (
+                        "漏洞类型（可与 name 相同，但**不能**只写「漏洞」「风险」）："
+                        "SQL 注入 / 任意文件读取 / 越权访问 / SSRF / RCE …"
+                    ),
+                },
                 "severity": {
                     "type": "string",
                     "enum": ["critical", "high", "medium", "low", "info"],
                 },
                 "matched_at": {
                     "type": "string",
-                    "description": "漏洞所在的完整 URL 或路径，必须能复现",
+                    "description": "漏洞所在的完整 URL（含 http(s):// 与路径），必须能复现",
+                },
+                "trigger": {
+                    "type": "string",
+                    "description": (
+                        "**触发条件，必填**：什么前提下会触发——参数在哪个位置、"
+                        "需要什么权限/凭证、依赖什么前置状态。只重复 URL 或类型不合格"
+                    ),
+                },
+                "impact": {
+                    "type": "string",
+                    "description": (
+                        "**实际影响，必填**：能造成什么具体后果——读到哪些数据、"
+                        "越权到什么角色、执行了什么命令。「存在安全风险」这类套话"
+                        "会被拦下"
+                    ),
                 },
                 "evidence": {
                     "type": "string",
                     "description": (
-                        "完整的证据与研判：回显内容、对比结果、攻击链步骤、"
-                        "以及为什么判定成立。**不要压缩成一句话**——"
-                        "报告里这一栏就是漏洞说明，写得越具体交付方越省事"
+                        "**漏洞成立依据，必填**：回显内容、对比结果、为什么判定成立。"
+                        "要指出可核对的东西（命中特征、状态码、与基线的差异），"
+                        "**不要压缩成一句话**——报告里这一栏就是漏洞说明"
                     ),
                 },
                 "payload": {
                     "type": "string",
                     "description": (
-                        "**实际发出的请求**，必填。单行 payload（如"
+                        "**实际发出的请求，必填**。单行 payload（如"
                         "「GET /rest/products/search?q=test')) UNION SELECT 1--」）"
                         "或整段原始请求（请求行 + 请求头 + 空行 + 请求体）都行；"
                         "给整段时会被拆成结构化字段，报告里就是一份完整请求"
@@ -522,10 +547,10 @@ BUILTINS: list[BuiltinTool] = [
                 "response": {
                     "type": "string",
                     "description": (
-                        "**原始响应报文**（Burp 式：状态行 + 响应头 + 空行 + 响应体），"
+                        "**原始响应报文，必填**（Burp 式：状态行 + 响应头 + 空行 + 响应体），"
                         "把 http_request 的返回整段粘进来即可。"
-                        "报告 PoC 段的 <<< 响应: 直接用它——"
-                        "**没有它，这条发现的 PoC 只有请求，对方无法比对**"
+                        "只有「HTTP 200」不合格——没有响应头/体就无法核对漏洞特征。"
+                        "报告 PoC 段的 <<< 响应: 直接用它"
                     ),
                 },
                 "expected": {
@@ -551,7 +576,28 @@ BUILTINS: list[BuiltinTool] = [
                     "description": "实际用于串联下一步的载荷或变量使用方式",
                 },
             },
-            ["name", "severity", "matched_at", "evidence", "payload"],
+            [
+                "name", "severity", "matched_at", "evidence", "payload",
+                "trigger", "impact",
+            ],
+        ),
+    ),
+    BuiltinTool(
+        name="list_clues",
+        group="报告",
+        desc=(
+            "查看**待验证线索**：被质量闸门拦下的提交（缺原始响应、缺实际影响、"
+            "写套话……）。线索不计入漏洞数、不在报告里；按返回的缺失字段补齐后，"
+            "用同一 URL + 同一漏洞类型重新 record_finding 即可升级为正式发现。"
+        ),
+        params=_obj(
+            {
+                "include_promoted": {
+                    "type": "boolean",
+                    "description": "是否连已升级销案的线索一起列出（默认 false）",
+                },
+            },
+            [],
         ),
     ),
     BuiltinTool(

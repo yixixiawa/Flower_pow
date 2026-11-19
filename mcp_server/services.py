@@ -58,6 +58,10 @@ def finding_brief(f: Any) -> dict[str, Any]:
         "status": _enum_value(getattr(f, "status", None)) or "confirmed",
         "status_label": getattr(getattr(f, "status", None), "label", ""),
         "status_reason": getattr(f, "status_reason", ""),
+        # 七字段契约里由人/模型判断的两项 + 是否过闸门
+        "trigger": getattr(f, "trigger", ""),
+        "impact": getattr(f, "impact", ""),
+        "validated": bool(getattr(f, "validated", False)),
         "evidence_score": round(float(getattr(f, "evidence_score", 0.0) or 0.0), 2),
         "confirmed": bool(getattr(f, "confirmed", True)),
         "needs_review": bool(getattr(f, "needs_review", False)),
@@ -102,6 +106,11 @@ def result_summary(result: Any, *, max_findings: int = 40) -> dict[str, Any]:
         "findings_confirmed": len(confirmed),
         "findings_needs_review": len(active) - len(confirmed),
         "findings_dismissed": len(findings) - len(active),
+        # 待验证线索：被质量闸门拦下的提交，**不在 findings 里**，也不进报告。
+        # 单独给一个计数，消费方才知道"还有东西没验证完"。
+        "pending_clues": len(
+            result.active_clues()
+        ) if callable(getattr(result, "active_clues", None)) else 0,
         "status_counts": (
             result.status_counts() if callable(getattr(result, "status_counts", None)) else {}
         ),
