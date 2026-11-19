@@ -178,14 +178,18 @@ class RuleRegistry:
         safe = safe.replace(">", "_").replace("|", "_").strip() or "_unnamed"
         return self.publish_dir / self.cfg.name / f"{safe}.yaml"
 
-    def publish_all(self, commit: str) -> tuple[int, list[str]]:
+    def publish_all(self, commit: str, dest: Path | None = None) -> tuple[int, list[str]]:
         """按当前清单全量重发布 flower 规则。返回 (数量, 错误列表)。
 
-        先清仓库发布目录再逐条写：保证"清单与磁盘一致"，
-        删掉的规则不会在 poc/community 里留尸体。
+        先清目标目录再逐条写：保证"清单与磁盘一致"，
+        删掉的规则不会在目标目录里留尸体。
+
+        ``dest`` 为空发布到正式执行目录（``poc/community/<repo>/``）；
+        给定路径则发布到该目录——**隔离暂存区**（P2-12：外部更新先入
+        暂存区，审核通过后才进执行目录）就靠这个参数落地。
         """
         errors: list[str] = []
-        target = self.publish_dir / self.cfg.name
+        target = Path(dest) if dest is not None else self.publish_dir / self.cfg.name
         if target.exists():
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
@@ -195,8 +199,10 @@ class RuleRegistry:
                 continue
             try:
                 data = self.sync.read_file(entry.get("file") or "")
-                dest = self._publish_path(rid)
-                dest.write_bytes(data)
+                # 文件名 = _publish_path 的文件名部分；目录以 target 为准
+                dest_file = target / (self._publish_path(rid).name)
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_bytes(data)
                 n += 1
             except (OSError, GitSyncError) as exc:
                 errors.append(f"发布 {rid} 失败: {exc}")

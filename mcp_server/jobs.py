@@ -191,6 +191,15 @@ class JobRegistry:
         if top_k and top_k > 0:
             cfg.rag.top_k = int(top_k)
 
+        # 统一策略入口（P1-10）：MCP 后台扫描与 CLI/Agent 过同一份 policy
+        # 判定——生产环境拒绝起任务，未绑定环境降级为只读侦察。
+        from policy.enforcer import active_scan_check, scoped_scan_config
+
+        allowed, msg = active_scan_check(cfg, target)
+        if not allowed:
+            raise ValueError(msg)
+        cfg, _note = scoped_scan_config(cfg, target)
+
         job = ScanJob(target, cfg, save_evidence=save_evidence)
         with self._lock:
             self._jobs[job.job_id] = job

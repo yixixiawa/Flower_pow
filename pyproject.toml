@@ -43,6 +43,8 @@ include = [
     "llm/**/*.py",
     "mcp_server/**/*.py",
     "output/**/*.py",
+    "policy/**/*.py",
+    "intel/**/*.py",
     "poc/**/*.yaml",
 ]
 

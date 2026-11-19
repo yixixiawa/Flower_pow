@@ -50,8 +50,18 @@ class _AutoMixin(_Base):
             self.runner.approver = self._auto_approve
 
         from core.scheduler import Scheduler
+        from policy.enforcer import active_scan_check, scoped_scan_config
 
-        sched = Scheduler(self.cfg, approver=self._auto_approve)
+        # 统一策略入口（P1-10）：/auto 起的 Scheduler 与 CLI/MCP 同一口径
+        allowed, msg = active_scan_check(self.cfg, self.session.target)
+        if not allowed:
+            print(f"\n[!] {msg}")
+            return
+        cfg, note = scoped_scan_config(self.cfg, self.session.target)
+        if note:
+            print(f"  [策略] {note}")
+
+        sched = Scheduler(cfg, approver=self._auto_approve)
         print(f"\n▶ 全自动开始：{self.session.target}（Ctrl+C 可中断）")
         t0 = _t.time()
         result = None

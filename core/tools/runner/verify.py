@@ -72,9 +72,15 @@ class VerifyMixin:
 
     async def _h_run_pipeline(self, session, url: str = "") -> str:
         from core.scheduler import Scheduler
+        from policy.enforcer import active_scan_check, scoped_scan_config
 
         target = self._target_of(session, url)
-        sched = Scheduler(self.cfg)
+        # 统一策略入口（P1-10）：完整流水线与 Agent 逐请求闸门同一份 policy
+        allowed, msg = active_scan_check(self.cfg, target)
+        if not allowed:
+            return f"【已拦截】（策略）{msg}"
+        cfg, note = scoped_scan_config(self.cfg, target)
+        sched = Scheduler(cfg)
         res = await sched.scan(target, verbose=False)
         a = self._merge_assets(session, res.assets)
         f = self._merge_findings(session, res.findings)

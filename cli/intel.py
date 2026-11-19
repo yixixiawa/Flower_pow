@@ -47,6 +47,7 @@ def _print_summary(results: list[dict]) -> None:
     t.add_column("下架", justify="right")
     t.add_column("非法", justify="right")
     t.add_column("发布", justify="right")
+    t.add_column("暂存", justify="right")
     t.add_column("备注", style="dim")
     for r in results:
         status = r.get("status") or "?"
@@ -70,6 +71,7 @@ def _print_summary(results: list[dict]) -> None:
             str(r.get("removed", 0)),
             str(r.get("invalid", 0)),
             str(r.get("published", 0)),
+            str(r.get("staged", 0)),
             note[:80],
         )
     console.print(t)
@@ -124,17 +126,61 @@ def check(
 def update(
     repo: str = typer.Option(None, "--repo", help="只更新指定仓库"),
     force: bool = typer.Option(False, "--force", help="忽略 SHA 记录，强制全量重注册"),
+    publish: bool = typer.Option(
+        False, "--publish",
+        help="审核通过：直接发布到执行目录 poc/community（默认先进隔离暂存区）",
+    ),
     config: str = typer.Option(None, "--config", "-c"),
 ) -> None:
-    """执行增量更新：只处理上次同步以来变化的 YAML 并发布到 poc/community。"""
+    """执行增量更新：只处理上次同步以来变化的 YAML。
+
+    默认先入隔离暂存区（data/updater/staging/<repo>/，P2-12 供应链隔离），
+    审核后用 `intel publish` 发布到执行目录；加 --publish 表示已审核，
+    跳过暂存直接发布。
+    """
     upd = _updater(config)
-    results = upd.update(repo, force=force)
+    results = upd.update(repo, force=force, publish=True if publish else None)
     _print_summary(results)
     for w in upd.warnings:
         console.print(f"[dim]· {w}[/dim]")
+    staged_any = any(r.get("staged") for r in results)
+    if staged_any:
+        console.print(
+            "[dim]· 本次更新在暂存区（data/updater/staging），未进执行目录；"
+            "审核后运行 flower-pow intel publish 发布[/dim]"
+        )
     changed = any(r.get("status") == "updated" for r in results)
     if changed:
         console.print("[dim]· 规则已变化，建议运行 flower-pow index 刷新 RAG 索引[/dim]")
+
+
+# ── intel publish（暂存区 → 执行目录）───────────────────────────
+
+
+@intel_app.command("publish")
+def publish(
+    repo: str = typer.Argument(..., help="要发布的仓库名，如 nuclei / flower"),
+    config: str = typer.Option(None, "--config", "-c"),
+) -> None:
+    """把暂存区里已审核的规则发布到执行目录 poc/community/<repo>/。
+
+    发布前会对暂存内容**再校验一遍**：暂存区只是隔离，不是信任。
+    """
+    from intel.updater.git_sync import GitSyncError
+
+    upd = _updater(config)
+    try:
+        result = upd.promote(repo)
+    except GitSyncError as exc:
+        err.print(f"[red]发布失败：{exc}[/red]")
+        raise typer.Exit(1)
+    console.print(
+        f"[green]✓[/green] {result['repo']} 已发布 {result['published']} 条规则到执行目录"
+    )
+    for e in result["errors"]:
+        err.print(f"[yellow]![/yellow] {e}")
+    if result["published"]:
+        console.print("[dim]· 建议运行 flower-pow index 刷新 RAG 索引[/dim]")
 
 
 # ── intel status ─────────────────────────────────────────────────

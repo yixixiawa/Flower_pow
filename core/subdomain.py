@@ -454,13 +454,22 @@ class SubdomainScanner:
     async def _full_one(self, url: str, verbose: bool = False) -> SubScanEntry:
         """跑完整流水线（侦察 → RAG → 验证 → 研判）。"""
         from core.scheduler import Scheduler
+        from policy.enforcer import active_scan_check, scoped_scan_config
 
         entry = SubScanEntry(host=url)
         loop = asyncio.get_running_loop()
         t0 = loop.time()
+        # 统一策略入口（P1-10）：子域名批量扫描的每个子域都过同一份 policy
+        # 判定——生产环境跳过该子域，未绑定环境降级为只读侦察。
+        allowed, _msg = active_scan_check(self.cfg, url)
+        if not allowed:
+            entry.error = "策略拒绝：环境绑定为生产环境，主动扫描跳过"
+            entry.elapsed = loop.time() - t0
+            return entry
         try:
+            cfg, _note = scoped_scan_config(self.cfg, url)
             res = await asyncio.wait_for(
-                Scheduler(self.cfg).scan(url, verbose=verbose), timeout=self.per_host_timeout
+                Scheduler(cfg).scan(url, verbose=verbose), timeout=self.per_host_timeout
             )
             entry.elapsed = loop.time() - t0
             entry.result = res

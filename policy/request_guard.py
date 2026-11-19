@@ -249,6 +249,25 @@ def _map_command(category: str, signals: list[str]) -> str:
 
 # ── Guard 本体 ────────────────────────────────────────────────────
 
+# 审批表**唯一**可作用的命令：L2「删除测试数据」（矩阵明文"需要单独审批"）。
+# L3 不在表内——P0 整改后 L3 无任何审批出路。
+_APPROVABLE_COMMANDS = frozenset({"删除测试数据"})
+
+
+def _same_host(url_a: str, url_b: str) -> bool:
+    """两个 URL 的主机名是否同源（P0-3：目标范围严格比对）。
+
+    只比 hostname（大小写不敏感），不比端口/路径——绑定目标是
+    ``http://host:8080/app`` 时，对 ``http://host:9999`` 的请求同样
+    算出界：换端口的服务是另一个攻击面，不在绑定范围内。
+    """
+    try:
+        ha = (urlparse(url_a or "").hostname or "").lower()
+        hb = (urlparse(url_b or "").hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(ha) and bool(hb) and ha == hb
+
 
 @dataclass(slots=True)
 class GuardContext:
@@ -263,7 +282,9 @@ class GuardContext:
     run_id: str = ""
     environment: str = ""           # 空 = 按 URL 现算；非空 = 调用方给定
     identity_bound: bool = False    # 账号身份是否已绑定（有凭证/已声明身份）
-    target_bound: bool = False      # 目标是否已绑定（会话目标与请求同源）
+    identity: str = ""              # 账号身份上下文（审计与台账用，P1-7）
+    target_bound: bool = False      # 兼容字段：仅表示"会话已有目标"
+    bound_target: str = ""          # **绑定的目标 URL**（P0-3：URL 必须同源才算绑定）
     approved_commands: set[str] = field(default_factory=set)  # 显式审批过的命令
 
 
@@ -273,17 +294,21 @@ class RequestGuard:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
         p = getattr(cfg, "policy", None)
-        self.enabled = bool(getattr(p, "enabled", True))
+        # P0 整改：``policy.enabled`` **不再是旁路开关**——安全策略强制
+        # 执行，配置里的 enabled 字段保留只为兼容旧配置文件，guard 不读。
+        self.enabled = True
         self.default_environment = str(
             getattr(p, "default_environment", Environment.UNKNOWN) or Environment.UNKNOWN
         )
         # host 通配 → 环境的绑定表（目标维度的落地）
         self.environments: dict[str, str] = dict(getattr(p, "environments", None) or {})
-        # 显式审批表：{"SQL 注入验证": true} —— 只认配置里明确写的 true
+        # 显式审批表：只认配置里明确写的 true。**且只对 L2「删除测试数据」
+        # 生效**——L3 在决策引擎里已无任何审批出路（P0 整改），审批表里
+        # 混进 L3 命令名也不会被读取。
         approvals = getattr(p, "approvals", None) or {}
         self.approved: set[str] = {
             cmd for cmd, v in approvals.items() if v is True
-        }
+        } & _APPROVABLE_COMMANDS
 
     # ── 目标 → 环境 ──────────────────────────────────────────────
     def environment_for(self, url: str) -> str:
@@ -316,13 +341,15 @@ class RequestGuard:
         body: str = "",
         params: dict[str, Any] | None = None,
         poc_hint: str = "",
+        history_hint: str = "",
         ctx: GuardContext | None = None,
     ) -> PolicyDecision:
-        """识别 + 决策。enabled=False 时直接给 ALLOW（策略整体关闭）。"""
-        if not self.enabled:
-            return PolicyDecision(decision=Decision.ALLOW, reason="策略已关闭（policy.enabled=false）")
+        """识别 + 决策。**策略恒生效**（P0-2：enabled 不再是旁路）。"""
         ctx = ctx or GuardContext()
-        cls = classify_request(url, method=method, body=body, params=params, poc_hint=poc_hint)
+        cls = classify_request(
+            url, method=method, body=body, params=params,
+            poc_hint=poc_hint, history_hint=history_hint,
+        )
         if not cls.command:
             return PolicyDecision(
                 decision=Decision.UNKNOWN,
@@ -330,28 +357,25 @@ class RequestGuard:
                 signals=cls.signals,
                 reason="接口未识别出已知命令，默认拒绝执行",
             )
-        approved = cls.command in self.approved or cls.command in ctx.approved_commands
+        # P0-3：目标范围严格比对——请求 URL 必须与绑定目标**同主机**，
+        # 只知道"会话有目标"不算绑定。跨主机请求视为未绑定 → 拒绝。
+        target_bound = bool(ctx.bound_target) and _same_host(url, ctx.bound_target)
+        approved = (
+            cls.command in self.approved or cls.command in ctx.approved_commands
+        ) and cls.command in _APPROVABLE_COMMANDS
         d = decide(
             cls.command,
             environment=ctx.environment or self.environment_for(url),
             identity_bound=ctx.identity_bound,
-            target_bound=ctx.target_bound,
+            target_bound=target_bound,
             approved=approved,
         )
         d.category = cls.category
         d.signals = cls.signals
-        if d.decision == Decision.REVIEW and d.level == PermissionLevel.L3:
-            # L3 即使有显式授权，也要环境兜底：生产环境的危险操作
-            # **不得因审批解锁**（Hybrid 规则明文）。
-            if (ctx.environment or self.environment_for(url)) not in Environment.TEST_ENVS:
-                d.decision = Decision.DENY
-                d.reason = f"{d.command}（L3）虽已显式授权，但目标环境非测试环境，不得解锁"
         return d
 
     def check_tool(self, tool_key: str, args: dict[str, Any], ctx: GuardContext | None = None) -> PolicyDecision:
         """外部工具调用走这里：按工具语义直接映射命令（无需报文识别）。"""
-        if not self.enabled:
-            return PolicyDecision(decision=Decision.ALLOW, reason="策略已关闭")
         command = _TOOL_COMMAND.get(tool_key, "")
         if not command:
             # 未知外部工具 → UNKNOWN 默认拒绝（不得自动放行未知接口）
@@ -362,19 +386,26 @@ class RequestGuard:
             )
         ctx = ctx or GuardContext()
         url = str(args.get("target") or args.get("url") or "")
-        approved = command in self.approved or command in ctx.approved_commands
+        # 工具未显式给目标时默认作用于绑定目标本身（与 runner 的回退一致）
+        if not url and ctx.bound_target:
+            url = ctx.bound_target
+        # P0-3：与 check_request 同一范围比对口径。显式给了不同目标的工具
+        # 调用按出界处理；未给目标且会话已绑定 → 视为在范围内。
+        target_bound = bool(ctx.bound_target) and (
+            not str(args.get("target") or args.get("url") or "")
+            or _same_host(url, ctx.bound_target)
+        )
+        approved = (
+            command in self.approved or command in ctx.approved_commands
+        ) and command in _APPROVABLE_COMMANDS
         d = decide(
             command,
             environment=ctx.environment or self.environment_for(url),
             identity_bound=ctx.identity_bound,
-            target_bound=ctx.target_bound,
+            target_bound=target_bound,
             approved=approved,
         )
         d.category = ApiCategory.EXECUTE
-        if d.decision == Decision.REVIEW and d.level == PermissionLevel.L3:
-            if (ctx.environment or self.environment_for(url)) not in Environment.TEST_ENVS:
-                d.decision = Decision.DENY
-                d.reason = f"{d.command}（L3）虽已显式授权，但目标环境非测试环境，不得解锁"
         return d
 
 

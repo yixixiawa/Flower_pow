@@ -157,6 +157,10 @@ class _ToolRunnerBase:
             getattr(cfg, "data_dir", "./data"),
             enabled=bool(getattr(getattr(cfg, "policy", None), "audit", True)),
         )
+        # 账号身份上下文（P1-7）：set_target 初始化为匿名，请求带凭证头时
+        # 升级为实名（_observe_identity）。绝不固定为 True——它是决策的
+        # 真实入参，也进审计与台账。
+        self._identity: str = ""
 
     def reset_target_scope(self) -> None:
         """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
@@ -182,6 +186,8 @@ class _ToolRunnerBase:
         self._host_signal.clear()
         self._host_streak.clear()
         self.test_ledger.clear()
+        # 身份是上一个目标的：换目标后回到匿名，等新目标的请求重新声明
+        self._identity = ""
 
 
 
@@ -462,24 +468,48 @@ class _ToolRunnerBase:
         "删除测试数据": "delete",
     }
 
+    def _current_identity(self, session) -> str:
+        """当前会话的**真实账号身份上下文**（P1-7，不固定 True）。
+
+        * 请求声明过凭证（Authorization/Cookie/X-API-Key）→ 实名身份；
+        * 否则随目标绑定显式声明为 ``anonymous@<host>``——匿名也是被
+          记录、可审计的身份（未认证请求的执行主体就是它），不是
+          "随便放行"的占位：它会进决策入参、审计与台账。
+        * 会话没有目标 → 没有身份（identity_bound=False，全量拒绝）。
+        """
+        if self._identity:
+            return self._identity
+        t = str(getattr(session, "target", "") or "")
+        if not t:
+            return ""
+        try:
+            host = urlparse(t).hostname or t
+        except ValueError:
+            host = t
+        return f"anonymous@{host}"
+
     def _policy_ctx(self, session, url: str):
         """决策上下文：目标、环境、账号身份三要素的绑定。
 
-        ``target_bound`` = 会话已有目标（/target 或 set_target 已执行）；
-        ``identity_bound`` = 会话即身份——REPL 由运行者启动并授权，
-        运行者身份随会话绑定（审计里单独留 target_id/run_id 可对账）。
-        真正的牙齿在 L1/L2/L3 的**环境门**上：判不出环境就是 unknown，
+        ``bound_target`` = 会话绑定的目标 URL。**范围比对在 guard 里做**：
+        请求 URL 必须与 bound_target 同主机才算 target_bound（P0-3）——
+        只知道"会话有目标"不算绑定，跨主机请求一律按未绑定拒绝。
+        ``identity_bound`` / ``identity`` = 真实账号身份上下文（P1-7）：
+        凭证头升级实名、无凭证显式匿名，绝不固定为 True。
+        真正的牙齿在 L1/L2 的**环境门**上：判不出环境就是 unknown，
         一律按条件不满足拒绝执行。
         """
         from policy.request_guard import GuardContext
 
         r = getattr(session, "result", None)
+        ident = self._current_identity(session)
         return GuardContext(
             target_id=(getattr(r, "target_id", "") or getattr(session, "target", "")),
             run_id=getattr(r, "current_run_id", "") or "",
             environment=self.policy_guard.environment_for(url),
-            target_bound=bool(getattr(session, "target", "")),
-            identity_bound=True,
+            identity_bound=bool(ident),
+            identity=ident,
+            bound_target=str(getattr(session, "target", "") or ""),
         )
 
     def _policy_scope(self, session) -> tuple[str, str]:
@@ -503,72 +533,81 @@ class _ToolRunnerBase:
                 url = self._normalize_target(str(args.get("url") or session.target or ""))
                 method = str(args.get("method") or "GET")
                 body = str(args.get("body") or "")
+                self._observe_identity(dict(args.get("headers") or {}) if isinstance(
+                    args.get("headers"), dict
+                ) else {}, url, body)
                 d = guard.check_request(
-                    url, method=method, body=body, ctx=self._policy_ctx(session, url)
+                    url, method=method, body=body,
+                    params=args.get("params") if isinstance(args.get("params"), dict) else None,
+                    poc_hint=str(args.get("poc_id") or args.get("poc") or ""),
+                    history_hint=self._history_hint(url),
+                    ctx=self._policy_ctx(session, url),
                 )
                 if d.allowed:
+                    # P0-5：删除操作在**真实请求发出之前**过对象台账。
+                    # 台账判不过 → 拒绝，绝不放行到 handler。
+                    ledger_deny = self._ledger_check(session, d, url)
+                    if ledger_deny is not None:
+                        return ledger_deny
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
-                    if d.level == "L3":
-                        # L3 的 REVIEW 来自 config approvals 的显式授权——
-                        # 授权即审批，不再逐次打断（环境门已在 check 内兜住）
-                        self.policy_audit.log(
-                            "approval", command=d.command, level=d.level,
-                            decision="ALLOW", category=d.category, url=url,
-                            target_id=self._policy_scope(session)[0],
-                            run_id=self._policy_scope(session)[1],
-                            reason=d.reason,
-                        )
-                        self._policy_allow(session, d, url=url)
-                        return None
+                    # P0-1：L3 在决策引擎已无 REVIEW 出路；能到这里的
+                    # REVIEW 只有 L2 删除——走运行期审批通道。
                     if await self._policy_review(d, session, url):
+                        ledger_deny = self._ledger_check(session, d, url)
+                        if ledger_deny is not None:
+                            return ledger_deny
                         self._policy_allow(session, d, url=url)
                         return None
-                return self._policy_deny_text(d, url)
+                return self._policy_deny(session, d, url)
 
             if name == "exploit_probe":
                 kinds = str(args.get("kinds") or "rce,fileread")
                 url = self._normalize_target(str(args.get("url") or session.target or ""))
-                # 探针类别 → 矩阵命令，取风险最高的一条判定：
-                # rce → 命令执行（L3）、upload → 上传测试文件（L2）、
-                # fileread → 查询详情（L0）
-                command = None
-                if "rce" in kinds:
-                    command = "命令执行"
-                elif "upload" in kinds:
-                    command = "上传测试文件"
-                else:
-                    command = "查询详情"
-                from policy.api_policy import decide as _decide
+                # P0-4：探针类别 → 矩阵命令，取风险最高的一条判定。
+                # **sqli 必须映射到 SQL 注入验证（L3）**，不得落 L0；
+                # 未知类别按 UNKNOWN 拒绝（不猜）。
+                commands = [
+                    self._PROBE_KIND_COMMAND.get(k.strip().lower(), "")
+                    for k in kinds.split(",")
+                ]
+                if not commands or any(not c for c in commands):
+                    return (
+                        "【已拦截】（策略）exploit_probe 含未识别的探针类别，"
+                        "按「条件不满足 → 拒绝执行」处理。"
+                        f"已知类别：{'、'.join(sorted(self._PROBE_KIND_COMMAND))}。"
+                    )
+                from policy.api_policy import (
+                    PermissionLevel,
+                    rule_for_command,
+                    decide as _decide,
+                )
 
+                worst = max(commands, key=lambda c: (
+                    PermissionLevel.rank(rule_for_command(c).level) if rule_for_command(c) else -1
+                ))
+                _rule = rule_for_command(worst)
                 d = _decide(
-                    command,
+                    worst,
                     environment=self.policy_guard.environment_for(url),
-                    identity_bound=True,
+                    identity_bound=bool(self._current_identity(session)),
                     target_bound=bool(getattr(session, "target", "")),
-                    approved=command in guard.approved,
+                    approved=False,  # P0-1：L3 无审批出路，L2 删除不走探针
                 )
-                d.category = "EXECUTE" if command == "命令执行" else (
-                    "UPLOAD" if command == "上传测试文件" else "READ"
-                )
+                d.category = {
+                    "命令执行": "EXECUTE", "SQL 注入验证": "EXECUTE",
+                    "上传测试文件": "UPLOAD", "删除测试数据": "DELETE",
+                }.get(worst, "READ")
+                d.signals = [f"探针类别：{kinds}（最高风险 → {worst}，{_rule.level if _rule else '?'}）"]
                 if d.allowed:
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
-                    if d.level == "L3":
-                        _, run_id = self._policy_scope(session)
-                        self.policy_audit.log(
-                            "approval", command=d.command, level=d.level,
-                            decision="ALLOW", category=d.category, url=url,
-                            run_id=run_id, reason=d.reason,
-                        )
-                        self._policy_allow(session, d, url=url)
-                        return None
                     if await self._policy_review(d, session, url):
                         self._policy_allow(session, d, url=url)
                         return None
-                return self._policy_deny_text(d, url)
+                return self._policy_deny(session, d, url)
 
             if name == "external_tool":
                 tool = str(args.get("tool") or "")
@@ -578,18 +617,10 @@ class _ToolRunnerBase:
                     self._policy_allow(session, d, url=url)
                     return None
                 if d.decision == "REVIEW":
-                    if d.level == "L3":
-                        self.policy_audit.log(
-                            "approval", command=d.command, level=d.level,
-                            decision="ALLOW", category=d.category, url=url,
-                            run_id=self._policy_scope(session)[1], reason=d.reason,
-                        )
-                        self._policy_allow(session, d, url=url)
-                        return None
                     if await self._policy_review(d, session, url):
                         self._policy_allow(session, d, url=url)
                         return None
-                return self._policy_deny_text(d, url)
+                return self._policy_deny(session, d, url)
             return None
         except Exception as exc:  # noqa: BLE001
             tid, rid = self._policy_scope(session)
@@ -602,6 +633,78 @@ class _ToolRunnerBase:
                 f"  {type(exc).__name__}: {exc}\n"
                 "  修复 policy 配置或用 /readonly 查看当前状态后重试。"
             )
+
+    # 探针类别 → 权限矩阵命令（P0-4：sqli 必须落 L3，不得落 L0）
+    _PROBE_KIND_COMMAND = {
+        "rce": "命令执行",              # L3
+        "sqli": "SQL 注入验证",          # L3（此前落入查询详情 L0——整改点）
+        "upload": "上传测试文件",        # L2
+        "fileread": "查询详情",          # L0
+        "fileupload": "上传测试文件",    # L2
+    }
+
+    def _observe_identity(self, headers: dict, url: str, body: str = "") -> None:
+        """从真实请求里观察账号身份（P1-7：身份绑定是真实上下文，不固定 True）。
+
+        * 请求头带 Authorization / Cookie / X-API-Key / X-Auth-Token →
+          实名身份（只记头名不记值，凭证不进日志）；
+        * 其余情况维持 set_target 时的匿名身份。
+        """
+        for h in headers or {}:
+            if str(h).lower() in ("authorization", "cookie", "x-api-key", "x-auth-token", "x-token"):
+                self._identity = f"cred:{str(h).lower()}"
+                return
+
+    def _history_hint(self, url: str) -> str:
+        """历史行为提示（P1-6）：台账里同主机出现过的写操作，喂给分类器。"""
+        try:
+            host = (urlparse(url or "").hostname or "").lower()
+        except ValueError:
+            return ""
+        if not host:
+            return ""
+        hits: list[str] = []
+        for o in self.test_ledger.objects_of():
+            try:
+                oh = (urlparse(o.url or "").hostname or "").lower()
+            except ValueError:
+                continue
+            if oh == host and o.action in ("delete", "create", "update", "upload"):
+                hits.append(o.action)
+        return ",".join(sorted(set(hits)))
+
+    def _ledger_check(self, session, d, url: str) -> str | None:
+        """删除类操作的真实请求前置台账检查（P0-5）。
+
+        返回拒绝文本（含【已拦截】前缀）或 None 放行。检查发生在
+        gate 内、handler 执行之前——台账判不过的删除请求**根本不会
+        被发出去**。
+        """
+        if d.command != "删除测试数据":
+            return None
+        tid, rid = self._policy_scope(session)
+        ok, reason = self.test_ledger.delete_verdict(
+            url,
+            run_id=rid,
+            target_id=tid,
+            environment=self.policy_guard.environment_for(url),
+            approved="删除测试数据" in self.policy_guard.approved,
+        )
+        if ok:
+            return None
+        self.policy_audit.log(
+            "deny", command=d.command, level=d.level, decision="DENY",
+            category=d.category, url=url, target_id=tid, run_id=rid,
+            reason=f"对象台账前置检查拒绝：{reason}",
+        )
+        lines = [
+            "【已拦截】（策略）删除操作未通过测试对象台账检查，请求未发出。",
+            f"  理由：{reason}",
+            "  删除范围只能覆盖本次测试生命周期内建立/修改过的对象；",
+            "  删除预置测试数据需在 config.yaml 的 policy.approvals 显式声明"
+            "（且仅测试环境生效）。",
+        ]
+        return "\n".join(lines)
 
     async def _policy_review(self, d, session, url: str) -> bool:
         """REVIEW 决策的运行期审批：有审核通道就问人，没有就拒绝。"""
@@ -637,7 +740,21 @@ class _ToolRunnerBase:
         )
         action = self._LEDGER_ACTIONS.get(d.command)
         if action and url:
-            self.test_ledger.record(url, action, run_id=rid, target_id=tid)
+            # 台账统一隔离口径（P1-8）：target_id / run_id / identity 一起落，
+            # 判"对象已知"时三个维度都要对得上。
+            self.test_ledger.record(
+                url, action, run_id=rid, target_id=tid, identity=self._current_identity(session),
+            )
+
+    def _policy_deny(self, session, d, url: str = "") -> str:
+        """DENY/UNKNOWN 决策的留痕 + 拒绝文本。拒绝也必须能对账。"""
+        tid, rid = self._policy_scope(session)
+        self.policy_audit.log(
+            "deny", command=d.command, level=d.level, decision=d.decision,
+            category=d.category, url=url, target_id=tid, run_id=rid,
+            reason=d.reason, extra={"signals": list(d.signals)[:6]} if d.signals else None,
+        )
+        return self._policy_deny_text(d, url)
 
     def _policy_deny_text(self, d, url: str = "") -> str:
         lines = [f"【已拦截】（策略）{d.command or '未知接口'} 被权限控制拒绝执行。"]
@@ -648,7 +765,7 @@ class _ToolRunnerBase:
         lines.append(
             "  条件不满足统一拒绝执行。如确属已授权的测试环境，请在 config.yaml 的"
             " policy 段绑定环境（environments: {\"<host 通配>\": \"isolated_test\"}"
-            " 或 dedicated_test）；L3 命令还必须在 approvals 里显式审批。"
+            " 或 dedicated_test）。L3 命令一律拒绝，无任何审批出路。"
         )
         return "\n".join(lines)
 
@@ -666,6 +783,9 @@ class _ToolRunnerBase:
             # 目标没变就不开——重复 set_target 不该把正在跑的一轮扫描腰斩。
             session.result.target_id = session.target
             session.result.new_run(f"目标 {session.target}")
+            # 身份随目标走（P1-7）：新目标从匿名开始，凭证由该目标的请求
+            # 重新声明，避免把上一个目标的会话凭证算到新目标头上。
+            self._identity = "anonymous"
         return f"目标已设定：{session.target}"
 
     async def _h_session_state(self, session, **_: Any) -> str:
@@ -694,12 +814,13 @@ class _ToolRunnerBase:
         if r.fingerprints:
             lines.insert(2, f"指纹：{r.fingerprints[0].summary()}")
         # 权限控制状态：Agent 必须知道当前环境判定与策略口径，
-        # 否则它发起的写操作被拦时完全摸不着头脑（拦截文本只到单次调用）
-        if getattr(self, "policy_guard", None) is not None and self.policy_guard.enabled:
+        # 否则它发起的写操作被拦时完全摸不着头脑（拦截文本只到单次调用）。
+        # 策略恒生效（P0-2），不再有 enabled 开关可看。
+        if getattr(self, "policy_guard", None) is not None:
             env = self.policy_guard.environment_for(session.target or "")
             lines.append(
-                f"策略：已启用 | 目标环境 {env or '未知'}"
-                "（L1 仅隔离测试环境、L2 需专门测试环境/审批、L3 默认禁止）"
+                f"策略：强制生效 | 目标环境 {env or '未知'} | 身份 {self._current_identity(session)}"
+                "（L1 仅隔离测试环境、L2 需专门测试环境/审批、L3 一律拒绝）"
             )
         api = [a for a in r.assets if a.kind == "api"]
         if api:

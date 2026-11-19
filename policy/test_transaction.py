@@ -57,27 +57,38 @@ class TestLedger:
         self._objects.append(obj)
         return obj
 
-    def known(self, url: str, *, current_run_only: bool = False, run_id: str = "") -> bool:
+    def known(
+        self, url: str, *, current_run_only: bool = False, run_id: str = "",
+        target_id: str = "",
+    ) -> bool:
         """对象是否被登记过。默认看**本会话全部** run：本轮创建、
         上一轮修改过的对象都是"已知"的；``current_run_only`` 收紧到
-        当前轮次（供更严格的场景用）。"""
+        当前轮次（供更严格的场景用）。
+
+        统一隔离口径（P1-8）：给 ``target_id`` 时**只认同目标的登记**——
+        换目标后旧目标的同名 path 不能被误认成"已知对象"（两个不同
+        站点都有 /api/users/123，台账按目标隔离才不串）。
+        """
         key = self._key(url)
         for o in reversed(self._objects):
             if o.url != key:
                 continue
             if current_run_only and run_id and o.run_id != run_id:
                 continue
+            if target_id and o.target_id != target_id:
+                continue
             return True
         return False
 
     def delete_verdict(
-        self, url: str, *, run_id: str = "", environment: str = "", approved: bool = False,
+        self, url: str, *, run_id: str = "", target_id: str = "",
+        environment: str = "", approved: bool = False,
     ) -> tuple[bool, str]:
         """删除前的生命周期判定，返回 (是否放行, 理由)。
 
         * 环境不是测试环境 → 拒（测试环境的删除权限不得推导到生产，
           这条边界在这里再拦一道，即使决策层已经判过）；
-        * 对象已知（本次测试建立/修改过）→ 放行；
+        * 对象已知（**同目标**的本次测试生命周期内建立/修改过）→ 放行；
         * 对象未知 + 有单独审批 → 放行（如删除预置测试用户）；
         * 对象未知 + 无审批 → 拒。
         """
@@ -87,7 +98,7 @@ class TestLedger:
             return False, "目标为生产环境：删除测试数据的权限不得推导到生产环境"
         if environment not in Environment.TEST_ENVS:
             return False, f"目标环境为 {environment or '未知'}，不满足测试环境条件"
-        if self.known(url, run_id=run_id, current_run_only=False):
+        if self.known(url, run_id=run_id, current_run_only=False, target_id=target_id):
             return True, "对象在本次测试生命周期内建立/修改过（台账已知）"
         if approved:
             return True, "对象不在台账中，但已获单独审批（如预置测试用户清理）"

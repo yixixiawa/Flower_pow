@@ -282,14 +282,12 @@ def decide(
     )
 
     if rule.level == PermissionLevel.L3:
-        # L3 默认禁止：任何情形拒绝。唯一的"出路"不在决策引擎里——
-        # 显式授权必须先经 request_guard 的环境与只读检查（生产环境
-        # 不得因审批解锁危险操作），引擎本身不给 L3 留执行路径。
-        if approved:
-            base.reason = f"{rule.command}（L3）已获显式授权，交由 request_guard 复核环境"
-            base.decision = Decision.REVIEW
-        else:
-            base.reason = f"{rule.command}（L3）默认禁止，无审批记录"
+        # L3 默认禁止：**任何情形拒绝，审批不给任何出路**（P0 整改：
+        # 原"显式授权后交由 request_guard 复核环境"的分支已删除——
+        # 配置文件里的 approvals 一旦写错 host 通配，就是生产环境
+        # 执行 SQL 注入验证的直接通路。L3 命令要跑，唯一的合法
+        # 途径是人自己改代码加白名单，而不是改配置。）
+        base.reason = f"{rule.command}（L3）默认禁止：任何情形一律拒绝执行（审批不设出路）"
         return base
 
     # 目标 / 账号身份绑定是**所有等级的公共前置**（边界 1）

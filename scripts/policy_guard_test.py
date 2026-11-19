@@ -127,6 +127,10 @@ def test_decide() -> None:
         d = decide(cmd, environment=Environment.ISOLATED_TEST,
                    identity_bound=True, target_bound=True)
         ok(d.decision == Decision.DENY, f"L3 {cmd} 无审批 → 直接拒绝")
+        # P0-1 整改：L3 **有审批也拒绝**——审批不设出路
+        d = decide(cmd, environment=Environment.ISOLATED_TEST,
+                   identity_bound=True, target_bound=True, approved=True)
+        ok(d.decision == Decision.DENY, f"L3 {cmd} 显式审批 → 仍然拒绝（无出路）")
 
     # 未知命令 → UNKNOWN
     d = decide("未知命令")
@@ -203,40 +207,130 @@ def _cfg_with(**kw) -> Config:
 def test_guard() -> None:
     from policy.request_guard import GuardContext
 
-    bound = GuardContext(target_bound=True, identity_bound=True)
+    # P0-3：目标范围严格比对——bound_target 是 URL，请求必须同主机
+    bound = GuardContext(bound_target="http://192.168.1.10:8080", identity_bound=True)
     # 环境判不出 = unknown → L1 拒绝（不猜）
     g = RequestGuard(_cfg_with())
     ctx = g.check_request("http://10.9.9.9/api/users", "POST", body="{}", ctx=bound)
     ok(ctx.decision == Decision.DENY, "默认 unknown 环境：创建被拒")
 
-    # host 通配绑定：isolated_test 环境 L1 放行
+    # host 通配绑定：isolated_test 环境 L1 放行（同主机）
     g = RequestGuard(_cfg_with(environments={"192.168.*": Environment.ISOLATED_TEST}))
     ctx = g.check_request("http://192.168.1.10:8080/api/users", "POST", body="{}", ctx=bound)
-    ok(ctx.decision == Decision.ALLOW, "隔离测试环境：创建放行")
+    ok(ctx.decision == Decision.ALLOW, "隔离测试环境 + 同主机：创建放行")
     ctx = g.check_request("http://10.0.0.5/api/users", "POST", body="{}", ctx=bound)
     ok(ctx.decision == Decision.DENY, "未命中绑定表 → 拒绝")
+
+    # P0-3：环境绑定了，但请求 URL 与绑定目标不同主机 → 按未绑定拒绝
+    ctx = g.check_request("http://192.168.1.99/api/users", "POST", body="{}", ctx=bound)
+    ok(ctx.decision == Decision.DENY, "同环境但跨主机（出界）→ 拒绝")
+    # 空 bound_target（会话没目标）→ 一律未绑定
+    ctx = g.check_request(
+        "http://192.168.1.10/api/users", "POST", body="{}",
+        ctx=GuardContext(identity_bound=True),
+    )
+    ok(ctx.decision == Decision.DENY, "无绑定目标 → 拒绝（不能只看环境）")
 
     # 未知外部工具 → UNKNOWN 拒绝
     ctx = g.check_tool("totally-unknown-tool", {}, ctx=bound)
     ok(ctx.decision == Decision.UNKNOWN, "未知工具 UNKNOWN 默认拒绝")
 
-    # L3 无审批直接拒；有审批 + 非测试环境仍拒（审批不解锁生产危险操作）
+    # P0-1：L3 无任何审批出路——SQL 注入验证 / 命令执行类工具配置了审批也拒
     g2 = RequestGuard(_cfg_with())
     ctx = g2.check_tool("sqlmap", {"target": "http://192.168.1.10"}, ctx=bound)
-    ok(ctx.decision == Decision.DENY, "sqlmap 无审批 → 拒绝")
+    ok(ctx.decision == Decision.DENY, "sqlmap（L3）→ 拒绝")
     g3 = RequestGuard(_cfg_with(
-        approvals={"SQL 注入验证": True},
+        approvals={"SQL 注入验证": True, "命令执行": True},
         environments={"192.168.*": Environment.ISOLATED_TEST},
     ))
+    ok(g3.approved == set(), "审批表里的 L3 命令不生效（approved 为空）")
     ctx = g3.check_tool("sqlmap", {"target": "http://192.168.1.10"}, ctx=bound)
-    ok(ctx.decision == Decision.REVIEW, "sqlmap 显式授权 + 测试环境 → REVIEW（环境门已过）")
-    g4 = RequestGuard(_cfg_with(approvals={"SQL 注入验证": True}))
-    ctx = g4.check_tool("sqlmap", {"target": "http://10.0.0.5"}, ctx=bound)
-    ok(ctx.decision == Decision.DENY, "sqlmap 显式授权但环境未知 → 仍拒绝")
+    ok(ctx.decision == Decision.DENY, "sqlmap 显式授权 + 测试环境 → 仍拒绝（L3 无出路）")
+    ctx = g3.check_tool("hydra", {"target": "http://192.168.1.10"}, ctx=bound)
+    ok(ctx.decision == Decision.DENY, "hydra（命令执行 L3）审批也不解锁")
 
-    # 策略关闭 → 一律放行（回到旧行为）
+    # P2-12 前置：审批表只对 L2 删除生效
+    g4 = RequestGuard(_cfg_with(
+        approvals={"删除测试数据": True},
+        environments={"192.168.*": Environment.ISOLATED_TEST},
+    ))
+    ok(g4.approved == {"删除测试数据"}, "L2 删除审批保留")
+    ctx = g4.check_request("http://192.168.1.10/api/users/1", "DELETE", ctx=bound)
+    ok(ctx.decision == Decision.ALLOW, "L2 删除 + 审批 + 测试环境 → 允许（还要过台账）")
+
+    # P0-2：策略强制执行——enabled=False 不再是旁路
     g5 = RequestGuard(_cfg_with(enabled=False))
-    ok(g5.check_request("http://x/", "DELETE").allowed, "策略关闭时放行（readonly 等旧闸门接管）")
+    ctx = g5.check_request("http://192.168.1.10/api/users", "POST", body="{}", ctx=bound)
+    ok(not ctx.allowed, "enabled=false 时策略仍强制执行（创建仍走判定）")
+    ctx = g5.check_tool("sqlmap", {"target": "http://192.168.1.10"}, ctx=bound)
+    ok(ctx.decision == Decision.DENY, "enabled=false 时 sqlmap 仍拒绝")
+
+
+# ── 4b. P0/P1/P2 整改专项 ─────────────────────────────────────────
+
+
+def test_hardening() -> None:
+    from policy.enforcer import active_scan_check, scoped_scan_config
+    from policy.audit_logger import PolicyAudit
+
+    # P0-4：sqli 探针映射 L3（命令映射表）
+    from core.tools.runner.base import _ToolRunnerBase
+
+    m = _ToolRunnerBase._PROBE_KIND_COMMAND
+    ok(m.get("sqli") == "SQL 注入验证", "sqli 探针 → SQL 注入验证（L3）")
+    ok(m.get("rce") == "命令执行", "rce 探针 → 命令执行（L3）")
+    ok(m.get("fileread") == "查询详情", "fileread 探针 → 查询详情（L0）")
+
+    # P1-6：params / POC 声明 / 历史行为真正进分类器
+    c = classify_request(
+        "http://t.example.com/api/task", "GET", params={"cron": "0 0 * * *"},
+    )
+    ok(c.command == "定时任务执行", "params 里的 cron 进分类（定时任务 L3）")
+    c = classify_request("http://t.example.com/api/list", "GET", poc_hint="sqli blind injection")
+    ok(c.command == "SQL 注入验证", "POC 声明 sqli 进分类（L3，更高风险为准）")
+    c = classify_request("http://t.example.com/api/list", "GET", history_hint="批量删除")
+    ok(c.command == "批量删除", "历史行为批量删除进分类（更高风险为准）")
+
+    # P1-8：台账按 target_id 隔离
+    led = TestLedger()
+    led.record("http://a.com/api/users/1", "create", run_id="r1", target_id="A")
+    ok(led.known("http://a.com/api/users/1", target_id="A"), "同目标命中")
+    ok(not led.known("http://a.com/api/users/1", target_id="B"), "跨目标不命中（P1-8）")
+    verdict, why = led.delete_verdict(
+        "http://a.com/api/users/1", target_id="B", environment=Environment.ISOLATED_TEST,
+    )
+    ok(not verdict, "跨目标的删除按未知对象处理（P1-8）")
+
+    # P1-10：MCP/CLI/后台任务统一入口
+    cfg = _cfg_with(environments={"10.0.0.*": Environment.PRODUCTION})
+    allowed, msg = active_scan_check(cfg, "http://10.0.0.5/")
+    ok(not allowed, "生产环境：主动扫描拒绝")
+    ok("生产环境" in msg, "拒绝文本写明生产环境")
+    allowed, msg = active_scan_check(_cfg_with(), "http://10.9.9.9/")
+    ok(allowed, "未绑定环境：放行但降级")
+    cfg2, note = scoped_scan_config(_cfg_with(), "http://10.9.9.9/")
+    ok(not cfg2.scan.sqli_probe_enabled and not cfg2.scan.rce_probe_enabled,
+       "未绑定环境：SQLi/RCE 探针强制关闭")
+    ok(not cfg2.scan.file_read_probe_enabled and not cfg2.scan.file_upload_probe_enabled,
+       "未绑定环境：文件读取/上传探针强制关闭")
+    cfg3, note3 = scoped_scan_config(
+        _cfg_with(environments={"192.168.*": Environment.ISOLATED_TEST}), "http://192.168.1.1/",
+    )
+    ok(cfg3.scan.sqli_probe_enabled, "隔离测试环境：探针按配置执行")
+    ok(note3 == "", "测试环境无降级提示")
+
+    # P2-11：审计落盘失败的明确策略——进待写队列、可观察
+    a = PolicyAudit("./data", enabled=True)
+    a._flush = lambda entries: False  # 模拟磁盘持续不可写
+    for i in range(10):
+        a.log("allow", command="查询详情", run_id=f"r{i}")
+    ok(a.pending_count == 10, f"落盘失败事件进待写队列（{a.pending_count}）")
+    ok("未落盘 10" in a.summary_line(), "状态行可见审计缺口")
+    ok(len(a.recent()) == 10, "内存 recent 仍可查")
+    a._flush = lambda entries: True
+    a.log("deny", command="命令执行")
+    ok(a.pending_count == 0, "恢复可写后欠账全部补写")
+    ok("⚠" not in a.summary_line(), "缺口清零后状态行不再告警")
 
 
 # ── 5. TestLedger 生命周期台账 ───────────────────────────────────
@@ -284,7 +378,10 @@ def test_runner_gate() -> None:
         cfg.data_dir = td
         runner = ToolRunner(cfg, root=td)
         s = Session(target="http://127.0.0.1:8080")
-        s.credentials["token"] = "x"  # 身份绑定
+        # P1-7：真实身份上下文——凭证由请求声明，不再固定 True
+        runner._observe_identity({"Authorization": "Bearer x"}, "http://127.0.0.1:8080/")
+        ok(runner._identity == "cred:authorization", "凭证头 → 实名身份")
+        ok("Bearer" not in runner._identity, "凭证值不进身份标签")
 
         # DELETE → 删除测试数据 L2：REVIEW 且无审批通道 → 拒绝（不触网）
         out = asyncio.run(runner.execute(
@@ -293,7 +390,7 @@ def test_runner_gate() -> None:
         ok(out.startswith("【已拦截】"), "L2 删除无审批通道被闸门拦下")
         ok("删除测试数据" in out, "拒绝回执写明命中的命令")
 
-        # 审计留痕：拒绝事件已落 JSONL
+        # 审计留痕：拒绝事件已落 JSONL（P0 整改后 DENY 也留痕）
         audit_file = Path(td) / "policy" / "audit.jsonl"
         ok(audit_file.is_file(), "审计 JSONL 已落盘")
         events = [json.loads(ln) for ln in audit_file.read_text(encoding="utf-8").splitlines()]
@@ -312,6 +409,26 @@ def test_runner_gate() -> None:
         ))
         ok(out.startswith("【已拦截】"), "运行期审批拒绝 → 拦截")
 
+        # 审批通过后，删除还要过 P0-5 台账前置：未知对象 → 请求发不出去
+        async def _approve(_desc: str) -> bool:
+            return True
+
+        runner.approver = _approve
+        out = asyncio.run(runner.execute(
+            "http_request", {"url": "http://127.0.0.1:8080/api/users/42", "method": "DELETE"}, s,
+        ))
+        ok(out.startswith("【已拦截】") and "台账" in out,
+           "审批通过但对象不在台账 → 请求发出前被台账拦下")
+        ok(runner.policy_audit.pending_count == 0, "台账拒绝也留了审计")
+
+        # 台账登记过的对象 + 审批 → 删除放行（gate 层验证，不触网）
+        verdict = asyncio.run(runner._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/users/42", "method": "DELETE"}, s,
+        ))
+        # 上一条 execute 没发请求、没进台账 → 这里仍是 REVIEW 通道放行 + 台账判未知
+        # 但 config approvals 没配删除 → REVIEW 走 _approve 通道 → 台账未知 → 拦
+        ok(verdict is not None and "台账" in verdict, "台账前置检查对未知对象持续拦截")
+
         # 创建进隔离测试环境 → 闸门放行（handler 会触网，这里直接测 _policy_gate）
         verdict = asyncio.run(runner._policy_gate(
             "http_request",
@@ -319,7 +436,17 @@ def test_runner_gate() -> None:
             s,
         ))
         ok(verdict is None, "隔离测试环境的创建请求放行")
-        ok(runner.test_ledger.known("http://127.0.0.1:8080/api/users"), "放行的创建进台账")
+        ok(runner.test_ledger.known(
+            "http://127.0.0.1:8080/api/users", target_id="http://127.0.0.1:8080",
+        ), "放行的创建进台账（带 target_id 隔离）")
+
+        # P0-3：跨目标请求 → 出界拒绝
+        verdict = asyncio.run(runner._policy_gate(
+            "http_request",
+            {"url": "http://127.0.0.2/api/users", "method": "POST", "body": "{}"},
+            s,
+        ))
+        ok(verdict is not None and "目标未绑定" in verdict, "跨主机请求按未绑定拒绝")
 
         # 破坏性 SQL 体（GET 也拦）→ SQL 注入验证 L3 拒绝
         verdict = asyncio.run(runner._policy_gate(
@@ -330,27 +457,37 @@ def test_runner_gate() -> None:
         ))
         ok(verdict is not None and "SQL 注入验证" in verdict, "破坏性 SQL 被按 L3 拦下")
 
-        # 外部工具：curl 只读取证放行；sqlmap 无审批拦截
+        # 外部工具：curl 只读取证放行；sqlmap 审批也拦（L3 无出路）
         verdict = asyncio.run(runner._policy_gate(
             "external_tool", {"tool": "curl", "args": []}, s,
         ))
         ok(verdict is None, "curl（只读映射）放行")
+        runner.policy_guard = RequestGuard(_cfg_with(
+            approvals={"SQL 注入验证": True},
+            environments={"127.0.0.*": Environment.ISOLATED_TEST},
+        ))
         verdict = asyncio.run(runner._policy_gate(
             "external_tool", {"tool": "sqlmap", "target": "http://127.0.0.1"}, s,
         ))
-        ok(verdict is not None and "SQL 注入验证" in verdict, "sqlmap 无审批被拦")
+        ok(verdict is not None and "SQL 注入验证" in verdict, "sqlmap 显式审批仍被拦（P0-1）")
 
-        # exploit_probe 默认带 rce → 命令执行 L3 拒绝
+        # P0-4：exploit_probe sqli → SQL 注入验证 L3 拒绝（此前落 L0）
         verdict = asyncio.run(runner._policy_gate(
-            "exploit_probe", {"url": "http://127.0.0.1:8080"}, s,
+            "exploit_probe", {"url": "http://127.0.0.1:8080", "kinds": "sqli"}, s,
         ))
-        ok(verdict is not None and "命令执行" in verdict, "rce 探针被按 L3 拦下")
+        ok(verdict is not None and "SQL 注入验证" in verdict, "sqli 探针被按 L3 拦下")
+        # 未知探针类别 → 拒绝（不猜）
+        verdict = asyncio.run(runner._policy_gate(
+            "exploit_probe", {"url": "http://127.0.0.1:8080", "kinds": "wormhole"}, s,
+        ))
+        ok(verdict is not None and "未识别" in verdict, "未知探针类别拒绝")
 
         # 换目标清台账：旧 run 的对象不再"已知"
         runner.test_ledger.record("http://127.0.0.1:8080/api/old", "create", run_id="old-run")
         ok(runner.test_ledger.known("http://127.0.0.1:8080/api/old"), "登记后已知")
         runner.reset_target_scope()
         ok(not runner.test_ledger.known("http://127.0.0.1:8080/api/old"), "reset_target_scope 清台账")
+        ok(runner._identity == "", "reset_target_scope 重置身份上下文（P1-7）")
 
         # 审计异常兜底：写到不可写的路径不抛
         from policy.audit_logger import PolicyAudit
@@ -362,7 +499,7 @@ def test_runner_gate() -> None:
         except Exception as exc:  # noqa: BLE001
             ok(False, f"审计落盘失败不抛异常（却抛了 {type(exc).__name__}）")
 
-        # 策略关闭的 runner：闸门全放行
+        # P0-2：policy.enabled=false 不再放行闸门——策略强制执行
         cfg_off = Config()
         cfg_off.policy.enabled = False
         off = ToolRunner(cfg_off, root=td)
@@ -370,7 +507,15 @@ def test_runner_gate() -> None:
             "http_request",
             {"url": "http://127.0.0.1:8080/api/users/1", "method": "DELETE"}, s,
         ))
-        ok(verdict is None, "policy.enabled=false 时闸门放行")
+        ok(verdict is not None and verdict.startswith("【已拦截】"),
+           "policy.enabled=false 时闸门仍拦截（强制执行）")
+
+
+def test_wheel_packages() -> None:
+    """P1-9：wheel 必须打包 policy/ 与 intel/。"""
+    text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    ok('"policy/**/*.py"' in text, "wheel include 含 policy/**/*.py")
+    ok('"intel/**/*.py"' in text, "wheel include 含 intel/**/*.py")
 
 
 def main() -> int:
@@ -378,8 +523,10 @@ def main() -> int:
     test_decide()
     test_classify()
     test_guard()
+    test_hardening()
     test_ledger()
     test_runner_gate()
+    test_wheel_packages()
     print(
         f"\n权限控制回归 {PASS}/{PASS} 通过"
         + (f"（另有 {len(FAIL)} 项失败）" if FAIL else "")

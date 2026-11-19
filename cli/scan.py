@@ -55,6 +55,16 @@ def scan(
 
     console.print(Panel(BANNER.strip("\n"), style="cyan", expand=False))
     _print_model_warnings(cfg)
+    # 统一策略入口（P1-10）：一次性扫描与 Agent 路径过同一份 policy 判定。
+    from policy.enforcer import active_scan_check, scoped_scan_config
+
+    allowed, msg = active_scan_check(cfg, target)
+    if not allowed:
+        err.print(f"[red]{msg}[/red]")
+        raise typer.Exit(2)
+    cfg, note = scoped_scan_config(cfg, target)
+    if note:
+        console.print(f"[yellow]策略：{note}[/yellow]")
     sched = Scheduler(cfg)
 
     try:

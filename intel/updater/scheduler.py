@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from datetime import date
 from pathlib import Path
@@ -174,17 +175,31 @@ class StateStore:
 
 
 class Updater:
-    """四个动作的编排：check / update / status / rollback。"""
+    """四个动作的编排：check / update / status / rollback。
+
+    发布链路（P2-12，供应链隔离）::
+
+        远程 Commit → 校验/注册（manifest）→ **暂存区**（staging/<repo>/）
+        → 人工审核 → `intel publish` 发布到执行目录（poc/community/<repo>/）
+
+    默认 ``staging=True``：update 只写暂存区，执行目录不受外部仓库
+    内容影响；显式 ``--publish``（视为审核通过）或 ``intel publish``
+    才把暂存区内容放进执行目录。rollback 是对**已发布历史版本**的
+    显式回退操作，视为已审核，仍直接发布。
+    """
 
     def __init__(
         self,
         data_dir: str | Path,
         remote_dir: str | Path,
         publish_dir: str | Path,
+        staging_dir: str | Path | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.remote_dir = Path(remote_dir)
         self.publish_dir = Path(publish_dir)
+        # 暂存区根目录：不给就在 data_dir/staging（与 remote/publish 平级）
+        self.staging_dir = Path(staging_dir) if staging_dir else self.data_dir / "staging"
         self.state = StateStore(self.data_dir)
         self.repos, self.warnings = load_repositories(self.data_dir)
 
@@ -231,8 +246,14 @@ class Updater:
         return out
 
     # ── update：增量落地 ──────────────────────────────────────────
-    def update(self, repo: str | None = None, force: bool = False) -> list[dict]:
+    def update(
+        self, repo: str | None = None, force: bool = False,
+        publish: bool | None = None,
+    ) -> list[dict]:
         """执行增量更新。返回每个仓库的更新摘要。
+
+        ``publish``：True = 直接发布到执行目录（视为审核通过，即 CLI
+        的 ``--publish``）；False/None = 先进隔离暂存区（P2-12 默认）。
 
         单仓库失败（网络 / git 异常）只影响该仓库，其余继续——
         外部依赖失败自动降级、不崩流水线。
@@ -247,10 +268,11 @@ class Updater:
                 "removed": 0,
                 "invalid": 0,
                 "published": 0,
+                "staged": 0,
                 "errors": [],
             }
             try:
-                self._update_one(cfg, summary, force)
+                self._update_one(cfg, summary, force, publish=publish)
             except GitSyncError as exc:
                 summary["status"] = "error"
                 summary["errors"].append(str(exc))
@@ -269,7 +291,10 @@ class Updater:
         self.state.save()
         return results
 
-    def _update_one(self, cfg: RepoConfig, summary: dict, force: bool) -> None:
+    def _update_one(
+        self, cfg: RepoConfig, summary: dict, force: bool,
+        publish: bool | None = None,
+    ) -> None:
         sync = self._sync(cfg)
         if not cfg.url:
             summary["status"] = "no-url"
@@ -336,8 +361,15 @@ class Updater:
             else:
                 summary["added"] += 1
 
-        published, pub_errors = reg.publish_all(remote)
-        summary["published"] = published
+        if publish:
+            # 显式审核通过：直接发布到执行目录
+            published, pub_errors = reg.publish_all(remote)
+            summary["published"] = published
+        else:
+            # 默认进隔离暂存区：执行目录不受外部内容影响（P2-12）。
+            # 暂存内容同样逐条校验，坏文件进不了暂存区。
+            staged, pub_errors = reg.publish_all(remote, dest=self.staging_dir / cfg.name)
+            summary["staged"] = staged
         summary["errors"].extend(pub_errors)
         reg.save()
 
@@ -352,6 +384,51 @@ class Updater:
                 return rid
         return None
 
+    # ── promote：暂存区 → 执行目录（审核通过后的发布动作）─────────
+    def promote(self, repo: str) -> dict:
+        """把暂存区里某仓库的规则发布到执行目录（P2-12 的"审核通过"步骤）。
+
+        暂存内容在发布前**再校验一遍**：暂存区只是隔离，不是信任——
+        落进执行目录的每个文件都必须当场通过 schema 校验。
+        """
+        src = self.staging_dir / repo
+        if not src.is_dir():
+            raise GitSyncError(f"暂存区没有仓库 {repo} 的待发布内容")
+        cfg = self._repo_by_name(repo)
+        if cfg is None:
+            raise GitSyncError(f"未配置仓库: {repo}")
+        dest = self.publish_dir / repo
+        errors: list[str] = []
+        n = 0
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in sorted(src.rglob("*.y*ml")):
+            data = f.read_bytes()
+            res = validate_rule_bytes(data, source_name=str(f.relative_to(src)))
+            if not res.ok:
+                errors.append(f"{f.relative_to(src)}: {res.error}")
+                continue
+            rel = f.relative_to(src)
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            (dest / rel).write_bytes(data)
+            n += 1
+        self.state.append_history(
+            {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "action": "promote",
+                "repo": repo,
+                "published": n,
+                "errors": errors,
+                "status": "ok" if not errors else "partial",
+            }
+        )
+        self.state.save()
+        return {"repo": repo, "published": n, "errors": errors}
+
+    def _repo_by_name(self, name: str) -> RepoConfig | None:
+        return next((r for r in self.repos if r.name == name), None)
+
     # ── status：本地规则状态 ──────────────────────────────────────
     def status(self) -> list[dict]:
         out: list[dict] = []
@@ -363,6 +440,12 @@ class Updater:
             published = (
                 sum(1 for _ in published_dir.rglob("*.yaml"))
                 if published_dir.is_dir()
+                else 0
+            )
+            staged_dir = self.staging_dir / cfg.name
+            staged = (
+                sum(1 for _ in staged_dir.rglob("*.y*ml"))
+                if staged_dir.is_dir()
                 else 0
             )
             out.append(
@@ -377,6 +460,7 @@ class Updater:
                     "last_sync": self.repo_sync_time(cfg.name),
                     **stats,
                     "published": published,
+                    "staged": staged,
                 }
             )
         return out

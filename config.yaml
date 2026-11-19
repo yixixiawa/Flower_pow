@@ -115,7 +115,7 @@ llm:
 # ── 接口测试生命周期权限控制（policy/，默认保守：判不出环境一律拒绝 L1/L2）──
 # 规则矩阵见 policy/api_policy.py 的 rules_table_markdown()。
 policy:
-  # 权限控制总开关。关掉 = 回到"只有 readonly 一道闸"的旧行为
+  # 【已废弃】安全策略强制执行，恒生效——任何配置都不能把权限控制关掉
   enabled: true
   # 未命中 host 绑定表时的默认环境：unknown / production /
   # dedicated_test / isolated_test。默认 unknown（L1/L2 条件不满足 → 拒绝执行）
@@ -125,11 +125,11 @@ policy:
   # environments:
   #   "192.168.*": isolated_test
   #   "10.0.2.*": dedicated_test
-  # 显式审批表：L3 命令（批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行）
-  # 只有出现在这里（且目标为测试环境 + readonly off）才有明示出路；
-  # 生产环境的危险操作不因审批解锁
+  # 单独审批表：只对 L2「删除测试数据」生效（矩阵明文"需要单独审批"）。
+  # L3 命令（批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行）写进这里
+  # 【没有任何效果】——L3 一律拒绝，审批不设出路
   # approvals:
-  #   "SQL 注入验证": true
+  #   "删除测试数据": true
   # 审计日志（data/policy/audit.jsonl）：允许、拒绝、审批全部留痕
   audit: true
 

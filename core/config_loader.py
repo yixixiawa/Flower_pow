@@ -185,16 +185,17 @@ class PolicyConfig(BaseModel):
     把目标 host 绑到隔离/专门测试环境。
     """
 
-    # 权限控制总开关。关掉 = 回到"只有 readonly 一道闸"的旧行为
+    # 【已废弃】安全策略强制执行，此开关不再生效（P0 整改：任何配置都
+    # 不能把权限控制整体关掉）。保留字段只为兼容旧配置文件不报错。
     enabled: bool = Field(default=True)
     # 未命中 host 绑定表时的默认环境：unknown / production /
     # dedicated_test / isolated_test。默认 unknown（保守方向）
     default_environment: str = Field(default="unknown")
     # host 通配 → 环境，如 {"192.168.*": "isolated_test", "10.0.2.*": "dedicated_test"}
     environments: dict[str, str] = Field(default_factory=dict)
-    # 显式审批表：{"删除测试数据": true}。L3 命令只有出现在这里
-    # （且目标为测试环境 + readonly off）才有一条明示的出路；
-    # 生产环境的危险操作不因审批解锁（Hybrid 规则）
+    # 单独审批表：**只对 L2「删除测试数据」生效**（矩阵明文"需要单独审批"）。
+    # L3 命令（批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行）写进这里
+    # 不会有任何效果——P0 整改后 L3 一律拒绝，审批不设出路。
     approvals: dict[str, bool] = Field(default_factory=dict)
     # 审计日志开关（policy/audit_logger）
     audit: bool = Field(default=True)

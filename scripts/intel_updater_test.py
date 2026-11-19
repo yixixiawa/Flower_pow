@@ -165,11 +165,19 @@ def main() -> int:
             "nuclei 模板登记且不发布",
         )
         demo = publish_dir / "community-poc" / "community-demo-rule.yaml"
-        check(demo.is_file(), "flower 规则发布到 poc/community")
+        staged_demo = data_dir / "staging" / "community-poc" / "community-demo-rule.yaml"
+        # P2-12：默认先入隔离暂存区，执行目录不受外部内容影响
+        check(r1["staged"] == 1 and r1["published"] == 0, "首次同步只进暂存区", r1)
+        check(staged_demo.is_file(), "flower 规则落在暂存区")
+        check(not demo.is_file(), "执行目录在审核发布前不受影响")
         check(
-            not (publish_dir / "community-poc" / "nuclei-demo.yaml").exists(),
-            "nuclei 模板不发布",
+            not (data_dir / "staging" / "community-poc" / "nuclei-demo.yaml").exists(),
+            "nuclei 模板不进暂存区",
         )
+        # 审核通过：promote 发布到执行目录
+        pr = upd.promote("community-poc")
+        check(pr["published"] == 1 and not pr["errors"], "promote 发布暂存规则", pr)
+        check(demo.is_file(), "审核后规则进入执行目录 poc/community")
         manifest = json.loads(
             (remote_dir / "community-poc" / "manifest.json").read_text(encoding="utf-8")
         )
@@ -190,7 +198,8 @@ def main() -> int:
         state = json.loads((data_dir / "state.json").read_text(encoding="utf-8"))
         check(state["repos"]["community-poc"]["last_commit"] == sha1, "state 记录 Commit SHA")
         hist = json.loads((data_dir / "history.json").read_text(encoding="utf-8"))
-        check(len(hist) == 1 and hist[0]["action"] == "update", "history 记录更新事件")
+        check(hist[0]["action"] == "update" and any(h["action"] == "promote" for h in hist),
+              "history 记录 update 与 promote 事件", [h["action"] for h in hist])
 
         # ── 2. 无变化：跳过 ──
         r2 = upd.update()[0]
@@ -218,10 +227,18 @@ def main() -> int:
         check(e2["commit"] == sha2, "元数据 commit 刷新")
         check(e2["sha256"] != e1["sha256"], "sha256 随内容变化")
         check(e2["first_seen"] == e1["first_seen"], "first_seen 保持不变")
-        published = (publish_dir / "community-poc" / "community-demo-rule.yaml").read_text(
-            encoding="utf-8"
-        )
-        check("demo-marker-v2" in published, "发布内容同步为新版本")
+        # P2-12：增量更新先进暂存区，审核发布后内容才同步
+        check("demo-marker-v2" not in demo.read_text(encoding="utf-8"),
+              "执行目录在审核前保持旧版本")
+        pr3 = upd.promote("community-poc")
+        check(pr3["published"] == 2, "审核发布暂存区全部规则", pr3)
+        check("demo-marker-v2" in demo.read_text(encoding="utf-8"), "审核后内容同步为新版本")
+
+        # --publish 直发路径：审核通过时跳过暂存区
+        (rules / "direct.yaml").write_text(FLOWER_EXTRA, encoding="utf-8")
+        _commit_remote(work, "v2b: direct publish")
+        r3b = upd.update(publish=True)[0]
+        check(r3b["published"] == 2 and r3b["updated"] == 1, "--publish 直接进执行目录", r3b)
 
         # ── 4. 未变内容重刷不涨版本号（force 全量重注册同一份内容）──
         (rules / "untouched.yaml").write_text(
@@ -241,15 +258,19 @@ def main() -> int:
 
         # ── 7. 远程删除 → removed ──
         sha3 = _git("rev-parse", "HEAD", cwd=str(work))  # v3 的 SHA（回滚目标）
+        # v2b 之后 community-extra-rule 的登记文件已切到 rules/direct.yaml，
+        # 两个文件都删掉才能覆盖到该 rule_id
         (rules / "extra.yaml").unlink()
+        (rules / "direct.yaml").unlink()
         _commit_remote(work, "v4: remove extra")
         r4 = upd.update()[0]
         check(r4["removed"] == 1, "远程删除计入 removed", r4)
         reg.load()
         check(reg.rules["community-extra-rule"]["status"] == "removed", "下架状态落盘")
+        # P2-12：暂存模式下架先体现在暂存区（执行目录等 promote/回滚收敛）
         check(
-            not (publish_dir / "community-poc" / "community-extra-rule.yaml").exists(),
-            "下架规则从发布目录清除",
+            not (data_dir / "staging" / "community-poc" / "community-extra-rule.yaml").exists(),
+            "下架规则从暂存区清除",
         )
 
         # ── 8. 回滚（无 --to → 回退到上一已同步 Commit，即 v3）──
@@ -324,7 +345,7 @@ def main() -> int:
         intel_grp = next(g for g in typer_app.registered_groups if g.name == "intel")
         sub_names = {c.name for c in intel_grp.typer_instance.registered_commands}
         check(
-            {"check", "update", "status", "rollback", "cve"} <= sub_names,
+            {"check", "update", "status", "rollback", "cve", "publish"} <= sub_names,
             "intel 子命令齐全",
             sub_names,
         )
