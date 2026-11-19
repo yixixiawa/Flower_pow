@@ -77,6 +77,29 @@ def _boot(
     _run_default(config, api_key or "", save_key, no_probe, classic, kickoff)
 
 
+def _auto_update_rules(cfg: Config) -> None:
+    """动态规则库按天自动更新（跨天首次启动才触发，当天不重复）。
+
+    刻意放在体检**之前**：规则更新只依赖 git + 网络，不依赖 API Key；
+    且更新完成后 POC 加载器立即能看到最新规则。失败（无网络 / 无 git）
+    静默降级——规则是增强项，绝不能挡住扫描启动。有增量时打一行摘要。
+    """
+    try:
+        from intel.updater.scheduler import auto_update_if_due
+
+        summary = auto_update_if_due(cfg)
+    except Exception:  # noqa: BLE001 —— 同上，绝不阻塞启动
+        return
+    if not summary:
+        return
+    bits = [
+        f"{r['repo']} +{r['added']} ~{r['updated']} -{r['removed']}"
+        + (f" !{r['invalid']}" if r["invalid"] else "")
+        for r in summary["repos"]
+    ]
+    console.print(f"[dim]规则库已按天自动更新：{' · '.join(bits)}[/dim]")
+
+
 def _run_default(
     config: str | None,
     api_key: str,
@@ -94,6 +117,7 @@ def _run_default(
     _reconfigure_console_utf8()
 
     cfg = _cfg(config)
+    _auto_update_rules(cfg)
     interactive = bool(sys.stdin and sys.stdin.isatty())
 
     boot = run_bootstrap(

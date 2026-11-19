@@ -30,6 +30,33 @@ def write_json(
     # 顶层再给一份汇总：消费方经常直接读 JSON 出图表，不该逼它自己去
     # 遍历 findings 数 dismissed 标记（写漏一次统计就多算一条误报）。
     data["active_findings"] = len(result.active_findings())
+    # 三档口径（与报告一致）：只有 confirmed 计入漏洞数量；
+    # needs_review 单列、rejected 单列，都不删——复核记录本身是交付物的一部分。
+    data["status_counts"] = result.status_counts()
+    data["needs_review"] = [
+        {
+            "poc_id": f.poc_id,
+            "name": f.name,
+            "severity": f.severity.value,
+            "matched_at": f.matched_at,
+            "evidence_score": round(f.evidence_score, 4),
+            "quality": f.quality.to_dict() if f.quality else None,
+            "reason": f.status_reason,
+        }
+        for f in result.needs_review_findings()
+    ]
+    data["rejected"] = [
+        {
+            "poc_id": f.poc_id,
+            "name": f.name,
+            "severity": f.severity.value,
+            "matched_at": f.matched_at,
+            "evidence_score": round(f.evidence_score, 4),
+            "reason": f.dismiss_reason or f.status_reason,
+            "dismissed_at": f.dismissed_at,
+        }
+        for f in result.rejected_findings()
+    ]
     data["excluded"] = [
         {
             "poc_id": f.poc_id,

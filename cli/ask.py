@@ -1,4 +1,8 @@
-"""检索与情报：``ask``（只 RAG 检索，不发请求）/ ``intel``（查外部 CVE）。"""
+"""检索：``ask``（只 RAG 检索，不发请求）。
+
+原来的 ``intel``（CVE 情报查询）已迁移为 ``cli.intel`` 的 ``intel cve`` 子命令，
+与规则库管理命令（check/update/status/rollback）挂在同一棵子树下。
+"""
 
 from __future__ import annotations
 
@@ -76,46 +80,3 @@ def ask(
     if out.notes:
         for n in out.notes:
             console.print(f"[dim]· {n}[/dim]")
-
-
-# ── intel ─────────────────────────────────────────────────────────
-
-
-@app.command()
-def intel(
-    cve: str = typer.Argument(..., help="CVE 编号，如 CVE-2021-44228"),
-    refresh: bool = typer.Option(False, "--refresh", help="强制刷新本地缓存"),
-) -> None:
-    """查询外部 CVE 情报（CVSS / KEV / EPSS，来自 pocindex.io 元数据）。"""
-    from kb.intel import get_intel
-
-    store = get_intel()
-    if refresh:
-        n = store.refresh(force=True)
-        console.print(f"[+] 已刷新，本地共 {n} 条 CVE 情报")
-    info = store.lookup(cve)
-    if not info:
-        err.print(f"[yellow]未找到 {cve} 的情报（可能该 CVE 尚无公开 PoC记录）[/yellow]")
-        raise typer.Exit(1)
-
-    t = Table(title=f"{cve}")
-    t.add_column("字段")
-    t.add_column("值")
-    t.add_row("CVSS", f"{info.cvss}" if info.cvss is not None else "-")
-    t.add_row("等级", info.severity or "-")
-    t.add_row("向量", info.vector or "-")
-    t.add_row("CISA KEV", "[red]在野利用[/red]" if info.kev else "否")
-    t.add_row(
-        "EPSS",
-        f"{info.epss:.1%}" if info.epss is not None else "-",
-    )
-    t.add_row("有公开 PoC", "是" if info.has_poc else "否")
-    t.add_row("有 Nuclei 模板", "是" if info.has_nuclei else "否")
-    console.print(t)
-    if info.description:
-        console.print(Panel(info.description[:800], title="描述", border_style="dim"))
-    if store.errors:
-        for e in store.errors:
-            console.print(f"[dim]· {e}[/dim]")
-
-

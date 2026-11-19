@@ -16,8 +16,9 @@ RAG（kb）读它做检索匹配，调度器（core/scheduler）读它决定下�
 模块分块
 ========
 =====================  ==========================================================
-``enums``             ``Severity`` / ``Category``——依赖为零的下游公共底座
+``enums``             ``Severity`` / ``Category`` / ``FindingStatus``（三档定级）
 ``poc``               POC 声明模型（对应 ``poc/*.yaml``）：怎么匹配，不含状态
+``quality``           ``EvidenceQuality`` 六维证据评分 + ``decide_status`` 定级规则
 ``models``            运行时对象（Evidence/Finding/ScanResult…）与误报排除
 ``util``              纯函数（正则缓存 / 文件名清洗 / dataclass 序列化）
 =====================  ==========================================================
@@ -30,7 +31,7 @@ RAG（kb）读它做检索匹配，调度器（core/scheduler）读它决定下�
 
 from __future__ import annotations
 
-from core.state.enums import Category, Severity
+from core.state.enums import Category, FindingStatus, Severity
 from core.state.models import (
    AttackChain,
    AttackStep,
@@ -43,10 +44,12 @@ from core.state.models import (
     restore_finding,
 )
 from core.state.poc import MatchOp, MatchRule, MatchTarget, POC, RequestSpec
+from core.state.quality import EvidenceQuality, decide_status
 from core.state.util import dataclass_to_dict, re_search, safe_name
 
 __all__ = [
-    "Severity", "Category",
+    "Severity", "Category", "FindingStatus",
+    "EvidenceQuality", "decide_status",
     "MatchTarget", "MatchOp", "MatchRule", "RequestSpec", "POC",
    "Evidence", "Fingerprint", "Asset", "AttackStep", "AttackChain", "Finding",
     "dismiss_finding", "restore_finding",

@@ -141,6 +141,18 @@ def write_markdown(
             if result.dismissed_findings()
             else []
         ),
+    ]
+    # 三档口径单列：**只有"已确认漏洞"计入漏洞数量**。待复核项常被误读成
+    # "漏报的漏洞"，所以必须写清它不计入数量，且说明为什么留着。
+    _sc = result.status_counts()
+    L += [
+        f"| 已确认漏洞 | {_sc['confirmed']} 条 |",
+        f"| 待人工复核 | {_sc['needs_review']} 条"
+        f"（有可疑现象但证据不足，**不计入**已确认漏洞数量） |",
+        f"| 误报 / 无效命中 | {_sc['rejected']} 条"
+        f"（不符合漏洞条件，保留复核记录，不进入正式漏洞列表） |",
+    ]
+    L += [
         "",
         "## 风险概览",
         "",
@@ -243,10 +255,21 @@ def write_markdown(
                 f"RAG 得分：{f.rag_score:.3f}"
             )
             L.append(f"- 命中：{unescape_md(f.matched_at)}")
+            L.append(f"- 定级：**{f.status.label}**（{unescape_md(f.status_reason or '—')}）")
+            q = f.quality
+            if q is not None:
+                L.append(f"- 证据质量：{q.summary()}　{q.line()}")
+            elif f.evidence_score:
+                L.append(f"- 证据质量：{f.evidence_score:.2f}（未保存六维明细）")
             if f.cve:
                 L.append(f"- CVE：{', '.join(f.cve)}")
             if f.verdict:
-                L.append(f"- 研判：{f.verdict}（置信度 {f.confidence:.0%}）")
+                # 说清"置信度"是什么：它是模型自评，不是漏洞概率。
+                # 报告读者最容易在这里误读，所以标签必须写明。
+                L.append(
+                    f"- AI 研判：{f.verdict}（模型自评信心 {f.confidence:.0%}，"
+                    f"**不是**漏洞为真的概率）"
+                )
             if f.rationale:
                 L.append(f"- 研判依据：{f.rationale}")
             if f.tags:
@@ -320,20 +343,53 @@ def write_markdown(
             L.append(fix or "（暂无针对性建议，请按漏洞类别做专项排查）")
             L.append("")
 
+    # ── 待人工复核附录 ─────────────────────────────────────────────
+    # 这一档**不是漏洞**，也不能删：它有可疑现象、只是证据不够。
+    # 单列出来是为了让人工复核有入口——写进正文会虚增漏洞数，直接丢掉
+    # 又会把线索一起丢掉。
+    review = result.needs_review_findings()
+    if review:
+        L += [
+            "",
+            "## 待人工复核（不计入已确认漏洞）",
+            "",
+            "> 以下项**有可疑现象但证据不足**，未计入上面的漏洞数量，也**不是误报**。"
+            "列在这里供人工复核：每条附了证据评分与缺项，补足取证后可升级为已确认。",
+            "",
+            "| 编号 | 等级 | 名称 | 位置 | 证据分 | 待补证据 / 原因 |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for f in sorted(review, key=lambda x: x.severity.rank, reverse=True):
+            q = f.quality
+            score = f"{q.summary()}" if q is not None else (
+                f"{f.evidence_score:.2f}" if f.evidence_score else "-"
+            )
+            gaps = ("；".join(q.gaps()[:3]) if q is not None else "")
+            rsn = (f.status_reason or "证据不足").replace("|", "\\|")[:80]
+            if gaps:
+                rsn = f"{rsn}（缺：{gaps}）"
+            loc = f.matched_at.replace("|", "\\|")[:80]
+            name = f.name.replace("|", "\\|")[:36]
+            L.append(
+                f"| `{f.poc_id}` | {f.severity.label} | {name} | {loc} | {score} | {rsn} |"
+            )
+        L.append("")
+
     # ── 误报复核附录 ───────────────────────────────────────────────
     # 为什么被排除的发现**不能悄悄消失**：客户一定会问「上次报的 XX 怎么没了」。
     # 报告要么能解释，要么就是不可信的。所以排除项单列一节，写明位置、原因、时间。
-    dismissed = result.dismissed_findings()
-    if dismissed:
+    rejected = result.rejected_findings()
+    if rejected:
         from datetime import datetime as _dt
 
         L += [
             "",
             "## 已排除的发现（误报复核）",
             "",
-            "> 以下项经复核判定为**误报**，未计入上面的风险统计。"
+            "> 以下项经复核判定为**误报或无效命中**，未计入上面的风险统计。"
             "列在这里是为了让排除本身可复核——"
-            "每条都附了排除原因：人工排除写的是判定依据，自动判定的会写明取证结果。",
+            "每条都附了排除原因：人工排除写的是判定依据，自动判定的会写明取证结果"
+            "（无响应 / 与随机路径基线一致 / 通用错误页）。",
             "",
             "> 最常见的误报类型是「公开演示站点」：站点本就建给人看，"
             "其中暴露的配置、默认账号、接口文档属于设计而非漏洞。"
@@ -343,14 +399,14 @@ def write_markdown(
             "| 编号 | 等级 | 名称 | 位置 | 排除原因 | 时间 |",
             "| --- | --- | --- | --- | --- | --- |",
         ]
-        for f in sorted(dismissed, key=lambda x: x.severity.rank, reverse=True):
+        for f in sorted(rejected, key=lambda x: x.severity.rank, reverse=True):
             when = (
                 _dt.fromtimestamp(f.dismissed_at).strftime("%Y-%m-%d %H:%M")
                 if f.dismissed_at
                 else "-"
             )
             loc = f.matched_at.replace("|", "\\|")[:90]
-            rsn = (f.dismiss_reason or "-").replace("|", "\\|")[:80]
+            rsn = (f.dismiss_reason or f.status_reason or "-").replace("|", "\\|")[:80]
             name = f.name.replace("|", "\\|")[:40]
             L.append(
                 f"| `{f.poc_id}` | {f.severity.label} | {name} | {loc} | {rsn} | {when} |"

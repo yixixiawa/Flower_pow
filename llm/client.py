@@ -401,27 +401,41 @@ class LLMClient:
     def apply_triage(
         findings: list[Finding], verdicts: dict[str, dict[str, Any]]
     ) -> tuple[list[Finding], list[Finding]]:
-        """把研判结果写回 findings。返回 ``(确认列表, 被过滤列表)``。"""
+        """把研判结果写回 findings。返回 ``(已确认列表, 判为误报列表)``。
+
+        **模型不再直接决定定级。** 它只产出三样东西：``verdict``（它对证据的
+        归类）、``confidence``（它对自己判断的信心）、``rationale``（理由）。
+        最终 ``status`` 由 :func:`core.state.quality.decide_status` 按**客观
+        证据分**决定——模型的作用是"可以降级"（判误报时压到待复核），
+        而不是"可以定性"。0.95 的置信度不是 95% 的真阳性率，把它当概率用
+        就是误报的来源。
+        """
+        from core.state.quality import decide_status
+
         confirmed: list[Finding] = []
         rejected: list[Finding] = []
         for idx, f in enumerate(findings):
             v = verdicts.get(f"{f.poc_id}#{idx}")
-            if not v:
+            if v:
+                f.verdict = v["verdict"]
+                f.confidence = v["confidence"]
+                f.rationale = v["rationale"]
+                if v["verdict"] == "false_positive":
+                    f.tags = list({*f.tags, "llm-reject"})
+                elif v["verdict"] == "needs_manual" and "needs-manual" not in f.tags:
+                    f.tags = list({*f.tags, "needs-manual"})
+            # 没有研判结果时也重算一次：证据分可能已足够确认（或本就不足）
+            f.status, f.status_reason = decide_status(
+                f.quality,
+                verdict=f.verdict,
+                llm_confidence=f.confidence,
+                evidence_score=f.evidence_score,
+            )
+            if f.confirmed:
                 confirmed.append(f)
-                continue
-            f.verdict = v["verdict"]
-            f.confidence = v["confidence"]
-            f.rationale = v["rationale"]
-            if v["verdict"] == "true_positive":
-                f.confirmed = True
-                confirmed.append(f)
-            elif v["verdict"] == "false_positive":
-                f.confirmed = False
+            elif f.rejected:
                 rejected.append(f)
-            else:
-                f.confirmed = True
-                f.tags = list({*f.tags, "needs-manual"})
-                confirmed.append(f)
+            # NEEDS_REVIEW 两个列表都不进：它既不是"确认"，也不是"误报"
         return confirmed, rejected
 
     # ── 3. 报告生成 ──────────────────────────────────────────────

@@ -137,6 +137,9 @@ def write_html(
 <div>{chips}</div>
 <div class="meta">目标 {html.escape(result.target)} · {_ts(result.started_at)} ·
  耗时 {result.duration:.1f}s · 有效发现 {len(result.active_findings())} 条{
+   f' · 待人工复核 {len(result.needs_review_findings())} 条'
+   f'（不计入确认漏洞）'
+   if result.needs_review_findings() else ''}{
    f' · 已排除（误报）{len(result.dismissed_findings())} 条'
    if result.dismissed_findings() else ''}</div>
 <hr>

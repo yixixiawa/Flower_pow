@@ -59,6 +59,11 @@ class _VerifyMixin:
         #     而且必须先有接口清单（OpenAPI 或 JS 端点）才有意义。
         await self._phase4b_exploit(result, verbose)
 
+        # 4.6) 第二次独立验证：完整性 → 反向验证 → 独立复测 → 定级
+        #      **必须放在研判之前**：模型只该看已经取证过的事实，不该替我们
+        #      决定"这条到底算不算漏洞"（它的置信度不是概率，见 quality.py）。
+        await self._phase4c_second_pass(result, verbose)
+
     async def _phase4b_exploit(self, result: ScanResult, verbose: bool) -> None:
         """一次性高危探针。
 
@@ -111,6 +116,60 @@ class _VerifyMixin:
             )
         result.phases["exploit"] = round(time.perf_counter() - t0, 2)
 
+    # ── 阶段 4.6：第二次独立验证 ─────────────────────────────────
+    async def _phase4c_second_pass(self, result: ScanResult, verbose: bool) -> None:
+        """对全部原始命中做独立取证，产出 ``evidence_score`` 与三档定级。
+
+        为什么不能只看一次命中：软 404、通用 200 页面、一次网络抖动都能
+        让"命中"成立而"漏洞"不成立。这一步用**同一 site 的基线**与**第二次
+        请求**把它们区分开（见 :mod:`detectors.second_pass`）。
+
+        异常处理原则：二次验证是增强，失败一律降级为「待人工复核」，
+        绝不把已经拿到的发现丢掉。
+        """
+        t0 = time.perf_counter()
+        if not result.findings:
+            result.phases["second_pass"] = 0.0
+            return
+        if not getattr(self.cfg.scan, "second_pass_enabled", True):
+            result.notes.append(
+                "第二次独立验证已关闭：命中只凭首次响应定级，"
+                "缺基线对照与独立复测的项都会落到待人工复核"
+            )
+            result.phases["second_pass"] = 0.0
+            return
+
+        from detectors.second_pass import SecondPassVerifier
+
+        det = HttpDetector(self.cfg.scan)
+        try:
+            verifier = SecondPassVerifier(
+                det,
+                base_url=result.target,
+                poc_lookup=self._poc_map,
+                retest_enabled=bool(getattr(self.cfg.scan, "second_pass_retest", True)),
+            )
+            stats = await verifier.run(result.findings)
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"二次验证异常: {type(exc).__name__}: {exc}")
+            result.phases["second_pass"] = round(time.perf_counter() - t0, 2)
+            return
+        finally:
+            await det.aclose()
+
+        result.notes.append(
+            f"二次验证：确认 {stats['confirmed']} / 待复核 {stats['needs_review']}"
+            f" / 误报 {stats['rejected']}（独立复测 {stats['retested']} 条，"
+            f"按非破坏性原则跳过 {stats['retest_skipped']} 条）"
+        )
+        if verbose:
+            self._log(
+                f"[3.5/5] 二次验证 {stats['checked']} 条 → 确认 {stats['confirmed']}"
+                f"、待复核 {stats['needs_review']}、误报 {stats['rejected']}",
+                verbose,
+            )
+        result.phases["second_pass"] = round(time.perf_counter() - t0, 2)
+
     # ── 阶段 5：降误报研判 ───────────────────────────────────────
     async def _phase5_triage(self, result: ScanResult, verbose: bool) -> None:
         t0 = time.perf_counter()
@@ -119,12 +178,11 @@ class _VerifyMixin:
             return
 
         if not self.llm.available:
-            result.notes.append("LLM 未配置：所有原始命中均按规则保留，未做误报过滤")
+            result.notes.append("LLM 未配置：不做研判，定级完全依据客观证据评分")
             if verbose:
                 self._log("[4/5] 跳过 LLM 研判（未配置 API Key）", verbose)
             result.phases["triage"] = round(time.perf_counter() - t0, 2)
-            # 没有研判就没有误报过滤，原始命中里 false positive 占比很高。
-            # 此时沉淀等于把噪声喂回召回，所以要求「必须研判过且置信度达标」
+            # 没有研判就没有模型补充判断，沉淀完全靠证据评分把关
             # （require_triage）——未研判项 confidence=0，会被严格挡下。
             if self.cfg.rag.knowledge_enabled and result.findings:
                 self._ingest_knowledge(result, verbose, require_triage=True)
@@ -134,35 +192,29 @@ class _VerifyMixin:
             self._log(f"[4/5] LLM 研判 {len(result.findings)} 条命中…", verbose)
         verdicts = self.llm.triage(result.findings)
         if not verdicts:
-            result.notes.append("LLM 研判失败或返回空：保留全部原始命中")
+            result.notes.append("LLM 研判失败或返回空：保留全部命中，定级沿用证据评分")
         else:
             confirmed, rejected = self.llm.apply_triage(result.findings, verdicts)
-            #过滤误报，但保留在 session 里供复核
-            rejected_ids = {id(f) for f in rejected}
-            result.findings = [f for f in result.findings if id(f) not in rejected_ids]
+            # **不再从 findings 里删除**：误报也是复核记录的一部分。
+            # 状态已经落到 REJECTED，报告正文/数量统计自然不会带它。
             result.notes.append(
-                f"LLM 研判：确认 {len(confirmed)} 条，过滤误报 {len(rejected)} 条"
-                f"（误报详情见会话快照 findings_all）"
+                f"LLM 研判：确认 {len(confirmed)} 条，判为误报 {len(rejected)} 条，"
+                f"待复核 {len(result.needs_review_findings())} 条"
+                f"（证据分不因模型置信度改变；0.95 不是 95% 的概率）"
             )
             if rejected and verbose:
-                self._log(f"      过滤误报 {len(rejected)} 条", verbose)
-            # 把被过滤的也写进 notes，便于人工复核
+                self._log(f"      模型判误报 {len(rejected)} 条（已转待复核/误报档）", verbose)
             for f in rejected[:5]:
                 result.notes.append(
-                    f"已过滤误报: {f.poc_id} —— {f.rationale or '模型判定为误报'}"
+                    f"模型判误报: {f.poc_id} —— {f.rationale or '模型判定为误报'}"
                 )
-            result.notes.append(
-                f"（被过滤项: "
-                + ", ".join(f.poc_id for f in rejected[:10])
-                + "）"
-            )
 
         result.findings.sort(key=lambda f: (f.severity.rank, f.confidence), reverse=True)
         result.phases["triage"] = round(time.perf_counter() - t0, 2)
 
         # ── 知识库沉淀 ────────────────────────────────────────────
-        # 放在研判**之后**：只有 confirmed 且非误报的发现才值得入库，
-        # 放在前面会把大量误报喂回召回，形成正反馈污染。
+        # 放在研判**之后**：只有 CONFIRMED 的发现才值得入库，
+        # 放在前面会把待复核项与误报喂回召回，形成正反馈污染。
         self._ingest_knowledge(result, verbose)
 
     def _ingest_knowledge(

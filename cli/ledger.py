@@ -238,6 +238,11 @@ def findings(
                             "matched_at": f.matched_at,
                             "dismissed": f.dismissed,
                             "dismiss_reason": f.dismiss_reason,
+                            # 三档定级 + 客观证据分（模型置信度不等于漏洞概率）
+                            "status": f.status.value,
+                            "status_label": f.status.label,
+                            "status_reason": f.status_reason,
+                            "evidence_score": round(f.evidence_score, 2),
                         }
                         for f in full
                     ],
@@ -251,20 +256,37 @@ def findings(
         console.print("[yellow]该会话没有发现[/yellow]")
         return
 
-    t = Table(title=f"发现（{len(active)} 条有效，{len(dismissed)} 条已排除）")
+    review = sess.result.needs_review_findings()
+    t = Table(
+        title=f"发现（已确认 {len(active)} · 待复核 {len(review)}"
+              f" · 误报 {len(sess.result.rejected_findings())}）"
+    )
     t.add_column("#", justify="right")
     t.add_column("等级")
     t.add_column("POC", overflow="fold")
     t.add_column("位置", overflow="fold")
+    t.add_column("证据分", justify="right")
     t.add_column("状态")
     for f in full:
-        status = "[dim]已排除[/dim]" if f.dismissed else "有效"
+        if f.dismissed:
+            status = "[dim]误报（人工排除）[/dim]"
+        elif f.status.value == "confirmed":
+            status = "[red]已确认[/red]"
+        elif f.status.value == "needs_review":
+            status = "[yellow]待复核[/yellow]"
+        else:
+            status = "[dim]误报/无效命中[/dim]"
+        score = f"{f.evidence_score:.2f}" if f.evidence_score else "-"
         t.add_row(str(idx[id(f)]), f.severity.label, f.poc_id,
-                  f.matched_at[:70], status)
+                  f.matched_at[:70], score, status)
     console.print(t)
     console.print(
         '[dim]排除误报：flower_pow findings <编号> -r "<依据>"'
         "　｜　看排除清单：--excluded[/dim]"
+    )
+    console.print(
+        "[dim]待复核项不是漏洞：它只是证据不足（缺基线对照/复测/专属特征），"
+        "补足取证后才会升级为已确认[/dim]"
     )
 
 

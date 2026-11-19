@@ -119,6 +119,14 @@ class ScanConfig(BaseModel):
     probe_concurrency: int = Field(default=4)
     # 响应内容硬上限（防止大文件把内存打爆）
     max_download_bytes: int = Field(default=2 * 1024 * 1024)
+    # ── 第二次独立验证（detectors/second_pass）───────────────────
+    # 命中后独立取证：证据完整性检查 + 反向验证（随机路径/首页基线比对）
+    # + 独立复测，然后按证据评分定级。关掉则只凭首次命中定级——
+    # 那种情况下绝大多数命中都会落到"待人工复核"，不建议关。
+    second_pass_enabled: bool = Field(default=True)
+    # 独立复测开关。只对 GET/HEAD 生效；POST/PUT 等非幂等方法**永远**跳过，
+    # 重放上传/删除请求等于再打一次目标。
+    second_pass_retest: bool = Field(default=True)
 
 
 class RAGConfig(BaseModel):
@@ -149,6 +157,23 @@ class RAGConfig(BaseModel):
     knowledge_min_confidence: float = Field(default=0.6)
     # 容量上限，超出按最后更新时间淘汰最旧的
     knowledge_max_entries: int = Field(default=2000)
+
+
+class IntelConfig(BaseModel):
+    """动态规则库（intel/updater）配置。
+
+    路径类字段支持相对路径——按 ``data_dir`` 的父目录（即项目根）锚定，
+    详见 :func:`intel.updater.scheduler._updater_from_config`。
+    """
+
+    # 启动时按天自动检查规则更新（同一天内不重复触发）
+    auto_update: bool = Field(default=True)
+    # 状态目录：state.json / history.json / repositories.json
+    data_dir: str = Field(default="./data/updater")
+    # 远程规则仓库的克隆根目录（remote_rules/<name>/ 即仓库工作区）
+    remote_dir: str = Field(default="./remote_rules")
+    # flower 形态规则的发布目录（poc_loader rglob 自动感知）
+    publish_dir: str = Field(default="./poc/community")
 
 
 class LLMConfig(BaseModel):
@@ -183,6 +208,7 @@ class Config(BaseModel):
     scan: ScanConfig = Field(default_factory=ScanConfig)
     rag: RAGConfig = Field(default_factory=RAGConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    intel: IntelConfig = Field(default_factory=IntelConfig)
     output_dir: str = Field(default="./output")
     data_dir: str = Field(default="./data")
 
@@ -378,6 +404,7 @@ def load_config(path: str | Path | None = None) -> Config:
         _apply_section(cfg.rag, raw.get("rag") or {})
         # 兼容旧配置里的 `ai:` 段
         _apply_section(cfg.llm, raw.get("llm") or raw.get("ai") or {})
+        _apply_section(cfg.intel, raw.get("intel") or {})
         for k in ("output_dir", "data_dir"):
             if raw.get(k) is not None:
                 setattr(cfg, k, raw[k])
@@ -409,6 +436,8 @@ def load_config(path: str | Path | None = None) -> Config:
     s.probe_max_ops = _env_int("POCS_PROBE_MAX_OPS", s.probe_max_ops)
     s.probe_error_abort = _env_int("POCS_PROBE_ERROR_ABORT", s.probe_error_abort)
     s.probe_concurrency = _env_int("POCS_PROBE_CONCURRENCY", s.probe_concurrency)
+    s.second_pass_enabled = _env_bool("POCS_SECOND_PASS", s.second_pass_enabled)
+    s.second_pass_retest = _env_bool("POCS_SECOND_PASS_RETEST", s.second_pass_retest)
     s.verify_tls = _env_bool("POCS_VERIFY_TLS", s.verify_tls)
     s.readonly = _env_bool("POCS_READONLY", s.readonly)
 

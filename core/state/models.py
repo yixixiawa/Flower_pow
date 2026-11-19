@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.state.enums import Category, Severity
+from core.state.enums import Category, FindingStatus, Severity
 from core.state.poc import POC
+from core.state.quality import EvidenceQuality, decide_status
 from core.state.util import safe_name
 
 
@@ -223,6 +224,20 @@ class AttackChain:
         )
 
 
+def _status_from_dict(d: dict[str, Any]) -> FindingStatus:
+    """从快照恢复定级，兼容没有 ``status`` 字段的旧快照。
+
+    旧快照里 ``confirmed=False`` 的语义是「模型判了误报、已从正式列表剔除」，
+    映射到 ``REJECTED`` 才能保持"口径不变"；缺字段则说明它当时就在正式列表里。
+    """
+    raw = d.get("status")
+    if raw:
+        return FindingStatus.parse(raw)
+    if "confirmed" in d:
+        return FindingStatus.CONFIRMED if d.get("confirmed") else FindingStatus.REJECTED
+    return FindingStatus.CONFIRMED
+
+
 @dataclass(slots=True)
 class Finding:
     """一条漏洞发现。"""
@@ -242,9 +257,23 @@ class Finding:
     rag_score: float = 0.0
     # LLM 研判结果
     verdict: str = ""# true_positive | false_positive | needs_manual
+    # **模型对自己判断的信心，不是"漏洞为真的概率"**。0.95 只说明模型
+    # 对这段证据有把握，和真实的真阳性率没有换算关系——最终定级看 status。
     confidence: float = 0.0
     rationale: str = ""
-    confirmed: bool = True
+    # ── 三档定级 + 客观证据质量（见 core/state/quality.py）──────────
+    # status 是**唯一权威**：只有 CONFIRMED 进正式报告、计入数量、沉淀知识库。
+    # 旧字段 ``confirmed`` 保留为只读属性（= status is CONFIRMED），
+    # 免得历史快照与外部脚本读取时炸掉。
+    status: FindingStatus = FindingStatus.CONFIRMED
+    # 为什么定到这一档（报告附录里逐条列出，复核时可追溯）
+    status_reason: str = ""
+    # 客观证据分（0~1），由六维加权算出；llm 置信度不参与这个分数
+    evidence_score: float = 0.0
+    # 六维明细（没跑二次验证的旧快照为 None）
+    quality: EvidenceQuality | None = None
+    # 二次验证的过程记录：完整性检查/反向验证/复测各自的结论
+    verify_notes: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     # ── 人工误报排除 ──────────────────────────────────────────────
     # 为什么不直接 ``del``：报告必须能解释"这条为什么没列出来"。硬删会连
@@ -266,6 +295,29 @@ class Finding:
         """是否仍计入有效发现（未被排除为误报）。"""
         return not self.dismissed
 
+    @property
+    def confirmed(self) -> bool:
+        """兼容旧字段：是否已确认。**唯一判据是 status**。
+
+        以前这是可写字段，模型判误报就把它置 False，等于让 LLM 直接决定
+        "这条不算漏洞"。现在它只读——定级走 :mod:`core.state.quality` 的
+        证据评分，模型结论只是其中一个（降级用）输入。
+        """
+        return self.status is FindingStatus.CONFIRMED
+
+    @property
+    def needs_review(self) -> bool:
+        return self.status is FindingStatus.NEEDS_REVIEW
+
+    @property
+    def rejected(self) -> bool:
+        return self.status is FindingStatus.REJECTED
+
+    @property
+    def llm_confidence(self) -> float:
+        """模型自评信心（语义见 :attr:`confidence`）。"""
+        return self.confidence
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "poc_id": self.poc_id,
@@ -283,6 +335,12 @@ class Finding:
             "verdict": self.verdict,
             "confidence": self.confidence,
             "rationale": self.rationale,
+            # 新三档定级 + 客观证据评分（老消费方读 "confirmed" 仍然可用）
+            "status": self.status.value,
+            "status_reason": self.status_reason,
+            "evidence_score": round(self.evidence_score, 4),
+            "quality": self.quality.to_dict() if self.quality else None,
+            "verify_notes": self.verify_notes,
             "confirmed": self.confirmed,
             "tags": self.tags,
             "dismissed": self.dismissed,
@@ -311,7 +369,11 @@ class Finding:
             verdict=str(d.get("verdict") or ""),
             confidence=float(d.get("confidence") or 0.0),
             rationale=str(d.get("rationale") or ""),
-            confirmed=bool(d.get("confirmed", True)),
+            status=_status_from_dict(d),
+            status_reason=str(d.get("status_reason") or ""),
+            evidence_score=float(d.get("evidence_score") or 0.0),
+            quality=EvidenceQuality.from_dict(d.get("quality")),
+            verify_notes=[str(x) for x in (d.get("verify_notes") or [])],
             tags=[str(x) for x in (d.get("tags") or [])],
             # 旧快照没有这三个字段——缺省即"未排除"，向后兼容
             dismissed=bool(d.get("dismissed", False)),
@@ -324,26 +386,44 @@ class Finding:
 
 
 def dismiss_finding(f: Finding, reason: str) -> None:
-    """把一条发现标记为误报（可撤销）。
+    """把一条发现标记为误报（可撤销）——同时落到 ``REJECTED`` 档。
 
-    **不动 verdict / confirmed**：那两个字段是探针与 LLM 研判的客观结论；
+    **不动 verdict / confidence**：那两个字段是探针与 LLM 研判的客观结论；
     "人工判定为误报"是另一层信息（谁、何时、为什么），单独记在 dismissed
     三件套里。混着写会让撤销变成有损操作——原来研判出的 true_positive
     一旦被覆盖就找不回来了。
+
+    **要动 status**：三档状态是"这条算不算正式漏洞"的权威口径，
+    人工判误报后它必须离开正式列表（否则报告正文还会列出来）。
+    撤销时按证据重新算，而不是记住旧值——证据更新后旧值会变陈旧。
     """
     f.dismissed = True
     f.dismiss_reason = (reason or "").strip() or "误报"
     f.dismissed_at = time.time()
+    f.status = FindingStatus.REJECTED
+    f.status_reason = f"人工判定误报：{f.dismiss_reason}"
     if "dismissed" not in f.tags:
         f.tags.append("dismissed")
 
 
 def restore_finding(f: Finding) -> None:
-    """撤销误报排除，让它重新计入有效发现。"""
+    """撤销误报排除，让它重新计入有效发现。
+
+    定级按**证据重新计算**（:func:`core.state.quality.decide_status`），
+    不复原到"排除前的那个值"：证据评分可能在此期间被补算过，
+    记一个陈旧快照反而会让撤销后的状态失真。
+    """
     f.dismissed = False
     f.dismiss_reason = ""
     f.dismissed_at = 0.0
     f.tags = [t for t in f.tags if t != "dismissed"]
+    f.status, f.status_reason = decide_status(
+        f.quality,
+        verdict=f.verdict,
+        llm_confidence=f.confidence,
+        evidence_score=f.evidence_score,
+    )
+    f.status_reason = f"撤销人工排除后按证据重算：{f.status_reason}"
 
 
 def _mark_if_excluded(target: str, f: Finding) -> bool:
@@ -401,32 +481,55 @@ class ScanResult:
     def duration(self) -> float:
         return (self.finished_at or time.time()) - self.started_at
 
-    # ── 有效发现 vs 已排除（误报）─────────────────────────────────
+    # ── 三档状态：正式列表 vs 待复核 vs 误报 ─────────────────────
     #
-    # ``counts()`` / ``by_severity()`` 一律**只算有效发现**，报告概览、风险
-    # 概览表、状态行都从这里取数——所以排除一条误报后，所有下游自动跟着变，
-    # 不需要在各处零散地加过滤条件（加漏一处就会"报告里删了、概览里还在"）。
-    # 已排除的发现仍留在 ``findings`` 里，供报告的"误报复核"附录使用。
+    # 口径（与需求一致）：
+    #   * ``confirmed_findings()`` —— **唯一**进正式报告、计入漏洞数量、
+    #     沉淀知识库的一档；
+    #   * ``needs_review_findings()`` —— 有可疑现象但证据不足，单列附录，
+    #     **不计入**已确认漏洞数量；
+    #   * ``rejected_findings()`` —— 误报/无效命中，保留复核记录（含人工排除项）。
+    #
+    # ``counts()`` / ``by_severity()`` 只算已确认，报告概览、风险表、状态行
+    # 都从这里取数——所以定级一变，所有下游自动跟着变，不需要各处零散过滤。
+    def confirmed_findings(self) -> list[Finding]:
+        return [f for f in self.findings if f.confirmed and not f.dismissed]
+
+    def needs_review_findings(self) -> list[Finding]:
+        return [f for f in self.findings if f.needs_review and not f.dismissed]
+
+    def rejected_findings(self) -> list[Finding]:
+        return [f for f in self.findings if f.rejected or f.dismissed]
+
     def active_findings(self) -> list[Finding]:
-        return [f for f in self.findings if f.active]
+        """仍计入有效发现的——即已确认且未被人工排除。"""
+        return self.confirmed_findings()
 
     def dismissed_findings(self) -> list[Finding]:
         return [f for f in self.findings if f.dismissed]
 
-    def counts(self) -> dict[str, int]:
-        c = {s.value: 0 for s in Severity}
+    def status_counts(self) -> dict[str, int]:
+        """三档计数（dismissed 一律归到 rejected）。"""
+        c = {s.value: 0 for s in FindingStatus}
         for f in self.findings:
             if f.dismissed:
-                continue
+                c[FindingStatus.REJECTED.value] += 1
+            else:
+                c[f.status.value] += 1
+        return c
+
+    def counts(self) -> dict[str, int]:
+        c = {s.value: 0 for s in Severity}
+        for f in self.confirmed_findings():
             c[f.severity.value] += 1
         return c
 
     def by_severity(self) -> dict[str, list[Finding]]:
-        """按严重度分组，**只含有效发现**（已排除的误报不进报告详情）。"""
+        """按严重度分组，**只含已确认漏洞**（待复核/误报另有附录）。"""
         out: dict[str, list[Finding]] = {}
-        for f in sorted(self.findings, key=lambda x: x.severity.rank, reverse=True):
-            if f.dismissed:
-                continue
+        for f in sorted(
+            self.confirmed_findings(), key=lambda x: x.severity.rank, reverse=True
+        ):
             out.setdefault(f.severity.value, []).append(f)
         return out
 
@@ -486,6 +589,7 @@ class ScanResult:
             "fingerprints": [f.to_dict() for f in self.fingerprints],
             "assets": [a.to_dict() for a in self.assets],
             "counts": self.counts(),
+            "status_counts": self.status_counts(),
             "pocs_loaded": self.pocs_loaded,
             "pocs_selected": self.pocs_selected,
             "pocs_executed": self.pocs_executed,

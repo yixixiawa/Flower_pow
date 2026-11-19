@@ -53,7 +53,14 @@ def finding_brief(f: Any) -> dict[str, Any]:
         "matched_at": getattr(f, "matched_at", ""),
         "verdict": getattr(f, "verdict", ""),
         "confidence": round(float(getattr(f, "confidence", 0.0) or 0.0), 2),
+        # 三档定级：只有 confirmed 计入漏洞数量；needs_review 是"证据不足"，
+        # rejected 是"误报/无效命中"，两者都不是漏报的漏洞。
+        "status": _enum_value(getattr(f, "status", None)) or "confirmed",
+        "status_label": getattr(getattr(f, "status", None), "label", ""),
+        "status_reason": getattr(f, "status_reason", ""),
+        "evidence_score": round(float(getattr(f, "evidence_score", 0.0) or 0.0), 2),
         "confirmed": bool(getattr(f, "confirmed", True)),
+        "needs_review": bool(getattr(f, "needs_review", False)),
         "dismissed": bool(getattr(f, "dismissed", False)),
         "dismiss_reason": getattr(f, "dismiss_reason", ""),
         "cve": list(getattr(f, "cve", []) or []),
@@ -65,7 +72,15 @@ def result_summary(result: Any, *, max_findings: int = 40) -> dict[str, Any]:
     """``ScanResult`` → 摘要。字段够复述结论，不够就别塞。"""
     findings = list(getattr(result, "findings", []) or [])
     active = [f for f in findings if not getattr(f, "dismissed", False)]
-    active.sort(key=lambda f: getattr(getattr(f, "severity", None), "rank", 0), reverse=True)
+    confirmed = [f for f in active if getattr(f, "confirmed", False)]
+    # 已确认的排前面：摘要列表是给模型看"先跟进哪条"的
+    active.sort(
+        key=lambda f: (
+            bool(getattr(f, "confirmed", False)),
+            getattr(getattr(f, "severity", None), "rank", 0),
+        ),
+        reverse=True,
+    )
     fps = [
         {
             "target": getattr(fp, "target", ""),
@@ -83,7 +98,13 @@ def result_summary(result: Any, *, max_findings: int = 40) -> dict[str, Any]:
         ) else {},
         "findings_total": len(findings),
         "findings_active": len(active),
+        # 只有 confirmed 算"漏洞数"；另两档单列，避免把待复核读成漏报
+        "findings_confirmed": len(confirmed),
+        "findings_needs_review": len(active) - len(confirmed),
         "findings_dismissed": len(findings) - len(active),
+        "status_counts": (
+            result.status_counts() if callable(getattr(result, "status_counts", None)) else {}
+        ),
         "asset_count": len(getattr(result, "assets", []) or []),
         "pocs_loaded": getattr(result, "pocs_loaded", 0),
         "pocs_selected": getattr(result, "pocs_selected", 0),

@@ -70,7 +70,7 @@ def finding_to_record(
     """把一条发现转成知识记录；不合格返回 ``None``。
 
     门控条件（任一不满足即拒绝）：
-    * ``confirmed`` 为真
+    * ``confirmed`` 为真（即三档定级里的 **已确认漏洞**；待复核/误报一律不入库）
     * ``verdict`` 不是 ``false_positive``
     * 等级不低于 ``min_severity``
     * 有证据（``matched_at`` 非空）——没有位置的「知识」检索时毫无用处
@@ -113,6 +113,11 @@ def finding_to_record(
         f"检测器 {f.detector}",
         " ".join(f.tags or []),
     ]
+    # 证据分写进可检索文本：下次召回时"同类证据强度"也是有用信号。
+    # 用 getattr 兜底——旧调用方（含测试里的轻量替身）没有这个字段。
+    score = getattr(f, "evidence_score", 0.0)
+    if score:
+        parts.append(f"证据分 {float(score):.2f}")
     if target:
         parts.insert(0, f"目标 {target}")
     if f.cve:

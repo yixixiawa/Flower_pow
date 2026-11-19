@@ -2,6 +2,23 @@
 # 重新生成方法：
 #     .venv/Scripts/python.exe -m pip freeze > requirements.txt
 #
+# ⚠ Python 3.15 安装说明（3.10–3.14 直接 `pip install -r requirements.txt` 即可）
+# ---------------------------------------------------------------------------
+# 3.15 太新，有两条 pin 还没有 cp315 预编译 wheel，照直装会转源码编译并失败
+# （报 "Microsoft Visual C++ 14.0 or greater is required"）。分两步绕开：
+#
+#   1) PyYAML 6.0.3 没有 cp315 wheel。它的 C 扩展只是 libyaml 加速（可选），
+#      用官方开关装纯 Python 版，功能完全等价：
+#        PYYAML_FORCE_LIBYAML=0 pip install --no-build-isolation \
+#            --no-binary=:all: PyYAML==6.0.3
+#
+#   2) pydantic 2.13.5 / pydantic_core 2.46.5 没有 cp315 wheel，装最新版：
+#        pip install pydantic typer openai
+#      （会连带装上带 cp315 wheel 的 pydantic-core；API 兼容）
+#
+# 其余依赖（rich / httpx / prompt_toolkit）的 pin 版本本身有 cp315 wheel。
+# ---------------------------------------------------------------------------
+#
 # 设计取舍：向量检索用纯 Python 的 hashing trick 实现（kb/indexer.py），
 # 因此不需要 numpy / chromadb / qdrant 这一整棵依赖树。
 # 直接依赖仅 7 个，其余均为其传递依赖。

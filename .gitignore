@@ -31,7 +31,12 @@ data/vector_db/
 data/intel/
 data/recon/
 data/wordlists/
+data/updater/
 data/*.json
+# 动态规则库：远程 Git 仓库的本地克隆 + 规则版本清单（运行时产物，可重建）
+remote_rules/
+# 社区规则由 intel update 从远程仓库发布进来，来源在远程，不入库
+poc/community/
 # 临时数据库与索引文件（可能被引到任意子目录）
 *.db
 *.sqlite3

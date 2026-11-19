@@ -15,7 +15,8 @@
 ``scan``     一次性完整扫描
 ``chat``     交互式会话（含 ``--classic`` 固定剧本）
 ``kb``       ``index`` / ``knowledge`` / ``pocs``
-``ask``      ``ask`` / ``intel``
+``ask``      ``ask``（RAG 检索；原 intel CVE 查询迁至 ``intel cve``）
+``intel``    ``intel check / update / status / rollback / cve``：动态规则库与 CVE 情报
 ``engines``  ``engines`` / ``jsaudit``
 ``probe``    ``exploit`` / ``tools`` / ``discover``
 ``models``   模型清单与切换
@@ -37,6 +38,7 @@ from cli import scan  # noqa: E402,F401
 from cli import chat  # noqa: E402,F401
 from cli import kb  # noqa: E402,F401
 from cli import ask  # noqa: E402,F401
+from cli import intel  # noqa: E402,F401  —— intel check/update/status/rollback/cve
 from cli import engines  # noqa: E402,F401
 from cli import probe  # noqa: E402,F401
 from cli import models  # noqa: E402,F401

@@ -79,8 +79,18 @@ rag:
   knowledge_min_confidence: 0.6 # LLM 研判置信度门槛
   knowledge_max_entries: 2000 # 超容量按最后更新淘汰最旧
 
+# ── 动态规则库（intel/updater）：Git 驱动的 POC 增量更新 ─────────────
+intel:
+  # 启动时按天自动检查规则更新（当天已触发过则跳过，跨天才执行）
+  auto_update: true
+  # 状态目录：state.json（同步状态）/ history.json（更新历史）/ repositories.json（仓库配置）
+  data_dir: ./data/updater
+  # 远程规则仓库克隆根目录：remote_rules/<name>/ 即仓库工作区，manifest.json 在其中
+  remote_dir: ./remote_rules
+  # flower 形态规则的发布目录（POC 加载器递归扫描，自动参与 RAG 与扫描）
+  publish_dir: ./poc/community
+
 # LLM：OpenAI 兼容协议，DeepSeek / OpenAI / vLLM 均可
-#
 # 官方模型（https://api-docs.deepseek.com/zh-cn/）：
 #   deepseek-flash    快、便宜 —— 高频机械任务（RAG 重排、误报研判）
 #   deepseek-v4-pro   强、贵   —— 低频理解任务（业务建模、报告撰写）

@@ -450,7 +450,12 @@ def build_index(
 
 
 def index_is_stale(poc_dir: str | Path, db_path: str | Path) -> bool:
-    """索引是否过期——任何一个 YAML 比索引新就需要重建。"""
+    """索引是否过期——任何一个 YAML 比索引新就需要重建。
+
+    ``load_poc_dir()`` 同时支持 ``*.yaml`` 与 ``*.yml``，这里必须**两边都查**：
+    只查 .yaml 时，.yml 文件改了索引却不重建，BM25/余弦用的还是旧词频，
+    检索结果与新规则对不上（改规则不生效的经典症状）。
+    """
     db = Path(db_path)
     if not db.is_file():
         return True
@@ -458,7 +463,11 @@ def index_is_stale(poc_dir: str | Path, db_path: str | Path) -> bool:
     d = Path(poc_dir)
     if not d.is_dir():
         return True
-    for f in d.rglob("*.yaml"):
+    files = [
+        *d.rglob("*.yaml"),
+        *d.rglob("*.yml"),
+    ]
+    for f in files:
         try:
             if f.stat().st_mtime > db_mtime:
                 return True
