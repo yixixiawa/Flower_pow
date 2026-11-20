@@ -27,6 +27,19 @@ Hybrid 决策规则：
 * 所有规则按**目标、环境和账号身份**绑定；
 * 测试环境允许删除测试用户，**不得推导为生产环境允许删除**；
 * 条件不满足时，统一处理为**拒绝执行**。
+
+EXPORT / AUTH 显式化整改（第二轮）::
+
+    矩阵原文没有 EXPORT/AUTH 行，旧实现把两者隐式映射进 L0 查询命令——
+    导出（/export、/download、/dump、/backup）与认证操作（提交凭证）
+    就这样拿到了"隐式 L0 授权"，授权路径既不显式也不可追踪。整改后：
+
+    * EXPORT → 「导出数据」独立规则（L1，仅隔离测试环境）——导出是
+      数据外带动作，比只读查询风险高，收紧而不是放权；
+    * AUTH → 「认证操作」独立规则（L0，仅限建立测试前状态）——
+      行为与旧映射等价，但**授权依据在矩阵里有一行可查**。
+
+    两条都是**收窄或显式化**，不扩大任何允许范围。
 """
 
 from __future__ import annotations
@@ -189,6 +202,23 @@ RULES: list[PolicyRule] = [
         default_status="禁止",
         deny_when="任何情形",
     ),
+    # ── 显式化整改（第二轮）：矩阵原文无 EXPORT/AUTH 行，旧实现隐式
+    # 映射进 L0 查询命令。以下两条把授权依据摆到明面上：
+    # EXPORT 收紧为 L1（仅隔离测试环境），AUTH 保持 L0 但规则可查。
+    PolicyRule(
+        command="导出数据",
+        level=PermissionLevel.L1,
+        allow_when="仅隔离测试环境（导出是数据外带动作，按 L1 收紧）",
+        default_status="非隔离测试环境默认拒绝",
+        deny_when="目标环境不是隔离测试环境",
+    ),
+    PolicyRule(
+        command="认证操作",
+        level=PermissionLevel.L0,
+        allow_when="有条件允许：目标、环境与账号身份已完成绑定，仅用于建立测试前状态（登录/登出/换取 token）",
+        default_status="允许（条件满足时）",
+        deny_when="目标/环境/账号身份未绑定，或行为超出建立测试前状态（如凭证爆破、批量取 token）",
+    ),
 ]
 
 _RULE_BY_COMMAND = {r.command: r for r in RULES}
@@ -212,13 +242,14 @@ def rules_table_markdown() -> str:
 # ── 接口分类 → 命令映射 ──────────────────────────────────────────
 
 # 分类本身独立（EXPORT 不是 READ），但落到权限矩阵时需要一条命令。
-# 矩阵没有 EXPORT/AUTH 行：EXPORT 的只读取证语义落在 L0 查询规则，
-# AUTH（建立测试前状态，如登录）同样落在 L0——分类字段仍然独立记录，
-# 审计里看得到它原来是 EXPORT/AUTH。
+# **显式映射整改（第二轮）**：EXPORT/AUTH 不再隐式复用 L0 查询命令——
+# EXPORT 落独立的「导出数据」（L1，仅隔离测试环境），AUTH 落独立的
+# 「认证操作」（L0，仅限建立测试前状态）。分类字段仍然独立记录，
+# 审计里看得到它原来是 EXPORT/AUTH，且授权依据在矩阵里各有一行。
 COMMAND_FOR_CATEGORY: dict[str, str] = {
     ApiCategory.READ: "查询详情",
-    ApiCategory.EXPORT: "查询详情",
-    ApiCategory.AUTH: "查询列表",
+    ApiCategory.EXPORT: "导出数据",
+    ApiCategory.AUTH: "认证操作",
     ApiCategory.CREATE: "创建测试数据",
     ApiCategory.UPDATE: "修改测试数据",
     ApiCategory.UPLOAD: "上传测试文件",

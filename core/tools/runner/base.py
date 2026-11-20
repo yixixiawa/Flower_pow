@@ -31,6 +31,7 @@ from core.state import Asset, Finding, Severity
 from core.tools.args import normalize_args
 from core.tools.external import ExternalTool
 from core.tools.probe import Probe
+from policy.request_guard import PROBE_KIND_COMMAND as _PROBE_KIND_COMMAND_SHARED
 
 
 MAX_TOOL_OUTPUT = 6000      # 回灌给模型的单个工具结果上限（字符）
@@ -153,6 +154,11 @@ class _ToolRunnerBase:
 
         self.policy_guard = RequestGuard(cfg)
         self.test_ledger = TestLedger()
+        # 运行期审批台账（第二轮整改 #5）：审批 = 一次性票据，精确绑定
+        # （对象 URL, 命令, 目标, 轮次, 身份），单次消费、带过期时间。
+        from policy.test_transaction import ApprovalLedger
+
+        self.approvals = ApprovalLedger()
         self.policy_audit = PolicyAudit(
             getattr(cfg, "data_dir", "./data"),
             enabled=bool(getattr(getattr(cfg, "policy", None), "audit", True)),
@@ -211,6 +217,25 @@ class _ToolRunnerBase:
         if not raw:
             raise ToolBlocked("缺少目标参数")
         return raw if "://" in raw else f"http://{raw}"
+
+    @staticmethod
+    def _validate_http_url(url: str) -> str:
+        """目标 URL 合法性校验（第二轮整改 #1：明确拒绝非法目标/协议/端口）。
+
+        校验走 :func:`policy.request_guard.validate_target_url` 统一入口
+        （全工程同一把尺子）：协议仅 http/https、主机名非空、端口 1-65535、
+        不含空白/控制字符。非法抛 ``ToolBlocked``——拒绝文本直接回灌模型，
+        而不是靠范围比对"碰巧"给一句含糊的"目标未绑定"。
+        """
+        from policy.request_guard import validate_target_url
+
+        try:
+            return validate_target_url(url)
+        except ValueError as exc:
+            raise ToolBlocked(
+                f"（策略）目标 URL 非法，拒绝执行：{exc}。"
+                "仅允许 http/https 协议、主机名非空、端口 1-65535。"
+            ) from exc
 
     def _target_of(self, session, explicit: str = "") -> str:
         """确定本次请求的目标：显式参数优先，否则用会话目标。"""
@@ -353,13 +378,13 @@ class _ToolRunnerBase:
                 if text.startswith(marker):
                     status = st
                     break
-        # P0-②：台账登记只发生在**执行成功**之后。取走 pending（无论
-        # 成败都清掉，防止陈旧条目泄漏进下一次调用），成功且能取得
-        # 对象标识才真正落台账。
+        # P0-② + 第二轮整改 #4：台账登记只发生在**执行成功且真实请求
+        # 成功**之后。取走 pending（无论成败都清掉，防止陈旧条目泄漏进
+        # 下一次调用），请求成功且能取得对象标识才真正落台账。
         pend = self._pending_ledger
         self._pending_ledger = None
         if pend and status == "ok":
-            self._commit_pending_ledger(pend, text)
+            self._commit_pending_ledger(pend, text, tool=name)
         if len(text) > MAX_TOOL_OUTPUT:
             if name == "external_tool":
                 # 外部工具的输出长度不可控（curl 拉一个 100KB 的库文件很正常），
@@ -530,6 +555,66 @@ class _ToolRunnerBase:
             getattr(r, "current_run_id", "") or "",
         )
 
+    async def _review_or_allow(
+        self, d, session, url: str, *, with_ledger: bool = False,
+        req_ctx: dict[str, Any] | None = None,
+    ) -> str | None:
+        """ALLOW / REVIEW / DENY 三岔口的**公共收口**（第二轮整改）。
+
+        三个 gate 分支的放行、审批、拒绝流程原本各抄一份，容易一改漏
+        一处（审批通道的前置检查就漂移过）。现在所有授权路径都从这里
+        走——**显式且唯一**：
+
+        * ALLOW → 审计持久化前置（P1-⑤）→（删除类）台账前置（P0-⑤）
+          → 放行留痕（写操作留痕失败即拒绝，第二轮整改 #6）；
+        * REVIEW → 审批事件必须可持久化 → 运行期审批 = 签发**一次性
+          票据**（第三轮整改 #5：票据绑定方法 + 请求内容指纹 + 风险
+          等级 + 审批人，内容变更/过期/换目标必须重新审批）→
+          （删除类）台账前置 → 放行留痕；
+        * DENY / UNKNOWN → 拒绝留痕。
+
+        ``req_ctx`` = 请求上下文（method/params/body/poc_id 或工具参数），
+        用于计算审批绑定的请求指纹。返回拒绝文本或 None 放行。
+        """
+        if d.allowed:
+            audit_block = self._audit_gate_for(d, session, url)
+            if audit_block is not None:
+                return audit_block
+            if with_ledger:
+                ledger_deny = await self._ledger_check(session, d, url)
+                if ledger_deny is not None:
+                    return ledger_deny
+            return self._policy_allow(session, d, url=url)
+        if d.decision == "REVIEW":
+            # P1-⑤：审批事件本身必须能持久化——审计不可持久化时
+            # 审批通道整体关闭，拒绝执行（不用内存记录替代）。
+            if not self.policy_audit.writable:
+                return self._audit_deny_text(d, session, url)
+            # P0-② + 第三轮整改 #5：审批走运行期逐请求通道，通过即签发
+            # 一次性票据并当场消费。票据绑定（URL/命令/方法/请求指纹/
+            # 风险等级/目标/轮次/身份）——内容变更、过期或切换目标后
+            # 一律重新审批。
+            from policy.test_transaction import request_fingerprint
+
+            rc = req_ctx or {}
+            method = str(rc.get("method") or "")
+            digest = request_fingerprint(
+                method=method, url=url,
+                params=rc.get("params"),
+                body=str(rc.get("body") or ""),
+                poc_id=str(rc.get("poc_id") or rc.get("tool") or ""),
+            )
+            if await self._policy_review(d, session, url, method=method, req_digest=digest):
+                if with_ledger:
+                    ledger_deny = await self._ledger_check(session, d, url, approved=True)
+                    if ledger_deny is not None:
+                        return ledger_deny
+                audit_block = self._audit_gate_for(d, session, url)
+                if audit_block is not None:
+                    return audit_block
+                return self._policy_allow(session, d, url=url)
+        return self._policy_deny(session, d, url)
+
     async def _policy_gate(self, name: str, args: dict[str, Any], session) -> str | None:
         """执行前的权限检查。返回拒绝文本（含【已拦截】前缀）或 None 放行。
 
@@ -541,125 +626,70 @@ class _ToolRunnerBase:
         guard = self.policy_guard
         try:
             if name == "http_request":
-                url = self._normalize_target(str(args.get("url") or session.target or ""))
+                # 第二轮整改 #1：目标 URL 合法性先于一切决策——非法目标/
+                # 协议/端口在这里就明确拒绝，不进范围比对。
+                url = self._validate_http_url(
+                    self._normalize_target(str(args.get("url") or session.target or ""))
+                )
                 method = str(args.get("method") or "GET")
                 body = str(args.get("body") or "")
+                params = args.get("params") if isinstance(args.get("params"), dict) else None
+                poc_id = str(args.get("poc_id") or args.get("poc") or "")
                 self._observe_identity(dict(args.get("headers") or {}) if isinstance(
                     args.get("headers"), dict
                 ) else {}, url, body, session=session)
                 d = guard.check_request(
                     url, method=method, body=body,
-                    params=args.get("params") if isinstance(args.get("params"), dict) else None,
-                    poc_hint=str(args.get("poc_id") or args.get("poc") or ""),
+                    params=params,
+                    poc_hint=poc_id,
                     history_hint=self._history_hint(url),
                     ctx=self._policy_ctx(session, url),
                 )
-                if d.allowed:
-                    # P1-⑤：写操作的放行以审计可持久化为先决条件
-                    audit_block = self._audit_gate_for(d, session, url)
-                    if audit_block is not None:
-                        return audit_block
-                    ledger_deny = await self._ledger_check(session, d, url)
-                    if ledger_deny is not None:
-                        return ledger_deny
-                    self._policy_allow(session, d, url=url)
-                    return None
-                if d.decision == "REVIEW":
-                    # P1-⑤：审批事件本身必须能持久化——审计不可持久化时
-                    # 审批通道整体关闭，拒绝执行（不用内存记录替代）。
-                    if not self.policy_audit.writable:
-                        return self._audit_deny_text(d, session, url)
-                    # P0-②：审批走运行期逐请求通道（绑定本次 URL）。
-                    if await self._policy_review(d, session, url):
-                        # 审批通过 = 本次请求的单独审批已绑定；台账未知对象
-                        # 因此放行。参数变化 → URL 变化 → 决策重来 → 重新审批。
-                        ledger_deny = await self._ledger_check(session, d, url, approved=True)
-                        if ledger_deny is not None:
-                            return ledger_deny
-                        self._policy_allow(session, d, url=url)
-                        return None
-                return self._policy_deny(session, d, url)
+                return await self._review_or_allow(d, session, url, with_ledger=True, req_ctx={
+                    "method": method, "params": params, "body": body, "poc_id": poc_id,
+                })
 
             if name == "exploit_probe":
                 kinds = str(args.get("kinds") or "rce,fileread")
-                url = self._normalize_target(str(args.get("url") or session.target or ""))
-                # P0-4：探针类别 → 矩阵命令，取风险最高的一条判定。
-                # **sqli 必须映射到 SQL 注入验证（L3）**，不得落 L0；
-                # 未知类别按 UNKNOWN 拒绝（不猜）。
-                commands = [
-                    self._PROBE_KIND_COMMAND.get(k.strip().lower(), "")
-                    for k in kinds.split(",")
-                ]
-                if not commands or any(not c for c in commands):
-                    return (
-                        "【已拦截】（策略）exploit_probe 含未识别的探针类别，"
-                        "按「条件不满足 → 拒绝执行」处理。"
-                        f"已知类别：{'、'.join(sorted(self._PROBE_KIND_COMMAND))}。"
-                    )
-                from policy.api_policy import (
-                    PermissionLevel,
-                    rule_for_command,
-                    decide as _decide,
+                # 第二轮整改 #1：探针目标同样过合法性校验（非法目标/协议/
+                # 端口明确拒绝），再走统一的 in_scope 范围比对。
+                url = self._validate_http_url(
+                    self._normalize_target(str(args.get("url") or session.target or ""))
                 )
-
-                worst = max(commands, key=lambda c: (
-                    PermissionLevel.rank(rule_for_command(c).level) if rule_for_command(c) else -1
-                ))
-                _rule = rule_for_command(worst)
-                # P0-①：**不得自行构造简化决策上下文**——与 http_request /
-                # external_tool 同一份 _policy_ctx，目标范围校验走 guard 的
-                # 统一入口 in_scope（scheme+host+port+路径前缀）。
-                ctx = self._policy_ctx(session, url)
-                d = _decide(
-                    worst,
-                    environment=ctx.environment,
-                    identity_bound=ctx.identity_bound,
-                    target_bound=guard.in_scope(url, ctx.bound_target),
-                    approved=False,  # L3 无审批出路；上传的逐请求审批在 REVIEW 通道
-                )
-                d.category = {
-                    "命令执行": "EXECUTE", "SQL 注入验证": "EXECUTE",
-                    "上传测试文件": "UPLOAD", "删除测试数据": "DELETE",
-                }.get(worst, "READ")
-                d.signals = [f"探针类别：{kinds}（最高风险 → {worst}，{_rule.level if _rule else '?'}）"]
-                if d.allowed:
-                    audit_block = self._audit_gate_for(d, session, url)
-                    if audit_block is not None:
-                        return audit_block
-                    self._policy_allow(session, d, url=url)
-                    return None
-                if d.decision == "REVIEW":
-                    if not self.policy_audit.writable:
-                        return self._audit_deny_text(d, session, url)
-                    if await self._policy_review(d, session, url):
-                        audit_block = self._audit_gate_for(d, session, url)
-                        if audit_block is not None:
-                            return audit_block
-                        self._policy_allow(session, d, url=url)
-                        return None
-                return self._policy_deny(session, d, url)
+                # 第三轮整改 #1：决策**统一走 RequestGuard.check_probe**——
+                # 范围（in_scope）/环境/身份判定与 http_request 同一条代码
+                # 路径，runner 不再直接调用 api_policy.decide() 自行拼决策
+                # （防止"简化版判定"绕过统一范围校验回潮）。
+                d = guard.check_probe(url, kinds, ctx=self._policy_ctx(session, url))
+                return await self._review_or_allow(d, session, url, req_ctx={
+                    "method": "GET", "poc_id": kinds,
+                })
 
             if name == "external_tool":
                 tool = str(args.get("tool") or "")
                 url = str(args.get("target") or args.get("url") or session.target or "")
+                if url:
+                    # 第二轮整改 #1：给了目标的工具调用，目标同样过合法性
+                    # 校验（http/https、端口合法）——堵 file:// 等协议混淆。
+                    url = self._validate_http_url(self._normalize_target(url))
                 d = guard.check_tool(tool, dict(args), ctx=self._policy_ctx(session, url))
-                if d.allowed:
-                    audit_block = self._audit_gate_for(d, session, url)
-                    if audit_block is not None:
-                        return audit_block
-                    self._policy_allow(session, d, url=url)
-                    return None
-                if d.decision == "REVIEW":
-                    if not self.policy_audit.writable:
-                        return self._audit_deny_text(d, session, url)
-                    if await self._policy_review(d, session, url):
-                        audit_block = self._audit_gate_for(d, session, url)
-                        if audit_block is not None:
-                            return audit_block
-                        self._policy_allow(session, d, url=url)
-                        return None
-                return self._policy_deny(session, d, url)
+                blk = await self._review_or_allow(d, session, url, req_ctx={
+                    "method": "", "tool": tool,
+                    "params": {k: str(v)[:200] for k, v in args.items()},
+                })
+                if blk is not None:
+                    return blk
+                return None
             return None
+        except ToolBlocked as exc:
+            # 第二轮整改 #1：目标/协议/端口的明确拒绝——以【已拦截】文本
+            # 回灌（execute 按标记归为 blocked），不会被下面的兜底 except
+            # 吞成"权限检查异常"，同时留 warn 审计。
+            tid, rid = self._policy_scope(session)
+            self.policy_audit.warn(
+                f"目标校验拒绝执行：{exc}", command=name, target_id=tid, run_id=rid,
+            )
+            return f"【已拦截】{exc}"
         except Exception as exc:  # noqa: BLE001
             tid, rid = self._policy_scope(session)
             self.policy_audit.log(
@@ -672,14 +702,9 @@ class _ToolRunnerBase:
                 "  修复 policy 配置或用 /readonly 查看当前状态后重试。"
             )
 
-    # 探针类别 → 权限矩阵命令（P0-4：sqli 必须落 L3，不得落 L0）
-    _PROBE_KIND_COMMAND = {
-        "rce": "命令执行",              # L3
-        "sqli": "SQL 注入验证",          # L3（此前落入查询详情 L0——整改点）
-        "upload": "上传测试文件",        # L2
-        "fileread": "查询详情",          # L0
-        "fileupload": "上传测试文件",    # L2
-    }
+    # 探针类别 → 权限矩阵命令：**权威表在 policy.request_guard**，
+    # runner 只保留引用别名（历史测试引用），不得复制一份自行漂移。
+    _PROBE_KIND_COMMAND = _PROBE_KIND_COMMAND_SHARED
 
     def _observe_identity(self, headers: dict, url: str, body: str = "", session=None) -> None:
         """从真实请求观察账号身份（P1-④：**真实账号绑定**，非凭证类型标记）。
@@ -814,8 +839,39 @@ class _ToolRunnerBase:
             "policy.audit: true）再发起需要审批的操作。"
         )
 
-    def _commit_pending_ledger(self, pend: dict[str, Any], response_text: str) -> None:
-        """执行成功后把 pending 台账条目真正落账（P0-②）。
+    # http_request 成功输出的状态码行（recon._h_http_request 固定格式：
+    # "状态码：{code}  耗时：..."）。请求失败时输出是"请求失败：..."，
+    # 没有这一行——旧实现把它当执行成功，失败请求照样登记台账（整改点）。
+    _STATUS_CODE_LINE = re.compile(r"状态码：\s*(\d{3})")
+
+    @classmethod
+    def _http_result_succeeded(cls, response_text: str) -> bool | None:
+        """从工具结果判真实 HTTP 请求是否成功（三态）：
+
+        * ``True`` —— 状态码 2xx/3xx；
+        * ``False`` —— 4xx/5xx，或结果里根本没有状态码行（请求失败）；
+        * ``None`` —— 不适用（非 HTTP 类结果），交由调用方按工具语义兜底。
+
+        注意：创建请求打到服务器返回 500 时，对象**并没有建立**——
+        拿 4xx/5xx 的失败响应去登记台账，等于登记一个不存在的对象，
+        之后删除判定还会把它当"已知"放行。
+        """
+        m = cls._STATUS_CODE_LINE.search(response_text or "")
+        if not m:
+            return None
+        return 200 <= int(m.group(1)) < 400
+
+    def _commit_pending_ledger(
+        self, pend: dict[str, Any], response_text: str, tool: str = "",
+    ) -> None:
+        """执行成功后把 pending 台账条目真正落账（P0-② + 第二轮整改 #4）。
+
+        登记以**真实请求成功**为前提：
+
+        * http_request —— 输出必有状态码行，2xx/3xx 才算请求成功；
+          4xx/5xx（对象没建起来）或"请求失败：..."一律不登记；
+        * 其他工具 —— 结果里出现状态码行按同一规则，否则按执行成功
+          兜底（外部工具的失败已被 execute 的状态标记挡在门外）。
 
         对象标识提取：创建/上传打在集合端点（URL 尾段是集合名）→
         响应优先；修改/资源型端点 → URL 尾段优先。
@@ -828,6 +884,21 @@ class _ToolRunnerBase:
         self._pending_ledger = None
         action = pend.get("action") or ""
         url = pend.get("url") or ""
+        http_ok = self._http_result_succeeded(response_text)
+        if http_ok is False or (http_ok is None and tool == "http_request"):
+            # 请求失败 / 服务端拒绝（4xx/5xx）：对象不存在，不登记。
+            # 缺状态码行且工具是 http_request = 请求根本没发出去成功。
+            why = (
+                f"服务端返回 {self._STATUS_CODE_LINE.search(response_text or '').group(1)}"
+                if http_ok is False else "请求失败（无状态码行）"
+            )
+            self.policy_audit.warn(
+                f"请求未成功（{why}），{action or '对象动作'}不登记（第二轮整改 #4）",
+                command=action, url=url,
+                target_id=pend.get("target_id") or "",
+                run_id=pend.get("run_id") or "",
+            )
+            return
         obj_id = extract_object_id(url, response_text, url_first=action == "update")
         self.test_ledger.record(
             url, action,
@@ -837,9 +908,30 @@ class _ToolRunnerBase:
             object_id=obj_id,
         )
 
-    async def _policy_review(self, d, session, url: str) -> bool:
-        """REVIEW 决策的运行期审批：有审核通道就问人，没有就拒绝。"""
+    async def _policy_review(
+        self, d, session, url: str, *, method: str = "", req_digest: str = "",
+    ) -> bool:
+        """REVIEW 决策的运行期审批：有审核通道就问人，没有就拒绝。
+
+        第二轮整改 #5 + 第三轮整改 #5：人审批通过 ≠ 一个裸布尔——签发
+        **一次性票据**并**当场消费**。票面绑定（URL/命令/方法/请求内容
+        指纹/风险等级/目标/轮次/身份/审批人）：内容变更、过期或切换
+        目标后必须重新审批；消费失败按审批未通过处理（fail-closed）；
+        **L3 命令不进入审批通道**（决策层已短路，这里再拒一道）。
+        票据号进审计，授权路径可追踪、不可重放。
+        """
+        from policy.api_policy import PermissionLevel
+
         tid, rid = self._policy_scope(session)
+        ident = self._current_identity(session)
+        if getattr(d, "level", "") == PermissionLevel.L3:
+            # L3 一律拒绝，审批不设出路——通道层面再拦一道
+            self.policy_audit.log(
+                "deny", command=d.command, level=d.level, decision="DENY",
+                category=d.category, url=url, target_id=tid, run_id=rid,
+                reason="L3 命令不得通过审批放行（审批无出路）",
+            )
+            return False
         if self.approver is None:
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision=d.decision,
@@ -847,35 +939,83 @@ class _ToolRunnerBase:
                 reason=d.reason + "；无审批通道，拒绝执行",
             )
             return False
+        approver_label = str(
+            getattr(self.approver, "__name__", None) or type(self.approver).__name__
+        )[:60]
         ok = bool(
             await self.approver(
-                f"策略审批：{d.command}（{d.level}）针对 {url[:80]}\n  {d.reason}"
+                f"策略审批：{d.command}（{d.level}）{method or 'GET'} {url[:80]}\n  {d.reason}"
             )
         )
-        self.policy_audit.log(
-            "approval" if ok else "deny",
-            command=d.command, level=d.level,
-            decision="ALLOW" if ok else "DENY",
-            category=d.category, url=url, target_id=tid, run_id=rid,
-            reason=("运行期审批通过：" + d.reason) if ok else ("运行期审批拒绝：" + d.reason),
+        if not ok:
+            self.policy_audit.log(
+                "deny", command=d.command, level=d.level, decision="DENY",
+                category=d.category, url=url, target_id=tid, run_id=rid,
+                reason="运行期审批拒绝：" + d.reason,
+            )
+            return False
+        token = self.approvals.issue(
+            url=url, command=d.command, target_id=tid,
+            run_id=rid, identity=ident,
+            method=method, request_digest=req_digest,
+            level=d.level, approver=approver_label,
         )
-        return ok
+        consumed, why = self.approvals.consume(
+            token.token, url=url, command=d.command, target_id=tid,
+            run_id=rid, identity=ident,
+            method=method, request_digest=req_digest, level=d.level,
+        )
+        if not consumed:
+            # 签发后当场消费失败：fail-closed，按审批未通过处理
+            self.policy_audit.log(
+                "deny", command=d.command, level=d.level, decision="DENY",
+                category=d.category, url=url, target_id=tid, run_id=rid,
+                reason=f"审批票据消费失败（{why}）：{d.reason}",
+            )
+            return False
+        self.policy_audit.log(
+            "approval", command=d.command, level=d.level, decision="ALLOW",
+            category=d.category, url=url, target_id=tid, run_id=rid,
+            reason="运行期审批通过（一次性票据，单次有效）：" + d.reason,
+            extra={
+                "approval_token": token.token,
+                "method": token.method,
+                "request_digest": token.request_digest,
+                "approver": token.approver,
+            },
+        )
+        return True
 
-    def _policy_allow(self, session, d, url: str = "") -> None:
+    def _policy_allow(self, session, d, url: str = "") -> str | None:
         """放行留痕 + 写操作挂 pending 台账（P0-②：**放行 ≠ 登记**）。
 
         台账登记延迟到 handler 执行成功之后（execute →
         _commit_pending_ledger）：闸门放行的创建可能执行失败，"执行
         成功并取得对象标识"才登记。删除不登记（删除不产生对象）。
+
+        第二轮整改 #6（P1-⑤ 收口）：写操作的**放行留痕本身必须持久化
+        成功**——writable 探针通过后、真正落盘前磁盘仍可能翻脸；留痕
+        写不进去的写操作拒绝执行，否则就是一笔"没有记录的允许"。
+        返回拒绝文本或 None。
         """
         tid, rid = self._policy_scope(session)
-        self.policy_audit.log(
+        persisted = self.policy_audit.log(
             "allow", command=d.command, level=d.level, decision=d.decision,
             category=d.category, url=url, target_id=tid, run_id=rid,
             reason=d.reason, extra={"signals": list(d.signals)[:6]} if d.signals else None,
         )
         action = self._LEDGER_ACTIONS.get(d.command)
         if action and url and action != "delete":
+            if not persisted:
+                self.policy_audit.warn(
+                    "写操作放行留痕未持久化，拒绝执行（P1-⑤ 收口）",
+                    command=d.command, url=url, target_id=tid, run_id=rid,
+                )
+                return (
+                    f"【已拦截】（策略）写操作「{d.command}」放行前的审计留痕未能持久化，"
+                    "按 P1-⑤ 拒绝执行——没有记录的允许等于没有允许。\n"
+                    "  修复 data 目录可写性（或恢复 policy.audit: true）后重试。"
+                )
             # 台账统一隔离口径（P1-8）：target_id / run_id / identity 一起挂，
             # 执行成功后落账时三个维度都要对得上才认"已知"。
             self._pending_ledger = {
@@ -885,6 +1025,7 @@ class _ToolRunnerBase:
                 "target_id": tid,
                 "identity": self._current_identity(session),
             }
+        return None
 
     def _policy_deny(self, session, d, url: str = "") -> str:
         """DENY/UNKNOWN 决策的留痕 + 拒绝文本。拒绝也必须能对账。"""

@@ -31,6 +31,15 @@
 
     ``audit.enabled=false``（配置关审计）同样视为不可持久化——
     写操作一律拒绝。要跑写操作，持久化审计必须在工作。
+
+第二轮整改（#6 审计故障处理收口）::
+
+    * ``_flush`` / ``log`` / ``writable`` 的异常面从裸 ``OSError``
+      扩到 ``(OSError, TypeError, ValueError)``——``json.dumps`` 遇到
+      不可序列化的 extra 抛 TypeError，旧实现会让它一路炸到调用方；
+    * ``extra`` 在入队**前**就做可序列化消毒：序列化失败降级为
+      ``{"repr": ...}``——待写队列里永远只放能安全写盘的字典，
+      重试补写时不会因为同一条坏数据反复失败。
 """
 
 from __future__ import annotations
@@ -62,14 +71,19 @@ class PolicyAudit:
 
     # ── 落盘 ─────────────────────────────────────────────────────
     def _flush(self, entries: list[dict[str, Any]]) -> bool:
-        """把待写事件追加进 JSONL。成功返回 True。"""
+        """把待写事件追加进 JSONL。成功返回 True。
+
+        异常面（第二轮整改 #6）：``OSError``（磁盘/权限）之外，
+        ``TypeError``/``ValueError``（序列化意外失败）同样按落盘失败
+        处理——审计是旁路，任何一类故障都不许把执行链炸断。
+        """
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as f:
                 for e in entries:
                     f.write(json.dumps(e, ensure_ascii=False) + "\n")
             return True
-        except OSError:
+        except (OSError, TypeError, ValueError):
             return False
 
     def log(
@@ -105,8 +119,15 @@ class PolicyAudit:
             "run_id": run_id,
             "reason": (reason or "")[:500],
         }
-        if extra:
-            entry["extra"] = extra
+        if extra is not None:
+            # 入队前消毒（第二轮整改 #6）：待写队列里只放能安全写盘的
+            # 字典——不可序列化的 extra 降级为 repr 摘要，否则重试补写
+            # 会因为同一条坏数据永远失败。
+            try:
+                json.dumps(extra, ensure_ascii=False)
+                entry["extra"] = extra
+            except (TypeError, ValueError):
+                entry["extra"] = {"repr": str(extra)[:200]}
         self._recent.append(entry)
         # 先冲历史欠账，再写当前条：都成功则队列清空
         batch = list(self._pending) + [entry]
@@ -149,7 +170,7 @@ class PolicyAudit:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8"):
                 ok = True
-        except OSError:
+        except (OSError, TypeError, ValueError):
             ok = False
         self._probe_ok = ok
         self._probe_at = now
@@ -168,7 +189,7 @@ class PolicyAudit:
             "level": str(kw.get("level") or ""),
             "decision": "",
             "category": "",
-            "url": (str(kw.get("url")) or "")[:300],
+            "url": str(kw.get("url") or "")[:300],
             "target_id": str(kw.get("target_id") or ""),
             "run_id": str(kw.get("run_id") or ""),
             "reason": (reason or "")[:500],

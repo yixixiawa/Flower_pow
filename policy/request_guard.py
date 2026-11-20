@@ -29,6 +29,7 @@ from policy.api_policy import (
     PermissionLevel,
     PolicyDecision,
     decide,
+    rule_for_command,
 )
 
 # ── 识别信号表 ────────────────────────────────────────────────────
@@ -303,6 +304,50 @@ def _same_host(url_a: str, url_b: str) -> bool:
     return in_scope(url_a, url_b) or in_scope(url_b, url_a)
 
 
+# ── 目标 URL 合法性校验（第二轮整改 #1：明确拒绝非法目标/协议/端口）──
+# in_scope 管"请求是否落在授权范围内"，validate_target_url 管"这个
+# 目标本身是否合法"——两道独立的门：协议混淆（ftp://）、端口越界
+# （:70000）、含控制字符的 URL 在**进范围比对之前**就该被明确拒绝，
+# 而不是靠范围比对"碰巧"判 False 后给一句含糊的"目标未绑定"。
+
+ALLOWED_SCHEMES: tuple[str, ...] = ("http", "https")
+
+
+def validate_target_url(url: str) -> str:
+    """目标 URL 合法性校验。合法返回原串（已 strip），非法抛 ``ValueError``。
+
+    * 非空、不含空白/控制字符；
+    * scheme **必须**是 http/https（调用方先做补头归一化，这里只放行
+      明确合法的协议——ftp/file/gopher 等一律拒绝）；
+    * 主机名非空；
+    * 端口（若显式给出）必须在 1-65535（``urlparse`` 对越界端口抛
+      ``ValueError``，同样按非法处理）。
+
+    调用方（runner）把 ``ValueError`` 转成明确的拒绝文本回灌模型。
+    """
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("目标为空")
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in raw):
+        raise ValueError(f"URL 含空白或控制字符：{raw[:60]!r}")
+    try:
+        p = urlparse(raw)
+        scheme = (p.scheme or "").lower()
+        host = p.hostname
+        port = p.port  # 越界端口（如 :70000）在此抛 ValueError
+    except ValueError as exc:
+        raise ValueError(f"URL 无法解析或端口越界：{exc}") from exc
+    if not scheme:
+        raise ValueError(f"URL 缺少协议头（仅允许 {'/'.join(ALLOWED_SCHEMES)}）：{raw[:60]!r}")
+    if scheme not in ALLOWED_SCHEMES:
+        raise ValueError(f"协议 {scheme!r} 不在允许范围（仅 http/https），拒绝执行")
+    if not host:
+        raise ValueError(f"URL 缺少主机名：{raw[:60]!r}")
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(f"端口 {port} 越界（合法范围 1-65535）")
+    return raw
+
+
 @dataclass(slots=True)
 class GuardContext:
     """决策的上下文绑定：目标、环境、账号身份（边界 1 的三要素）。
@@ -348,19 +393,56 @@ class RequestGuard:
 
     # ── 目标 → 环境 ──────────────────────────────────────────────
     def environment_for(self, url: str) -> str:
-        """按 host 通配绑定表判环境；未命中走 default_environment。
+        """按环境绑定表判环境；未命中走 default_environment。
+
+        绑定模式支持 ``[scheme://]host-glob[:port]``（整改：目标匹配
+        不再只看 hostname）：
+
+        * 模式显式声明了 scheme（``http://192.168.*``）→ 请求 scheme
+          必须一致——https 请求不会继承 http 绑定的环境分类；
+        * 模式显式声明了端口（``192.168.1.10:8080``）→ 请求**有效端口**
+          （默认端口归一：http:80 / https:443 与省略等价）必须一致——
+          同主机换端口不会继承环境分类；
+        * 只写 host 的模式（``192.168.*``）= 宿主显式声明"该主机名的
+          所有 scheme/端口同一环境"，这是配置所有者的明确授权面，
+          不是推断。
 
         判不出就是 UNKNOWN——**不猜**。UNKNOWN 在决策里等价于拒绝
         （L1/L2 条件不满足），安全方向不会错。
         """
         try:
-            host = (urlparse(url or "").hostname or "").lower()
+            p = urlparse(url or "")
+            scheme = (p.scheme or "").lower()
+            host = (p.hostname or "").lower()
+            port = p.port
         except ValueError:
             return self.default_environment
         for pat, env in self.environments.items():
-            if self._glob_match(host, pat.lower()):
+            if self._binding_match(str(pat), scheme, host, port):
                 return env
         return self.default_environment
+
+    @classmethod
+    def _binding_match(cls, pattern: str, scheme: str, host: str, port: int | None) -> bool:
+        """环境绑定模式匹配：``[scheme://]host-glob[:port]``。"""
+        pat = (pattern or "").strip().lower()
+        if not pat:
+            return False
+        want_scheme: str | None = None
+        if "://" in pat:
+            want_scheme, _, pat = pat.partition("://")
+        # 尾段是纯数字 → 端口声明；否则整段是 host 通配
+        head, sep, tail = pat.rpartition(":")
+        want_port: int | None = None
+        if sep and tail.isdigit():
+            want_port, pat = int(tail), head
+        if want_scheme is not None and want_scheme != scheme:
+            return False
+        if want_port is not None:
+            effective = port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
+            if effective != want_port:
+                return False
+        return cls._glob_match(host, pat)
 
     @staticmethod
     def _glob_match(host: str, pattern: str) -> bool:
@@ -438,6 +520,81 @@ class RequestGuard:
         )
         d.category = ApiCategory.EXECUTE
         return d
+
+    def check_probe(self, url: str, kinds: str, ctx: GuardContext | None = None) -> PolicyDecision:
+        """exploit_probe 的统一决策入口（整改：runner **不得**直接调用
+        ``api_policy.decide()`` 自行拼决策）。
+
+        与 check_request / check_tool 同一条授权路径：
+
+        * 目标范围 → 统一入口 :func:`in_scope`（scheme+hostname+port
+          规范化 + 路径前缀），绑定目标为空或出界即 target_bound=False；
+        * 环境 → :meth:`environment_for`（绑定表支持 scheme/port 声明）；
+        * 审批 → 恒 False（L3 无审批出路；L2 的逐请求审批在运行期通道）。
+
+        探针类别 → 矩阵命令映射见 :data:`PROBE_KIND_COMMAND`；任一类别
+        未识别 → UNKNOWN 默认拒绝（不猜）。
+        """
+        commands = [PROBE_KIND_COMMAND.get(k.strip().lower(), "") for k in (kinds or "").split(",")]
+        if not commands or any(not c for c in commands):
+            return PolicyDecision(
+                decision=Decision.UNKNOWN,
+                command="",
+                category=ApiCategory.UNKNOWN,
+                reason=(
+                    f"exploit_probe 含未识别的探针类别，默认拒绝执行"
+                    f"（已知类别：{'、'.join(sorted(PROBE_KIND_COMMAND))}）"
+                ),
+            )
+        worst = max(commands, key=lambda c: (
+            PermissionLevel.rank(rule_for_command(c).level)
+            if rule_for_command(c) is not None else -1
+        ))
+        rule = rule_for_command(worst)
+        ctx = ctx or GuardContext()
+        # 与 check_request 完全同源的范围判定——这是"不可绕过"的保证：
+        # runner 只喂 url 与 ctx，范围/环境/身份判定全部在本模块内完成。
+        target_bound = bool(ctx.bound_target) and in_scope(url, ctx.bound_target)
+        d = decide(
+            worst,
+            environment=ctx.environment or self.environment_for(url),
+            identity_bound=ctx.identity_bound,
+            target_bound=target_bound,
+            approved=False,
+        )
+        d.category = _CATEGORY_FOR_COMMAND.get(worst, ApiCategory.READ)
+        d.signals = [
+            f"探针类别：{kinds}",
+            f"最高风险命令：{worst}（{rule.level if rule else '?'}）",
+            f"范围判定：{'在授权范围内' if target_bound else '出界或未绑定（拒绝）'}",
+        ]
+        return d
+
+
+# 探针类别 → 权限矩阵命令（P0-4：sqli 必须落 L3，不得落 L0）。
+# **权威表在本模块**——runner 只引用，不得复制一份自行漂移。
+PROBE_KIND_COMMAND: dict[str, str] = {
+    "rce": "命令执行",             # L3
+    "sqli": "SQL 注入验证",        # L3（此前落入查询详情 L0——整改点）
+    "upload": "上传测试文件",      # L2
+    "fileread": "查询详情",        # L0
+    "fileupload": "上传测试文件",  # L2
+}
+
+# 命令 → 分类（check_probe 供审计展示用）
+_CATEGORY_FOR_COMMAND: dict[str, str] = {
+    "命令执行": ApiCategory.EXECUTE,
+    "SQL 注入验证": ApiCategory.EXECUTE,
+    "上传测试文件": ApiCategory.UPLOAD,
+    "删除测试数据": ApiCategory.DELETE,
+    "批量删除": ApiCategory.DELETE,
+    "查询详情": ApiCategory.READ,
+    "查询列表": ApiCategory.READ,
+    "导出数据": ApiCategory.EXPORT,
+    "认证操作": ApiCategory.AUTH,
+    "创建测试数据": ApiCategory.CREATE,
+    "修改测试数据": ApiCategory.UPDATE,
+}
 
 
 # 外部工具语义映射：这些工具的能力本身就是矩阵里的一条命令。

@@ -26,8 +26,21 @@ from policy.api_policy import (
     rules_table_markdown,
 )
 from policy.audit_logger import PolicyAudit
-from policy.request_guard import ClassifiedRequest, GuardContext, RequestGuard, classify_request
-from policy.test_transaction import TestLedger, TrackedObject
+from policy.request_guard import (
+    ClassifiedRequest,
+    GuardContext,
+    RequestGuard,
+    classify_request,
+    in_scope,
+    validate_target_url,
+)
+from policy.test_transaction import (
+    ApprovalLedger,
+    TestLedger,
+    TrackedObject,
+    UseOnceApproval,
+    request_fingerprint,
+)
 
 __all__ = [
     # api_policy
@@ -36,8 +49,10 @@ __all__ = [
     "ApiCategory", "Decision", "Environment", "PermissionLevel",
     # request_guard
     "RequestGuard", "GuardContext", "classify_request", "ClassifiedRequest",
+    "in_scope", "validate_target_url", "PROBE_KIND_COMMAND",
     # test_transaction
-    "TestLedger", "TrackedObject",
+    "TestLedger", "TrackedObject", "ApprovalLedger", "UseOnceApproval",
+    "request_fingerprint",
     # audit_logger
     "PolicyAudit",
 ]
