@@ -156,6 +156,97 @@ class Detector(ABC):
         self._soft404_bodies: list[str] = []
         self._client: httpx.AsyncClient | None = None
         self._client_proxy: str | None = None
+        # ── 统一安全入口（第六轮整改 P0-2/P0-5）──────────────────────
+        # 每条请求发出前过策略检查：目标范围 + 操作分类 + 环境绑定，
+        # 禁止"只靠 Runner 工具名检查"——批量 POC 的每一条请求都在这里
+        # 受约束。被拦请求不触网，转为带 error 的 Evidence 返回。
+        self._policy_guard = None          # 懒创建 RequestGuard
+        self._policy_bound: str = ""       # 首个请求绑定范围（scheme://netloc）
+        self.policy_blocked = 0            # 被策略拦截的请求数（可观测）
+        self.policy_notes: list[str] = []  # 拦截原因（进探测器 notes / 报告）
+        # 当前探测类别（sqli/rce/fileread/upload）——批量 sweep 时由探测
+        # 器写入，作为 POC 声明维度进分类（payload 编码与否都逃不过类别）。
+        self._current_kind = ""
+        # 写操作（上传）的人工审批通道：ExploitProbeDetector 注入；
+        # None = 无通道 → REVIEW 类请求一律拦截。
+        self.approver = None
+
+    # ── 统一安全入口 ─────────────────────────────────────────────
+    def _policy_scope_bind(self, url: str) -> str:
+        """把首个请求的目标绑定为授权范围（scheme://netloc）。
+
+        检测器实例通常只服务一个目标；绑定后任何跨主机/跨端口请求都
+        按出界拒绝（与 runner 闸门的 in_scope 同一把尺子）。
+        """
+        if self._policy_bound:
+            return self._policy_bound
+        try:
+            p = urlparse(url if "://" in url else f"http://{url}")
+            self._policy_bound = f"{(p.scheme or 'http').lower()}://{p.netloc.lower()}"
+        except ValueError:
+            self._policy_bound = ""
+        return self._policy_bound
+
+    async def _policy_check(
+        self, url: str, method: str, body: str, poc: "POC | None" = None,
+        *, policy_approved: bool = False,
+    ) -> str:
+        """逐请求策略检查。返回 "" 放行，否则返回拦截原因文本。
+
+        与 runner 闸门同一套 policy 模块（不是简化版）：
+
+        * 目标 URL 合法性（协议/端口/字符）→ 非法即拦；
+        * 首请求绑定范围，后续请求必须 in_scope（跨主机/端口出界即拦）；
+        * 七维度分类（路径/方法/参数/请求体/POC 声明）→ 映射矩阵命令；
+        * ``decide()`` 判 ALLOW 才放行——L3（SQLi/RCE）任何环境都拦，
+          unknown 环境只放行明确只读，写语义请求按矩阵拒绝；
+        * REVIEW（L2 上传，dedicated 环境）→ 仅当 ``policy_approved``
+          （探测器 approver 通道对该次上传的逐请求人工审批）为真才放行。
+        """
+        from policy.api_policy import ApiCategory, Decision, Environment, decide
+        from policy.request_guard import (
+            RequestGuard,
+            classify_request,
+            in_scope,
+            validate_target_url,
+        )
+
+        if self._policy_guard is None:
+            self._policy_guard = RequestGuard(self.cfg)
+        guard = self._policy_guard
+        try:
+            url_n = validate_target_url(url)
+        except ValueError as exc:
+            return f"目标 URL 非法：{exc}"
+        bound = self._policy_scope_bind(url_n)
+        if bound and not in_scope(url_n, bound):
+            return f"请求目标超出本检测器绑定的范围（{bound}）"
+        method_u = (method or "GET").upper()
+        cls = classify_request(
+            url_n, method=method_u, body=body,
+            poc_hint=(poc.id if poc is not None else "") or self._current_kind,
+        )
+        if not cls.command:
+            return f"请求分类 UNKNOWN（{'；'.join(cls.signals[:3])}），默认拒绝"
+        env = guard.environment_for(url_n)
+        clearly_read_only = (
+            method_u in ("GET", "HEAD", "OPTIONS") and cls.category == ApiCategory.READ
+        )
+        d = decide(
+            cls.command,
+            environment=env,
+            identity_bound=True,   # 检测器请求按显式匿名身份计（anonymous@host）
+            target_bound=True,     # 范围已由 in_scope 确认
+            approved=False,
+            clearly_read_only=clearly_read_only,
+        )
+        if d.decision == Decision.ALLOW:
+            return ""
+        if d.decision == Decision.REVIEW and policy_approved:
+            # 上传类 REVIEW：探测器 approver 通道已对该次上传逐请求
+            # 人工审批（attack.py），凭该放行标记通过。
+            return ""
+        return f"权限矩阵拒绝：{d.command or '未知操作'} → {d.decision}（{d.reason}）"
 
     # ── HTTP 客户端 ──────────────────────────────────────────────
     def client(self, url: str = "") -> httpx.AsyncClient:
@@ -233,6 +324,8 @@ class Detector(ABC):
         headers: dict[str, str] | None = None,
         body: str = "",
         capture_limit: int | None = None,
+        *,
+        policy_approved: bool = False,
     ) -> Evidence:
         """发一个请求并抓取证据。**任何网络异常都转为 Evidence.error，不抛出。**
 
@@ -240,8 +333,27 @@ class Detector(ABC):
         「报告里贴一段响应」用的；抓 JS 时按 4KB 截断，等于只扫了文件头
         的 license 注释——压缩 bundle 动辄几百 KB，接口路径全在后面。
         JS 分析传 ``cfg.js_max_bytes``（默认 2MB）。
+
+        **统一安全入口（第六轮整改 P0-2/P0-5）**：发出前过
+        :meth:`_policy_check`——目标范围 + 操作分类 + 环境绑定逐请求
+        约束，被拦请求不触网，返回带 ``error`` 的 Evidence（error 以
+        ``【策略拦截】`` 开头，调用方可识别）；拦截计数与原因进
+        ``policy_blocked`` / ``policy_notes``。
+        ``policy_approved`` 仅用于上传类 REVIEW（探测器 approver 已对
+        该次上传逐请求人工审批后传入），不能放行 L3/DENY/UNKNOWN。
         """
+        # ── 策略前置：被拦请求根本不建客户端、不触网 ──────────────────
+        # 有效性方法先定（POC 声明的 method 优先），分类按真实要发的请求算
         method = (poc.request.method if poc else method) or method
+        block = await self._policy_check(
+            url, method, body, poc, policy_approved=policy_approved,
+        )
+        if block:
+            self.policy_blocked += 1
+            self.policy_notes.append(f"{method} {url[:80]} → {block[:160]}")
+            ev = Evidence(url=url, method=method, request_headers=dict(headers or {}))
+            ev.error = f"【策略拦截】{block}"
+            return ev
         req_headers = dict(poc.request.headers if poc else {})
         req_headers.update(headers or {})
 

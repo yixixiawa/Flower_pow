@@ -341,7 +341,9 @@ def test_hardening() -> None:
     m = _ToolRunnerBase._PROBE_KIND_COMMAND
     ok(m.get("sqli") == "SQL 注入验证", "sqli 探针 → SQL 注入验证（L3）")
     ok(m.get("rce") == "命令执行", "rce 探针 → 命令执行（L3）")
-    ok(m.get("fileread") == "查询详情", "fileread 探针 → 查询详情（L0）")
+    # P0-4（第六轮整改）：fileread 是主动利用（路径穿越取文件），矩阵没有
+    # 它的授权行 → 移出映射 → UNKNOWN 默认拒绝，不得映射查询详情 L0。
+    ok("fileread" not in m, "fileread 探针移出命令映射（无矩阵授权 → UNKNOWN/DENY）")
 
     # P1-6：params / POC 声明 / 历史行为真正进分类器
     c = classify_request(
@@ -373,11 +375,17 @@ def test_hardening() -> None:
     cfg2, note = scoped_scan_config(_cfg_with(), "http://10.9.9.9/")
     ok(not cfg2.scan.sqli_probe_enabled and not cfg2.scan.rce_probe_enabled,
        "未绑定环境：SQLi/RCE 探针强制关闭")
-    cfg3, note3 = scoped_scan_config(
-        _cfg_with(environments={"192.168.*": Environment.ISOLATED_TEST}), "http://192.168.1.1/",
-    )
-    ok(cfg3.scan.sqli_probe_enabled, "隔离测试环境：探针按配置执行")
-    ok(note3 == "", "测试环境无降级提示")
+    cfg_in = _cfg_with(environments={"192.168.*": Environment.ISOLATED_TEST})
+    cfg_in.scan.sqli_probe_enabled = True
+    cfg3, note3 = scoped_scan_config(cfg_in, "http://192.168.1.1/")
+    # P0-3（第六轮整改）：批量流水线在测试环境也**不得自动放行 L3**——
+    # SQLi/RCE 探针一律关闭（矩阵 L3 默认禁止，审批无出路，测试环境
+    # 不构成授权依据）；且返回配置副本，绝不改共享 cfg。
+    ok(not cfg3.scan.sqli_probe_enabled and not cfg3.scan.rce_probe_enabled,
+       "隔离测试环境：L3 探针（SQLi/RCE）强制关闭（P0-3）")
+    ok(cfg3 is not cfg_in and cfg_in.scan.sqli_probe_enabled,
+       "scoped_scan_config 返回配置副本（不污染共享配置）")
+    ok("L3" in note3, "测试环境提示 L3 探针已按矩阵关闭")
 
     # P2-11 + P1-⑤：审计落盘失败的明确策略
     a = PolicyAudit("./data", enabled=True)
@@ -694,11 +702,12 @@ def test_runner_gate() -> None:
             "exploit_probe", {"url": "http://127.0.0.2/", "kinds": "fileread"}, s,
         ))
         ok(verdict is not None and "已拦截" in verdict, "exploit_probe 出界（P0-① 统一校验）拒绝")
-        # exploit_probe 范围内 fileread（L0）放行
+        # P0-4（第六轮整改）：fileread 无矩阵授权 → UNKNOWN 拒绝（范围内也一样）
         verdict = asyncio.run(runner._policy_gate(
             "exploit_probe", {"url": "http://127.0.0.1:8080/", "kinds": "fileread"}, s,
         ))
-        ok(verdict is None, "exploit_probe 范围内只读探针放行")
+        ok(verdict is not None and "已拦截" in verdict and "未识别" in verdict,
+           "exploit_probe fileread（无矩阵授权行）→ UNKNOWN 默认拒绝")
         # 破坏性 SQL 体 → SQL 注入验证 L3 拒绝
         verdict = asyncio.run(runner._policy_gate(
             "http_request",
@@ -817,11 +826,12 @@ def test_remediation2() -> None:
             "http_request", {"url": "ftp://127.0.0.1:8080/x", "method": "GET"}, s,
         ))
         ok(verdict is not None and "协议" in verdict, "http_request 非法协议同样拒绝")
-        # 合法目标不受影响（L0 探针照常放行）
+        # 合法目标 + 范围内 fileread 探针 → UNKNOWN 拒绝（P0-4：无矩阵授权）
         verdict = asyncio.run(runner._policy_gate(
             "exploit_probe", {"url": "http://127.0.0.1:8080/", "kinds": "fileread"}, s,
         ))
-        ok(verdict is None, "合法目标 + 范围内只读探针仍放行")
+        ok(verdict is not None and "已拦截" in verdict,
+           "合法目标 + fileread 探针仍拒绝（P0-4：fileread 无授权行）")
 
         # ── #1（第四轮整改）：EXPORT/AUTH 无矩阵授权 → UNKNOWN 默认拒绝 ──
         # 矩阵恰好十条命令；EXPORT/AUTH 只有独立分类与风险信号，
@@ -992,8 +1002,10 @@ def test_remediation2() -> None:
         ok("ops-zhangsan" in aprs[-1]["reason"], "审批理由行也带审批人（可追责到人）")
         ok(aprs[-1].get("extra", {}).get("identity"), "审批审计带请求身份（谁在什么身份下获批）")
         runner.approver_identity = ""
-        ok(runner._approver_label().endswith("_approve2"),
-           "未显式声明 → 回退通道函数名（不再是笼统的 type 名）")
+        # P1-4（第六轮整改）：函数名兜底**禁用**——裸函数通道拿不到真实
+        # 身份就返回空串，审批按"未认证审批人"留痕。
+        ok(runner._approver_label() == "",
+           "未显式声明且通道无身份属性 → 不再用函数名充当审批人（P1-4）")
         _chan = type("Chan", (), {"approver_id": "alice@corp"})()
         runner.approver = _chan
         ok(runner._approver_label() == "alice@corp", "通道对象自带身份属性 → 用真实身份")
@@ -1032,23 +1044,28 @@ def test_remediation2() -> None:
             "http://127.0.0.1:8080/", "sqli,fileread",
             ctx=GuardContext(bound_target="http://127.0.0.1:8080", identity_bound=True),
         )
-        ok(d.command == "SQL 注入验证" and d.decision == Decision.DENY,
-           "check_probe 多类别取最高风险（sqli → L3 拒绝）")
+        # P0-4（第六轮整改）：混合类别里有未识别项 → 整体 UNKNOWN（fail-closed，
+        # 不"去掉未知类别继续判"）
+        ok(d.decision == Decision.UNKNOWN and d.command == "",
+           "check_probe 多类别含未识别项 → 整体 UNKNOWN 拒绝")
+        # P0-4（第六轮整改）：fileread 单独执行 → UNKNOWN 拒绝（无矩阵授权行）
         d = gp.check_probe(
             "http://127.0.0.1:8080/", "fileread",
             ctx=GuardContext(bound_target="http://127.0.0.1:8080", identity_bound=True),
         )
-        ok(d.command == "查询详情" and d.decision == Decision.ALLOW,
-           "check_probe 范围内只读探针 → L0 放行")
+        ok(d.decision == Decision.UNKNOWN and d.command == "",
+           "check_probe fileread → UNKNOWN 默认拒绝（不映射查询详情 L0）")
         d = gp.check_probe(
             "http://127.0.0.1:8080/", "fileread",
             ctx=GuardContext(bound_target="http://10.0.0.1", identity_bound=True),
         )
-        ok(d.decision == Decision.DENY, "check_probe 范围外 → 拒绝（统一 in_scope，不可绕过）")
+        ok(d.decision == Decision.UNKNOWN, "check_probe fileread（无论范围）→ UNKNOWN 拒绝")
         d = gp.check_probe(
-            "http://127.0.0.1:8080/", "fileread", ctx=GuardContext(identity_bound=True),
+            "http://127.0.0.1:8080/", "upload",
+            ctx=GuardContext(bound_target="http://127.0.0.1:8080", identity_bound=True),
         )
-        ok(d.decision == Decision.DENY, "check_probe 无绑定目标 → 拒绝")
+        ok(d.command == "上传测试文件" and d.decision == Decision.DENY,
+           "check_probe upload → L2 上传（隔离环境不满足专门条件 → 拒绝）")
         d = gp.check_probe(
             "http://127.0.0.1:8080/", "wormhole",
             ctx=GuardContext(bound_target="http://127.0.0.1:8080", identity_bound=True),
@@ -1161,6 +1178,339 @@ def test_wheel_packages() -> None:
     ok('"intel/**/*.py"' in text, "wheel include 含 intel/**/*.py")
 
 
+def test_round6() -> None:
+    """第六轮整改专项：P0（全工具入闸/Detector 统一入口/流水线 L3/fileread/
+    批量 POC 约束）+ P1（L0 环境绑定/身份三元组/候选空拒绝/审批真实身份/
+    解码歧义）+ P2（HTTP 出口覆盖/入口一致性/并发隔离）。"""
+    from core.tools.runner import ToolRunner
+    from policy.api_policy import PolicyDecision
+    from policy.request_guard import (
+        GuardContext,
+        RequestGuard,
+        in_scope,
+        over_decode_limit,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = _cfg_with(environments={"127.0.0.*": Environment.ISOLATED_TEST})
+        cfg.data_dir = td
+        runner = ToolRunner(cfg, root=td)
+        s = Session(target="http://127.0.0.1:8080")
+
+        # ── P1-1：L0 加环境绑定——unknown 环境仅明确只读操作 ──────────
+        d = decide("查询详情", environment=Environment.UNKNOWN,
+                   identity_bound=True, target_bound=True, clearly_read_only=False)
+        ok(d.decision == Decision.DENY,
+           "L0 unknown 环境 + 非明确只读 → 拒绝（P1-1 环境绑定）")
+        d = decide("查询详情", environment=Environment.UNKNOWN,
+                   identity_bound=True, target_bound=True, clearly_read_only=True)
+        ok(d.decision == Decision.ALLOW,
+           "L0 unknown 环境 + 明确只读（GET 无高危信号）→ 放行")
+        d = decide("查询详情", environment=Environment.ISOLATED_TEST,
+                   identity_bound=True, target_bound=True, clearly_read_only=False)
+        ok(d.decision == Decision.ALLOW, "L0 已绑定环境（隔离测试）→ 放行")
+        # unknown 环境的 http_request：GET 只读放行，POST 写语义拒绝
+        cfg_u = _cfg_with()
+        cfg_u.data_dir = td
+        runner_u = ToolRunner(cfg_u, root=td)
+        v = asyncio.run(runner_u._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/items/1", "method": "GET"}, s,
+        ))
+        ok(v is None, "unknown 环境：GET 明确只读 → 放行")
+        v = asyncio.run(runner_u._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/items", "method": "POST", "body": "{}"}, s,
+        ))
+        ok(v is not None and "已拦截" in v, "unknown 环境：POST 写语义 → 拒绝")
+        v = asyncio.run(runner_u._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/items/1", "method": "DELETE"}, s,
+        ))
+        ok(v is not None and "已拦截" in v, "unknown 环境：DELETE → 拒绝")
+
+        # ── P0-1：sqli_probe / login / authz_probe / recon_* 全部入闸 ──
+        from policy.request_guard import BUILTIN_POLICY_TOOLS
+
+        ok("sqli_probe" in BUILTIN_POLICY_TOOLS and "login" in BUILTIN_POLICY_TOOLS
+           and "authz_probe" in BUILTIN_POLICY_TOOLS and "recon_paths" in BUILTIN_POLICY_TOOLS,
+           "内置目标请求工具全部纳入 BUILTIN_POLICY_TOOLS（P0-1）")
+        ok(runner._BUILTIN_POLICY_TOOLS is BUILTIN_POLICY_TOOLS,
+           "runner 引用权威工具集合（不各自漂移）")
+        v = asyncio.run(runner._policy_gate(
+            "sqli_probe", {"url": "http://127.0.0.1:8080/", "limit": 5}, s,
+        ))
+        ok(v is not None and "SQL 注入验证" in v and "已拦截" in v,
+           "sqli_probe 工具 → L3 一律拒绝（验收：sqli_probe L3 拒绝）")
+        v = asyncio.run(runner._policy_gate(
+            "login", {"url": "http://127.0.0.1:8080/api/login",
+                      "username": "u", "password": "p"}, s,
+        ))
+        ok(v is not None and "已拦截" in v,
+           "login 工具 → AUTH 无矩阵授权行 → UNKNOWN 拒绝")
+        # authz_probe：只读 GET 对比 → L0，隔离测试环境放行
+        v = asyncio.run(runner._policy_gate(
+            "authz_probe", {"url": "http://127.0.0.1:8080/", "limit": 5}, s,
+        ))
+        ok(v is None, "authz_probe（L0 只读对比）绑定齐全 → 放行")
+        # recon_paths：L0 侦察 → 放行
+        v = asyncio.run(runner._policy_gate(
+            "recon_paths", {"url": "http://127.0.0.1:8080/"}, s,
+        ))
+        ok(v is None, "recon_paths（L0 侦察）→ 放行")
+        # recon_ports 用 host 参数 → 同样入闸
+        v = asyncio.run(runner._policy_gate(
+            "recon_ports", {"host": "127.0.0.1"}, s,
+        ))
+        ok(v is None, "recon_ports（host 参数）→ 放行")
+        # unknown 环境：authz_probe 的请求是只读 GET → 放行；出界 → 拒
+        v = asyncio.run(runner_u._policy_gate(
+            "authz_probe", {"url": "http://127.0.0.1:8080/"}, s,
+        ))
+        ok(v is None, "unknown 环境：authz_probe 只读 → 放行（unknown 仅明确只读）")
+        v = asyncio.run(runner._policy_gate(
+            "recon_paths", {"url": "http://10.9.9.9/"}, s,
+        ))
+        ok(v is not None and "已拦截" in v, "recon_paths 出界 → 拒绝（统一范围校验）")
+
+        # ── P1-2：身份绑定 session_id / target_id / 凭证指纹 ──────────
+        s_a = Session(target="http://127.0.0.1:8080")
+        s_a.session_id = "sess-A"
+        s_b = Session(target="http://127.0.0.1:8080")
+        s_b.session_id = "sess-B"
+        runner._observe_identity(
+            {"Authorization": "Bearer same-token"}, "http://127.0.0.1:8080/", session=s_a,
+        )
+        ida = runner._current_identity(s_a, url="http://127.0.0.1:8080/")
+        runner._identity = ""
+        runner._observe_identity(
+            {"Authorization": "Bearer same-token"}, "http://127.0.0.1:8080/", session=s_b,
+        )
+        idb = runner._current_identity(s_b, url="http://127.0.0.1:8080/")
+        ok(ida != idb, "同 Token 不同 Session → 身份不同（P1-2 会话隔离）")
+        ok("|sess=sess-A|" in ida and "|sess=sess-B|" in idb,
+           "身份串绑定 session_id（可对账）")
+        ok("|tgt=127.0.0.1:8080" in ida, "身份串绑定 target（目标维度可对账）")
+        # 匿名请求紧接管理员请求仍匿名（同一会话内来回切换）
+        runner._identity = ""
+        runner._observe_identity(
+            {"Authorization": "Bearer admin-tok"}, "http://127.0.0.1:8080/", session=s_a,
+        )
+        id_admin = runner._current_identity(s_a, url="http://127.0.0.1:8080/")
+        runner._identity = ""
+        id_anon1 = runner._observe_identity({}, "http://127.0.0.1:8080/", session=s_a)
+        runner._identity = ""
+        runner._observe_identity(
+            {"Authorization": "Bearer admin-tok"}, "http://127.0.0.1:8080/", session=s_a,
+        )
+        id_admin2 = runner._current_identity(s_a, url="http://127.0.0.1:8080/")
+        ok(id_anon1.startswith("anonymous@") and "|sess=sess-A|" in id_anon1,
+           "匿名请求 → 显式匿名身份（绑定会话/目标）")
+        ok(id_admin == id_admin2 and id_admin != id_anon1,
+           "管理员身份恢复解析且与匿名身份不同")
+
+        # ── P1-3：对象 ID 候选集为空不得放行走台账 ────────────────────
+        led = TestLedger()
+        led.record("http://h/api/users", "create", run_id="r", target_id="t",
+                   identity="i", object_id="33")
+        ok(not led.known("http://h/", run_id="r", target_id="t", identity="i"),
+           "删除 URL 提不出任何候选 id → 不放行（P1-3）")
+        verdict, why = led.delete_verdict(
+            "http://h/", run_id="r", target_id="t", identity="i",
+            environment=Environment.ISOLATED_TEST,
+        )
+        ok(not verdict, "候选集为空的删除 → 台账拒绝（P1-3）")
+        verdict, _ = led.delete_verdict(
+            "http://h/api/users/33", run_id="r", target_id="t", identity="i",
+            environment=Environment.ISOLATED_TEST,
+        )
+        ok(verdict, "候选 id 命中登记对象 → 正常放行（行为不回归）")
+
+        # ── P1-5：路径解码达上限仍歧义 → 拒绝 ────────────────────────
+        ok(not over_decode_limit("/app/%2e%2e/other"), "单层编码可解码 → 非歧义")
+        ok(not over_decode_limit("/app/x%20y"), "常规 %20 编码 → 非歧义")
+        ok(not over_decode_limit("/app/%252e%252e"), "双层编码（限内）→ 非歧义，摊平解析")
+        ok(over_decode_limit("/app/%2525252e%2525252e"), "四层以上嵌套编码 → 歧义（P1-5）")
+        ok(in_scope("http://127.0.0.1:8080/app/%2e/sub", "http://127.0.0.1:8080/app"),
+           "限内编码摊平后按真实语义比对（/app/./sub → /app/sub 在前缀内）")
+        ok(not in_scope("http://127.0.0.1:8080/app/%2e%2e/other", "http://127.0.0.1:8080/app"),
+           "编码 .. 摊平后逃出前缀 → 拒绝（路径穿越）")
+        ok(not in_scope("http://127.0.0.1:8080/app/%2525252e%2525252e", "http://127.0.0.1:8080/app"),
+           "多层编码歧义路径 → fail-closed 拒绝（验收：多层编码路径穿越拒绝）")
+        v = asyncio.run(runner._policy_gate(
+            "http_request",
+            {"url": "http://127.0.0.1:8080/api/%2525252e%2525252e", "method": "GET"}, s,
+        ))
+        ok(v is not None and "已拦截" in v, "多层编码歧义路径的请求 → 闸门拒绝")
+
+        # ── P1-4：审批回调返回真实身份；无身份不得记为已认证审批人 ──────
+        async def _approve_bool(desc: str) -> bool:
+            return True
+
+        async def _approve_id(desc: str) -> str:
+            return "ops-lisi"
+
+        runner.approver = _approve_bool
+        v = asyncio.run(runner._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/u/1", "method": "DELETE"}, s,
+        ))
+        ok(v is None, "裸布尔审批通道：操作放行")
+        apr = [e for e in runner.policy_audit.recent() if e["event"] == "approval"][-1]
+        ok(apr.get("extra", {}).get("authenticated_approver") is False
+           and "未认证" in apr.get("extra", {}).get("approver", ""),
+           "无真实身份的审批 → 记为未认证审批人（不得冒充已认证）")
+        runner.approver = _approve_id
+        v = asyncio.run(runner._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/u/2", "method": "DELETE"}, s,
+        ))
+        ok(v is None, "回调返回真实身份 → 放行")
+        apr = [e for e in runner.policy_audit.recent() if e["event"] == "approval"][-1]
+        ok(apr.get("extra", {}).get("approver") == "ops-lisi"
+           and apr.get("extra", {}).get("authenticated_approver") is True,
+           "回调返回的真实身份进审批审计（authenticated_approver=True）")
+
+        # ── P0-2：Detector.send_request 统一安全入口（不靠 Runner 工具名）─
+        from detectors.http_detector import HttpDetector
+
+        class _FakeResp:
+            def __init__(self) -> None:
+                self.status_code = 200
+                self.headers = {"content-type": "text/html"}
+                self.content = b"hello"
+
+        class _FakeClient:
+            async def request(self, method, url, headers=None, content=None):  # noqa: ANN001
+                return _FakeResp()
+
+        det = HttpDetector(cfg.scan)
+        det.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        # 绑定范围 = 首个请求；正常 GET 放行且真实发出
+        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list"))
+        ok(not ev.error and ev.status_code == 200, "Detector 正常只读 GET → 放行并发出")
+        # sqli 类别（_current_kind）→ L3 → 拦截，不触网
+        det._current_kind = "sqli"
+        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list?id=1"))
+        ok(ev.error and ev.error.startswith("【策略拦截】") and "SQL 注入验证" in ev.error,
+           "Detector sqli 探针请求 → L3 拦截（统一安全入口，不靠工具名）")
+        ok(det.policy_blocked == 1 and det.policy_notes, "拦截计数与原因可观测")
+        # 跨主机出界 → 拦截
+        det._current_kind = ""
+        ev = asyncio.run(det.send_request("http://10.9.9.9/api/list"))
+        ok(ev.error and "超出" in ev.error, "Detector 跨主机请求 → 范围拦截")
+        # 非法协议 → 拦截
+        ev = asyncio.run(det.send_request("ftp://127.0.0.1/x"))
+        ok(ev.error and "非法" in ev.error, "Detector ftp:// 目标 → 拦截")
+        # unknown 环境：POST 写语义 → 拦截
+        det_u = HttpDetector(cfg_u.scan)
+        det_u.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        ev = asyncio.run(det_u.send_request("http://127.0.0.1:8080/api/items",
+                                            method="POST", body="a=1"))
+        ok(ev.error and "【策略拦截】" in ev.error,
+           "Detector unknown 环境 POST → 拦截（unknown 仅明确只读）")
+        # 上传类：dedicated 环境 + 探测器审批通道 → policy_approved 通路
+        det_d = HttpDetector(_cfg_with(environments={"127.0.0.*": Environment.DEDICATED_TEST}).scan)
+        det_d.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
+                                            body="--b\r\ncontent-disposition: form-data"))
+        ok(ev.error and "【策略拦截】" in ev.error,
+           "Detector 上传（L2 REVIEW）无逐请求审批 → 拦截")
+        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
+                                            body="--b\r\ncontent-disposition: form-data",
+                                            policy_approved=True))
+        ok(not ev.error, "Detector 上传（L2 REVIEW）+ 逐请求审批标记 → 放行")
+
+        # ── P2：CLI / MCP / Agent / 后台任务的策略入口一致性（静态回归）──
+        root = Path(__file__).resolve().parent.parent
+        entry_checks = [
+            ("cli/scan.py", "active_scan_check"),
+            ("mcp_server/jobs.py", "active_scan_check"),
+            ("core/repl/auto.py", "active_scan_check"),
+            ("core/tools/runner/verify.py", "active_scan_check"),
+            ("core/subdomain.py", "active_scan_check"),
+        ]
+        missing = [
+            rel for rel, kw in entry_checks
+            if kw not in (root / rel).read_text(encoding="utf-8", errors="ignore")
+        ]
+        ok(not missing, f"CLI/MCP/Agent/子域入口全部走 active_scan_check：{missing}")
+        ok("build_client_kwargs" in (root / "detectors/base.py").read_text(encoding="utf-8"),
+           "Detector HTTP 客户端走统一代理出口（覆盖率）")
+        # 内置工具闸门接线（Agent 路径）：_POLICY_TOOLS 覆盖全部目标请求工具
+        from core.tools.runner.base import _ToolRunnerBase
+
+        for t in ("sqli_probe", "login", "authz_probe", "recon_fingerprint",
+                  "recon_ports", "recon_ports_bg", "recon_paths", "recon_js",
+                  "js_audit", "recon_openapi", "recon_subdomains"):
+            ok(t in _ToolRunnerBase._POLICY_TOOLS, f"Agent 闸门覆盖 {t}")
+
+
+def test_round6_concurrency() -> None:
+    """第六轮验收：后台并发无身份/台账串线——同一 Token 在两个会话里
+    并发创建，台账条目身份互不串（P1-2 三元组 + ContextVar 隔离）。"""
+    from core.tools.runner import ToolRunner
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = _cfg_with(environments={"127.0.0.*": Environment.ISOLATED_TEST})
+        cfg.data_dir = td
+        runner = ToolRunner(cfg, root=td)
+        s_a = Session(target="http://127.0.0.1:8080")
+        s_a.session_id = "sess-A"
+        s_b = Session(target="http://127.0.0.1:8080")
+        s_b.session_id = "sess-B"
+
+        async def _fake_http(session, **kwargs):  # noqa: ANN001, ANN202
+            url = str(kwargs.get("url") or "")
+            tail = url.rstrip("/").split("/")[-1]
+            return (
+                f"POST {url}\n状态码：201  耗时：1ms  正文大小：46B\n"
+                f'正文（46 字符）：\n{{"ok":true,"data":{{"id":"{tail}-obj"}}}}'
+            )
+
+        runner._h_http_request = _fake_http
+        # 两个会话用同一个 Token 并发创建
+        s_a.credentials["token"] = "same-token"
+        s_b.credentials["token"] = "same-token"
+
+        async def _two():
+            return await asyncio.gather(
+                runner.execute("http_request", {
+                    "url": "http://127.0.0.1:8080/api/alpha",
+                    "method": "POST", "body": "{}",
+                }, s_a),
+                runner.execute("http_request", {
+                    "url": "http://127.0.0.1:8080/api/beta",
+                    "method": "POST", "body": "{}",
+                }, s_b),
+            )
+
+        outs = asyncio.run(_two())
+        ok(all("状态码：201" in o for o in outs), "并发创建两次都执行成功")
+        tid, rid = runner._policy_scope(s_a)
+        # 两个会话的台账身份必须不同（同 Token/同目标、仅 session 不同）
+        obj_a = next(o for o in runner.test_ledger.objects_of() if "alpha" in o.url)
+        obj_b = next(o for o in runner.test_ledger.objects_of() if "beta" in o.url)
+        id_a, id_b = obj_a.identity, obj_b.identity
+        ok(id_a != id_b, "同 Token 不同 Session → 台账身份不同（P1-2）")
+        ok("sess=sess-A" in id_a and "sess=sess-B" in id_b,
+           "台账身份绑定 session_id（可对账）")
+        tid_a, rid_a = runner._policy_scope(s_a)
+        tid_b, rid_b = runner._policy_scope(s_b)
+        ok(rid_a != rid_b, "不同会话 → 各自独立的扫描轮次（run 隔离）")
+        ok(runner.test_ledger.known("http://127.0.0.1:8080/api/alpha/alpha-obj",
+                                    target_id=tid_a, run_id=rid_a, identity=id_a),
+           "会话 A 的对象以 A 的身份落账（不被 B 串线）")
+        ok(runner.test_ledger.known("http://127.0.0.1:8080/api/beta/beta-obj",
+                                    target_id=tid_b, run_id=rid_b, identity=id_b),
+           "会话 B 的对象以 B 的身份落账（不被 A 串线）")
+        ok(not runner.test_ledger.known("http://127.0.0.1:8080/api/alpha/alpha-obj",
+                                        target_id=tid_b, run_id=rid_b, identity=id_b),
+           "A 的对象对 B 的会话/身份不可见（台账不串线）")
+        ok(runner._pending_ledger is None, "并发执行后无遗留 pending 条目")
+        # 审计隔离：allow 事件各带各的身份
+        events = [e for e in runner.policy_audit.recent()
+                  if e["event"] == "allow" and e.get("command") == "创建测试数据"]
+        idents = {e.get("target_id") and e.get("run_id") and e.get("url") for e in events}
+        ok(len(events) == 2 and len(idents) == 2,
+           "并发创建的两条放行留痕互相独立")
+
+
 def main() -> int:
     test_rules_table()
     test_decide()
@@ -1172,6 +1522,8 @@ def main() -> int:
     test_runner_gate()
     test_remediation2()
     test_concurrency_isolation()
+    test_round6()
+    test_round6_concurrency()
     test_http_exit()
     test_wheel_packages()
     print(

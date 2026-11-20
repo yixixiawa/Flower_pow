@@ -103,12 +103,17 @@ class _HistoryMixin(_Base):
         print(f"#{no} 标题已改为：{cs[no-1].title}")
 
     # ── 写操作人工审核 ────────────────────────────────────────────
-    async def _approve(self, desc: str) -> bool:
+    async def _approve(self, desc: str) -> str | bool:
         """每**一次**写操作前的人工审核（现在只有文件上传会走到这里）。
 
         为什么必须一次一问：上传确实会在目标上留下文件。批量放行等于把
         "只写一次"变成"想写几次写几次"，出事了无法收场。
+
+        P1-4（第六轮整改）：返回**真实审批人身份**（str）而非裸布尔——
+        审批审计必须能追责到"谁批的"；拒绝返回 False。
         """
+        import getpass
+
         print("\n" + "─" * 62)
         print("  ⚠ 写操作待审核")
         print("─" * 62)
@@ -121,7 +126,10 @@ class _HistoryMixin(_Base):
             return False
         ok = (ans or "").strip().lower() in ("y", "yes")
         print("  → " + ("已放行" if ok else "已拒绝"))
-        return ok
+        if not ok:
+            return False
+        user = getpass.getuser()
+        return f"interactive:{user}"
 
     # ── 全自动（Alt+Shift / /auto）────────────────────────────────
 

@@ -174,6 +174,11 @@ class TestLedger:
             return False
         key = self._key(url)
         cands = candidate_ids(url)
+        # P1-3（第六轮整改）：删除 URL 里**提不出任何对象标识候选** →
+        # 无从确认"删的就是登记的那个对象" → 一律按未知处理，不得凭
+        # "台账里有条目"放行（比如打在集合端点、根路径的删除请求）。
+        if not cands:
+            return False
         for o in reversed(self._objects):
             # 四元组逐一相等（含空值相等）：任何一维对不上都跳过
             if o.target_id != target_id or o.run_id != run_id or o.identity != identity:
@@ -252,6 +257,10 @@ class TestLedger:
             return False
         key = self._key(url)
         cands = candidate_ids(url)
+        # P1-3（第六轮整改）：候选集为空 → 无法把删除请求对到具体对象
+        # → 不得走台账放行（同 known() 的 fail-closed 口径）。
+        if not cands:
+            return False
         for o in reversed(self._objects):
             if o.action not in ("create", "upload") or not o.object_id:
                 continue

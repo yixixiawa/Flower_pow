@@ -27,11 +27,12 @@ class _SchedulerBase:
     def __init__(
         self,
         cfg: Config,
-        approver: Callable[[str], Awaitable[bool]] | None = None,
+        approver: Callable[[str], Awaitable["bool | str"]] | None = None,
     ) -> None:
         self.cfg = cfg
         self.llm = LLMClient(cfg.llm)
         # 写操作的人工审核通道。None 时上传类探测会被跳过（不会偷偷写目标）。
+        # P1-4（第六轮整改）：回调返回 bool 或真实审批人身份 str。
         self.approver = approver
         self._intel = None  # 延迟加载
         # POC 库：JS 逻辑审计与一次性探针都要用它做漏洞模板兜底，

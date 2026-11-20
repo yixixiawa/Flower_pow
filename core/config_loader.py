@@ -47,6 +47,10 @@ class ScanConfig(BaseModel):
     follow_redirects: bool = Field(default=True)
     verify_tls: bool = Field(default=False)
     proxy: str | None = Field(default=None)
+    # Detector 统一安全入口（P0-2）用的策略配置引用——由 Config 的
+    # model_post_init 回填（同一 PolicyConfig 对象，不序列化）。
+    # None = 独立构造的 ScanConfig（测试/库调用）→ 环境按 unknown 处理。
+    policy: "PolicyConfig | None" = Field(default=None, exclude=True, repr=False)
     # 代理例外表：命中的主机会**直连**，不走 proxy。
     # 这是**唯一**的直连出口——用户自己写进配置的显式声明，
     # 不是从 Windows 注册表 ProxyOverride 里继承来的副作用。
@@ -236,6 +240,14 @@ class Config(BaseModel):
     intel: IntelConfig = Field(default_factory=IntelConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     output_dir: str = Field(default="./output")
+
+    def model_post_init(self, __context: Any) -> None:
+        # Detector 统一安全入口（第六轮整改 P0-2）需要环境绑定表做逐请求
+        # 环境判定，但探测器只拿得到 ScanConfig——把**同一个** PolicyConfig
+        # 对象共享给 scan（exclude=True 不进序列化/导出）。共享引用意味着
+        # 运行期改 policy.environments 对探测器立即可见，不存在两份漂移。
+        if getattr(self.scan, "policy", None) is None:
+            self.scan.policy = self.policy
     data_dir: str = Field(default="./data")
 
 

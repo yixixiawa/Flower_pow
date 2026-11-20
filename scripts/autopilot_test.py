@@ -50,7 +50,8 @@ class FakeDet(ExploitProbeDetector):
         self._bodies = bodies
         self.sent: list[str] = []
 
-    async def send_request(self, url, poc=None, method="GET", headers=None, body=""):
+    async def send_request(self, url, poc=None, method="GET", headers=None, body="",
+                           capture_limit=None, *, policy_approved=False):
         i = len(self.sent)
         self.sent.append(url)
         b = self._bodies(i) if callable(self._bodies) else (

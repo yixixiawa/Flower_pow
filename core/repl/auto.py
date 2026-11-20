@@ -88,17 +88,20 @@ class _AutoMixin(_Base):
         except Exception as exc:  # noqa: BLE001
             print(f"[!] 报告导出失败：{type(exc).__name__}: {exc}")
 
-    async def _auto_approve(self, desc: str) -> bool:
+    async def _auto_approve(self, desc: str) -> str:
         """全自动期间的写操作通道：**不阻拦，但每一条都留痕**。
 
         为什么还要打印而不直接 ``return True``：上传会在目标上留下文件，
         事后必须能回答"到底写进去了几个、写到哪"。打印 + 写进 notes，
         是为了让"一键"不等于"无法审计"。
+
+        P1-4（第六轮整改）：返回真实审批身份——全自动模式的放行主体是
+        "确认开启全自动的那个终端用户"，记为 ``auto-mode``；不再是裸布尔。
         """
         first = (desc or "").splitlines()[0] if desc else ""
         print(f"  [auto] 写操作放行：{first}")
         self.session.result.notes.append(f"[全自动] 已放行写操作：{first}")
-        return True
+        return "auto-mode（全自动模式确认放行）"
 
     def _merge_scan(self, result) -> dict[str, int]:
         """把 ``Scheduler.scan`` 的结果并回当前会话。

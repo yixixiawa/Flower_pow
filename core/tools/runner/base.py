@@ -32,7 +32,10 @@ from core.state import Asset, Finding, Severity
 from core.tools.args import normalize_args
 from core.tools.external import ExternalTool
 from core.tools.probe import Probe
-from policy.request_guard import PROBE_KIND_COMMAND as _PROBE_KIND_COMMAND_SHARED
+from policy.request_guard import (
+    BUILTIN_POLICY_TOOLS as _BUILTIN_POLICY_TOOLS_SHARED,
+    PROBE_KIND_COMMAND as _PROBE_KIND_COMMAND_SHARED,
+)
 
 
 MAX_TOOL_OUTPUT = 6000      # 回灌给模型的单个工具结果上限（字符）
@@ -127,7 +130,9 @@ class _ToolRunnerBase:
         # 写操作（目前只有上传）的人工审核通道。
         # None = 没有审核通道 → 上传会被跳过而不是偷偷执行。
         # 由交互层（core/repl.py）注入；全自动模式下注入"自动放行+打日志"。
-        self.approver: Callable[[str], Awaitable[bool]] | None = None
+        # P1-4（第六轮整改）：回调返回 bool 或**真实审批人身份 str**——
+        # 返回裸 True 的审批在审计里记为未认证审批人。
+        self.approver: Callable[[str], Awaitable[bool | str]] | None = None
         # 落盘文件的命名序号（防同一秒撞名）
         self._spill_seq = 0
         # 最近几次**真实发出**的请求（http_request 的结果快照）。
@@ -524,7 +529,15 @@ class _ToolRunnerBase:
 
     # 受权限矩阵管辖的面向目标工具。本地产物读写（files/fsops）、
     # 会话管理、报告导出不在"接口测试生命周期"范围内，不过闸门。
-    _POLICY_TOOLS = frozenset({"http_request", "external_tool", "exploit_probe"})
+    # 第六轮整改 P0-1：sqli_probe / login / authz_probe / recon_* 全部
+    # 纳入——它们都会向目标发请求，必须过同一道权限闸门
+    # （命令映射见 policy.request_guard._BUILTIN_TOOL_COMMAND）。
+    _POLICY_TOOLS = frozenset({
+        "http_request", "external_tool", "exploit_probe",
+        "sqli_probe", "login", "authz_probe",
+        "recon_fingerprint", "recon_ports", "recon_ports_bg", "recon_paths",
+        "recon_js", "js_audit", "recon_openapi", "recon_subdomains",
+    })
 
     _LEDGER_ACTIONS = {
         "创建测试数据": "create",
@@ -541,21 +554,36 @@ class _ToolRunnerBase:
         前次请求的身份**。匿名归属优先取本次请求 URL 的主机（url 给出
         时），退回会话目标主机。
 
+        P1-2（第六轮整改）：身份**绑定执行上下文三元组**——
+        ``|sess=<session_id>|tgt=<目标主机>``。同一个 Token 在两个会话
+        里是两个身份（台账/审计互不串线）；同一会话换目标后身份随之
+        变化（旧目标的台账条目天然不可复用）。
+
         * 无凭证 → ``anonymous@<host>``：匿名也是被记录、可审计的身份
           （未认证请求的执行主体就是它），不是"随便放行"的占位；
         * 会话没有目标、也没有请求 URL → 没有身份（identity_bound=
           False，全量拒绝）。
         """
-        if self._identity:
-            return self._identity
+        base = self._identity
         src = url or str(getattr(session, "target", "") or "")
-        if not src:
-            return ""
+        if not base:
+            if not src:
+                return ""
+            try:
+                host = urlparse(src).hostname or src
+            except ValueError:
+                host = src
+            base = f"anonymous@{host}"
+        # 绑定 session 与 target：同一凭证在不同会话/目标下是不同身份
+        sid = str(getattr(session, "session_id", "") or "nosession")
+        tgt = ""
         try:
-            host = urlparse(src).hostname or src
+            tgt = (urlparse(str(getattr(session, "target", "") or "")).netloc or "").lower()
         except ValueError:
-            host = src
-        return f"anonymous@{host}"
+            tgt = ""
+        if not tgt:
+            tgt = (str(getattr(getattr(session, "result", None), "target_id", "") or "")[:80]) or "notarget"
+        return f"{base}|sess={sid}|tgt={tgt}"
 
     def _policy_ctx(self, session, url: str):
         """决策上下文：目标、环境、账号身份三要素的绑定。
@@ -719,6 +747,36 @@ class _ToolRunnerBase:
                 if blk is not None:
                     return blk
                 return None
+
+            # ── P0-1（第六轮整改）：内置目标请求工具统一入闸 ─────────────
+            # sqli_probe / login / authz_probe / recon_* 都会向目标发请求，
+            # 决策统一走 guard.check_builtin（与 http_request 同一授权路径：
+            # in_scope 范围 + 环境绑定 + 身份 + 审批恒 False）。run_pipeline
+            # 不在此列——它的闸门是 policy.enforcer 的主动扫描进门检查
+            # （CLI / MCP / Agent 三个入口同一口径）。
+            if name in self._BUILTIN_POLICY_TOOLS:
+                raw = str(
+                    args.get("url") or args.get("target") or args.get("host")
+                    or args.get("domain") or session.target or ""
+                )
+                url = ""
+                if raw:
+                    url = self._validate_http_url(self._normalize_target(raw))
+                else:
+                    raise ToolBlocked("缺少目标参数（url/target/host）")
+                # 身份：这些工具经 session.credentials 携带凭证（login 写入、
+                # authz_probe 使用），gate 逐请求按凭证指纹解析——有 Token
+                # 用 Token 指纹，无 Token 显式匿名，不继承前次实名。
+                tok = str((getattr(session, "credentials", None) or {}).get("token") or "")
+                if tok:
+                    self._identity = f"cred:session:{hashlib.sha256(tok.encode('utf-8')).hexdigest()[:10]}"
+                else:
+                    self._identity = ""
+                d = guard.check_builtin(name, url, ctx=self._policy_ctx(session, url))
+                return await self._review_or_allow(d, session, url, req_ctx={
+                    "method": "GET", "tool": name,
+                    "params": {k: str(v)[:200] for k, v in args.items()},
+                })
             return None
         except ToolBlocked as exc:
             # 第二轮整改 #1：目标/协议/端口的明确拒绝——以【已拦截】文本
@@ -744,6 +802,10 @@ class _ToolRunnerBase:
     # 探针类别 → 权限矩阵命令：**权威表在 policy.request_guard**，
     # runner 只保留引用别名（历史测试引用），不得复制一份自行漂移。
     _PROBE_KIND_COMMAND = _PROBE_KIND_COMMAND_SHARED
+
+    # 内置目标请求工具集合：与 policy.request_guard._BUILTIN_TOOL_COMMAND
+    # 的键保持一致（P0-1）。guard 是权威，这里只圈"哪些工具过闸"。
+    _BUILTIN_POLICY_TOOLS = _BUILTIN_POLICY_TOOLS_SHARED
 
     # 逐请求都要重新解析的凭证头（第四轮整改 #2）
     _CRED_HEADERS = frozenset(
@@ -960,35 +1022,30 @@ class _ToolRunnerBase:
         )
 
     def _approver_label(self) -> str:
-        """审批人的**真实身份**（第四轮整改 #4）——审批审计必须能追责到人。
+        """审批人的**真实身份**（第四轮整改 #4 + 第六轮整改 P1-4）。
 
-        解析顺序（都不满足回退，最终兜底 "unknown-approver"）：
+        解析顺序（第六轮整改起**禁用函数名兜底**）：
 
         1. ``self.approver_identity`` —— 注入审批通道的调用方（repl /
           全自动模式 / MCP）显式声明的操作者身份；
         2. 通道对象自带的身份属性（``approver_id`` / ``username`` /
-          ``display_name`` / ``name``）—— 自定义审批类声明的"我是谁"；
-        3. ``__qualname__`` / ``__name__`` / 类型名 —— 裸函数通道至少
-          记到函数级。
+          ``display_name``）—— 自定义审批类声明的"我是谁"。
 
-        旧的 ``type(self.approver).__name__`` 会把闭包、lambda、不同人
-        注入的通道都记成同一个 "function"——审批人和审批事件对不上号。
+        都没有 → 返回空串：审批回调**必须返回真实身份**（str）或由
+        调用方显式声明；拿不到真实身份的审批在审计里记为
+        **未认证审批人**（``authenticated_approver: False``），
+        绝不把 ``function`` / ``_approve`` 这类函数名当审批人。
         """
         if self.approver_identity.strip():
             return self.approver_identity.strip()[:60]
         a = self.approver
         if a is None:
-            return "none"
-        for attr in ("approver_id", "username", "user", "display_name", "name"):
+            return ""
+        for attr in ("approver_id", "username", "user", "display_name"):
             v = getattr(a, attr, None)
-            if isinstance(v, str) and v.strip() and attr != "name":
+            if isinstance(v, str) and v.strip():
                 return v.strip()[:60]
-        label = (
-            getattr(a, "__qualname__", None)
-            or getattr(a, "__name__", None)
-            or type(a).__name__
-        )
-        return (str(label)[:60] or "unknown-approver")
+        return ""
 
     async def _policy_review(
         self, d, session, url: str, *, method: str = "", req_digest: str = "",
@@ -1022,19 +1079,29 @@ class _ToolRunnerBase:
             )
             return False
         approver_label = self._approver_label()
-        ok = bool(
-            await self.approver(
-                f"策略审批：{d.command}（{d.level}）{method or 'GET'} {url[:80]}\n  {d.reason}"
-            )
+        result = await self.approver(
+            f"策略审批：{d.command}（{d.level}）{method or 'GET'} {url[:80]}\n  {d.reason}"
         )
+        # P1-4（第六轮整改）：审批回调**返回真实身份**（str）——返回裸
+        # True 的通道没有可追责的审批人，按"未认证审批"留痕（审计
+        # authenticated_approver=False），绝不拿函数名充当审批人。
+        if isinstance(result, str):
+            ok = bool(result.strip())
+            if ok and not approver_label:
+                approver_label = result.strip()[:60]
+        else:
+            ok = bool(result)
         if not ok:
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision="DENY",
                 category=d.category, url=url, target_id=tid, run_id=rid,
-                reason=f"运行期审批拒绝（审批人 {approver_label}）：" + d.reason,
+                reason=f"运行期审批拒绝（审批人 {approver_label or '未声明'}）：" + d.reason,
                 extra={"approver": approver_label, "identity": ident},
             )
             return False
+        authenticated = bool(approver_label)
+        if not authenticated:
+            approver_label = "未认证审批（通道未返回真实身份）"
         token = self.approvals.issue(
             url=url, command=d.command, target_id=tid,
             run_id=rid, identity=ident,
@@ -1052,7 +1119,7 @@ class _ToolRunnerBase:
                 "deny", command=d.command, level=d.level, decision="DENY",
                 category=d.category, url=url, target_id=tid, run_id=rid,
                 reason=f"审批票据消费失败（审批人 {approver_label}；{why}）：{d.reason}",
-                extra={"approver": approver_label},
+                extra={"approver": approver_label, "authenticated_approver": authenticated},
             )
             return False
         self.policy_audit.log(
@@ -1065,6 +1132,7 @@ class _ToolRunnerBase:
                 "request_digest": token.request_digest,
                 "approver": token.approver,
                 "identity": ident,
+                "authenticated_approver": authenticated,
             },
         )
         return True

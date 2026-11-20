@@ -127,14 +127,19 @@ def exploit(
         finally:
             await det.aclose()
 
-    async def _cli_approve(desc: str) -> bool:
+    async def _cli_approve(desc: str) -> str | bool:
         """CLI 模式的上传人工审核通道。
 
         没有这一步，``detectors/exploit.py`` 的闸门会判定"无审核通道"
         并跳过全部上传 —— ``--upload`` 就永远是个摆设（这正是修之前的症状）。
         为什么要一次一问：上传会在目标上留下文件，批量放行等于把
         "只写一次"变成"想写几次写几次"。
+
+        P1-4（第六轮整改）：放行返回**真实审批人身份**（终端用户名），
+        拒绝返回 False——审批审计可追责到人，不拿函数名充当审批人。
         """
+        import getpass
+
         console.print()
         console.rule("[yellow]⚠ 写操作待审核[/yellow]")
         for ln in (desc or "").splitlines():
@@ -144,11 +149,13 @@ def exploit(
             ans = await asyncio.to_thread(
                 input, "  允许这一次？[y/N] "
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            return False
+        except KeyboardInterrupt:
             return False
         ok = (ans or "").strip().lower() in ("y", "yes")
         console.print("  → " + ("[green]已放行[/green]" if ok else "[red]已拒绝[/red]"))
-        return ok
+        return f"cli-interactive:{getpass.getuser()}" if ok else False
 
     try:
         det, (findings, stats) = asyncio.run(_go())

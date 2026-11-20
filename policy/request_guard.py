@@ -307,6 +307,30 @@ def normalize_url_path(path: str) -> str:
     return "/" + "/".join(segs)
 
 
+def over_decode_limit(path: str) -> bool:
+    """路径解码达到上限仍有残余编码 → **歧义，不可判**（第六轮整改 P1-5）。
+
+    ``normalize_url_path`` 最多解码 ``_MAX_UNQUOTE`` 层；超出上限的
+    多层编码路径（``%252532``×N 层嵌套）真实语义依赖服务端解码层数，
+    静态分析无法确知——此时"规范化后的前缀比对"结论不可信。
+    调用方（in_scope/_endpoint）对歧义路径一律 fail-closed 拒绝，
+    不猜服务端会解几层。
+    """
+    p = path or ""
+    try:
+        from urllib.parse import unquote
+
+        for _ in range(_MAX_UNQUOTE):
+            dec = unquote(p)
+            if dec == p:
+                return False
+            p = dec
+        # 达到上限后仍在变化 → 还有未解码层 → 歧义
+        return unquote(p) != p
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _endpoint(url: str) -> tuple[str, str, int, str] | None:
     """URL → (scheme, hostname, port, path)，全部规范化。解析失败返回 None。
 
@@ -325,6 +349,11 @@ def _endpoint(url: str) -> tuple[str, str, int, str] | None:
         return None
     if port is None:
         port = _DEFAULT_PORTS.get(scheme, 0)
+    # P1-5（第六轮整改）：解码达上限仍歧义的路径 → 不可判 → fail-closed。
+    # 多层编码路径（%2525...嵌套）的真实语义取决于服务端解码层数，
+    # 规范化结论不可信——按"解析失败"处理（in_scope 判 False）。
+    if over_decode_limit(p.path or "/"):
+        return None
     return scheme, host, port, normalize_url_path(p.path or "/")
 
 
@@ -355,6 +384,27 @@ def in_scope(url: str, bound_target: str) -> bool:
 def _same_host(url_a: str, url_b: str) -> bool:
     """统一的范围校验（P0-① 升级：scheme+host+port+路径前缀，详见 in_scope）。"""
     return in_scope(url_a, url_b) or in_scope(url_b, url_a)
+
+
+# 主机级授权工具：端口扫描/子域枚举的对象本来就是"主机上的任意端口/域"，# noqa: E501
+# 严格 port 比对会把工具的本职工作判成出界。这类工具按 scheme+host 授权。
+HOST_SCOPED_TOOLS: frozenset[str] = frozenset({
+    "recon_ports", "recon_ports_bg", "recon_subdomains",
+})
+
+
+def host_in_scope(url: str, bound_target: str) -> bool:
+    """主机级范围比对（scheme + hostname，不比端口）。
+
+    仅限 :data:`HOST_SCOPED_TOOLS` 使用——绑定 ``http://h:8080`` 表示
+    授权"主机 h"，端口扫描扫该主机的其他端口是工具的定义而非越界。
+    路径类工具仍走严格 :func:`in_scope`（scheme+host+port+路径前缀）。
+    """
+    a = _endpoint(bound_target)
+    b = _endpoint(url)
+    if a is None or b is None:
+        return False
+    return a[0] == b[0] and a[1] == b[1]
 
 
 # ── 目标 URL 合法性校验（第二轮整改 #1：明确拒绝非法目标/协议/端口）──
@@ -531,6 +581,13 @@ class RequestGuard:
         # P0-①：目标范围校验走**统一入口** in_scope（scheme+host+port+路径前缀）。
         # 只知道"会话有目标"不算绑定，范围外请求视为未绑定 → 拒绝。
         target_bound = bool(ctx.bound_target) and in_scope(url, ctx.bound_target)
+        # P1-1（第六轮整改）：L0 的环境绑定需要"明确只读"证据——
+        # 方法只读且七维度分类没有任何更高风险信号。破坏性 SQL/上传/
+        # 批量特征会把 category 抬高，这里自然为 False。
+        clearly_read_only = (
+            (method or "GET").upper() in ("GET", "HEAD", "OPTIONS")
+            and cls.category == ApiCategory.READ
+        )
         # P0-②：审批不在配置层——恒传 False，逐请求审批在运行期通道。
         d = decide(
             cls.command,
@@ -538,6 +595,7 @@ class RequestGuard:
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
             approved=False,
+            clearly_read_only=clearly_read_only,
         )
         d.category = cls.category
         d.signals = cls.signals
@@ -564,14 +622,61 @@ class RequestGuard:
             not str(args.get("target") or args.get("url") or "")
             or in_scope(url, ctx.bound_target)
         )
+        # P1-1（第六轮整改）：映射为只读语义的外部工具（nmap/curl/dirsearch
+        # 等枚举与取回事实类）构成"明确只读"——unknown 环境照旧放行；
+        # L3 类映射（sqlmap/nuclei/hydra）不受此影响（矩阵一律拒绝）。
         d = decide(
             command,
             environment=ctx.environment or self.environment_for(url),
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
             approved=False,  # P0-②：审批只在运行期逐请求发生
+            clearly_read_only=command in (Command.QUERY_LIST, Command.QUERY_DETAIL),
         )
         d.category = ApiCategory.EXECUTE
+        return d
+
+    def check_builtin(self, tool_key: str, url: str, ctx: GuardContext | None = None) -> PolicyDecision:
+        """Runner 内置目标请求工具的统一决策入口（第六轮整改 P0-1）。
+
+        sqli_probe / login / authz_probe / recon_* 全部走这里——与
+        check_request / check_tool / check_probe 同一条授权路径：
+        范围统一 :func:`in_scope`、环境统一 :meth:`environment_for`、
+        审批恒 False（L3 无出路；L2 的逐请求审批在运行期通道）。
+
+        映射表 :data:`_BUILTIN_TOOL_COMMAND`；映射为空串（如 login——
+        AUTH 无矩阵授权）或缺席 → UNKNOWN 默认拒绝。
+        """
+        command = _BUILTIN_TOOL_COMMAND.get(tool_key)
+        if not command:
+            return PolicyDecision(
+                decision=Decision.UNKNOWN,
+                command="",
+                category=ApiCategory.AUTH if command == "" else ApiCategory.UNKNOWN,
+                reason=(
+                    f"内置工具 {tool_key} 无权限矩阵授权行"
+                    + ("（AUTH 类不映射 L0）" if command == "" else "，不在映射内")
+                    + "，默认拒绝执行"
+                ),
+            )
+        ctx = ctx or GuardContext()
+        # 范围判定与 check_request 同源：目标为空或出界 → 未绑定 → 拒绝。
+        # 端口扫描/子域枚举按主机级授权（扫其他端口是工具本职，不是越界）。
+        if tool_key in HOST_SCOPED_TOOLS:
+            target_bound = bool(ctx.bound_target) and bool(url) and host_in_scope(url, ctx.bound_target)
+        else:
+            target_bound = bool(ctx.bound_target) and bool(url) and in_scope(url, ctx.bound_target)
+        d = decide(
+            command,
+            environment=ctx.environment or self.environment_for(url),
+            identity_bound=ctx.identity_bound,
+            target_bound=target_bound,
+            approved=False,
+            # 内置侦察/越权工具只发只读 GET——L0 的 unknown 环境放行条件
+            clearly_read_only=True,
+        )
+        d.category = ApiCategory.READ if command in (Command.QUERY_LIST, Command.QUERY_DETAIL) else _CATEGORY_FOR_COMMAND.get(command, ApiCategory.UNKNOWN)
+        d.signals = [f"内置工具 {tool_key} → {command}"]
         return d
 
     def check_probe(self, url: str, kinds: str, ctx: GuardContext | None = None) -> PolicyDecision:
@@ -626,12 +731,15 @@ class RequestGuard:
 
 # 探针类别 → 权限矩阵命令（P0-4：sqli 必须落 L3，不得落 L0）。
 # **权威表在本模块**——runner 只引用，不得复制一份自行漂移。
+# P0-4（第六轮整改）：**fileread 移出映射**——文件读取探针（路径穿越
+# 取 /etc/passwd 类）是主动利用行为，不是"查询详情"这种合法只读；
+# 矩阵没有它的授权行 → 映射空串 → UNKNOWN 默认拒绝。
 PROBE_KIND_COMMAND: dict[str, str] = {
     "rce": "命令执行",             # L3
     "sqli": "SQL 注入验证",        # L3（此前落入查询详情 L0——整改点）
     "upload": "上传测试文件",      # L2
-    "fileread": "查询详情",        # L0
     "fileupload": "上传测试文件",  # L2
+    # "fileread" 刻意不在表内：无矩阵授权 → UNKNOWN/DENY（第六轮整改 P0-4）
 }
 
 # 命令 → 分类（check_probe 供审计展示用）
@@ -667,3 +775,29 @@ _TOOL_COMMAND: dict[str, str] = {
     "nuclei": Command.SQLI_VERIFY,    # 模板扫可能带利用 payload（L3）
     "hydra": Command.EXECUTE_CMD,     # 攻击性爆破，按 L3 攻击命令归类
 }
+
+
+# Runner **内置**目标请求工具 → 权限矩阵命令（第六轮整改 P0-1：
+# sqli_probe / login / authz_probe / recon_* 全部纳入策略执行）。
+# 权威表在本模块，runner 只引用；映射缺席的内置工具一律 UNKNOWN 拒绝。
+# * sqli_probe 的唯一能力就是 SQL 注入验证 → L3 一律拒绝；
+# * login 提交凭证建立会话——矩阵没有 AUTH 授权行 → 空串 UNKNOWN 拒绝
+#   （与 http_request 打 /login 端点的判定同口径，不得映射 L0）；
+# * authz_probe / recon_* 只发只读 GET 侦察 → 查询列表（L0，
+#   环境绑定条件由 decide() 的 L0 分支把关）。
+_BUILTIN_TOOL_COMMAND: dict[str, str] = {
+    "sqli_probe": Command.SQLI_VERIFY,      # L3：一律拒绝
+    "login": "",                            # AUTH 无矩阵授权 → UNKNOWN
+    "authz_probe": Command.QUERY_LIST,      # L0：只读 GET 对比
+    "recon_fingerprint": Command.QUERY_LIST,
+    "recon_ports": Command.QUERY_LIST,
+    "recon_ports_bg": Command.QUERY_LIST,
+    "recon_paths": Command.QUERY_LIST,
+    "recon_js": Command.QUERY_LIST,
+    "js_audit": Command.QUERY_LIST,
+    "recon_openapi": Command.QUERY_LIST,
+    "recon_subdomains": Command.QUERY_LIST,
+}
+
+# 过闸的内置工具名集合（runner 引用；guard 是权威，不得各自漂移）
+BUILTIN_POLICY_TOOLS: frozenset[str] = frozenset(_BUILTIN_TOOL_COMMAND)

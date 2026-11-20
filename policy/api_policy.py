@@ -280,11 +280,19 @@ def decide(
     identity_bound: bool = False,
     target_bound: bool = False,
     approved: bool = False,
+    clearly_read_only: bool = False,
 ) -> PolicyDecision:
     """按矩阵对一条命令做 Hybrid 决策。
 
     判定顺序刻意写成"先拒绝后允许"：任何一条禁止条件命中就走拒绝，
     剩下的才检查允许条件——保证不会因为两条都沾边而放行。
+
+    ``clearly_read_only``（第六轮整改 P1-1：L0 加环境绑定）——本次请求
+    是否为**无歧义的只读**（方法 GET/HEAD/OPTIONS 且七维度分类没有任何
+    更高风险信号）。矩阵 L0 的允许条件写着"目标、环境与账号身份已完成
+    绑定，操作为只读"：环境未绑定（unknown）时只放行明确只读操作，
+    带任何写语义/注入 payload/批量特征的请求一律拒绝——unknown 不是
+    "什么都行"，而是"只放行一眼就能确认无害的请求"。
     """
     rule = rule_for_command(command)
     if rule is None:
@@ -322,6 +330,15 @@ def decide(
         return base
 
     if rule.level == PermissionLevel.L0:
+        # P1-1（第六轮整改）：L0 的环境绑定是真实条件——unknown 环境
+        # 只放行**明确只读**操作（方法只读且七维度分类无更高风险信号）。
+        # 带写语义或 payload 特征的请求在 unknown 环境一律拒绝。
+        if environment == Environment.UNKNOWN and not clearly_read_only:
+            base.reason = (
+                f"{rule.command}（L0）目标环境未绑定（unknown），"
+                "仅明确只读操作放行；本次请求带非只读语义/特征，拒绝执行"
+            )
+            return base
         base.decision = Decision.ALLOW
         base.reason = f"{rule.command}（L0）只读且目标/环境/身份已绑定，有条件允许"
         return base
