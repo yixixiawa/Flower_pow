@@ -59,6 +59,9 @@ class _ContextMixin(_Base):
             # /read 补的是路径前缀没用（本地文件名枚举等于帮用户列目录），
             # 所以只补"已授权过的文件"，方便 /files --drop 与 /plan 引用
             "files": ["--drop", "--clear"],
+            # /guard 子命令（等级命令只查看，不是解锁开关）
+            "guard": ["status", "L0", "L1", "L2", "L3", "pending",
+                      "approve", "deny", "revoke", "readonly", "on", "off"],
             # /sessions 的参数 = 全部会话名 + all（空格即出候选，见 _sessions）
             "sessions": ["all", *ids],
             # 标题编号只列已存在的 + 下一个（避免补出一堆不存在的编号）

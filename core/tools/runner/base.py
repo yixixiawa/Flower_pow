@@ -1080,18 +1080,56 @@ class _ToolRunnerBase:
         tid, rid = self._policy_scope(session)
         ident = self._current_identity(session, url=url)
         if getattr(d, "level", "") == PermissionLevel.L3:
-            # L3 一律拒绝，审批不设出路——通道层面再拦一道
+            # L3 一律拒绝，审批不设出路——通道层面再拦一道。
+            # 警告文本与 L3 识别登记统一在 _policy_deny（DENY 唯一出口）处理。
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision="DENY",
                 category=d.category, url=url, target_id=tid, run_id=rid,
                 reason="L3 命令不得通过审批放行（审批无出路）",
             )
             return False
+        # ── GUARD 台账：已审批票据的预检（/guard approve 签发的一次性票据）──
+        from policy.guard_registry import get_registry
+
+        reg = self._guard_registry(session)
+        ok_reg, _why_reg, reg_approver = reg.match_approved(
+            session_id=session.session_id, target_id=tid, run_id=rid,
+            url=url, method=method,
+            fingerprint=req_digest or "", identity=ident,
+        )
+        if ok_reg:
+            self.policy_audit.log(
+                "approval", command=d.command, level=d.level, decision="ALLOW",
+                category=d.category, url=url, target_id=tid, run_id=rid,
+                reason=f"GUARD 一次性票据消费成功（审批人 {reg_approver or '已登记'}，"
+                       "仅本请求有效）：" + d.reason,
+                extra={"approver": reg_approver, "identity": ident,
+                       "channel": "guard"},
+            )
+            self._cv_policy_approved.set(True)
+            return True
         if self.approver is None:
+            # 无审批通道：登记待审批请求（GUARD 编号进拒绝文本，用户可以
+            # 用 /guard pending 查看、/guard approve <id> 事后审批）。
+            req_grd, _ = reg.register(
+                session_id=session.session_id, target_id=tid, run_id=rid,
+                url=url, method=method,
+                fingerprint=req_digest or "", level=d.level,
+                command=d.command, environment="", identity=ident,
+                kind="", reason=d.reason,
+            )
+            grd_note = (
+                f"GUARD 编号 {req_grd.request_id}，可 /guard pending 查看、"
+                f"/guard approve {req_grd.request_id} 人工审批本次请求"
+                if req_grd is not None else ""
+            )
+            if grd_note:
+                d.reason = f"{d.reason}\n  {grd_note}"
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision=d.decision,
                 category=d.category, url=url, target_id=tid, run_id=rid,
-                reason=d.reason + "；无审批通道，拒绝执行",
+                reason=d.reason + "；无审批通道，拒绝执行" + (f"（{grd_note}）" if grd_note else ""),
+                extra={"guard_request_id": req_grd.request_id if req_grd else ""},
             )
             return False
         approver_label = self._approver_label()
@@ -1156,6 +1194,12 @@ class _ToolRunnerBase:
         self._cv_policy_approved.set(True)
         return True
 
+    def _guard_registry(self, session):
+        """GUARD 请求审批台账（与审计同 data_dir，进程内单例）。"""
+        from policy.guard_registry import get_registry
+
+        return get_registry(str(self.policy_audit.path.parent.parent))
+
     def _policy_allow(self, session, d, url: str = "") -> str | None:
         """放行留痕 + 写操作挂 pending 台账（P0-②：**放行 ≠ 登记**）。
 
@@ -1200,6 +1244,21 @@ class _ToolRunnerBase:
     def _policy_deny(self, session, d, url: str = "") -> str:
         """DENY/UNKNOWN 决策的留痕 + 拒绝文本。拒绝也必须能对账。"""
         tid, rid = self._policy_scope(session)
+        if getattr(d, "level", "") == "L3":
+            # schedule §4：系统识别到 L3 请求 → 展示最高风险警告。
+            # 警告只用于风险提醒，不是解锁密码或授权机制。
+            self._guard_registry(session).record_l3(
+                session_id=session.session_id, operation=d.command or "L3 操作",
+                target=url, source="runner", level="L3", reason=d.reason,
+            )
+            d.reason = (
+                "！你知道你在干什么了！\n"
+                f"  操作名称：{d.command or 'L3 操作'}\n"
+                f"  目标：{url}\n"
+                "  请求来源：runner\n"
+                "  风险等级：L3\n"
+                f"  DENY 原因：{d.reason}（L3 永久拒绝，无审批出路）"
+            )
         self.policy_audit.log(
             "deny", command=d.command, level=d.level, decision=d.decision,
             category=d.category, url=url, target_id=tid, run_id=rid,

@@ -325,6 +325,10 @@ class _LoopMixin(_Base):
         if low.startswith("/readonly"):
             self._set_readonly(raw)
             return True
+        # ── /guard 分级权限管理 ───────────────────────────────────
+        if low == "/guard" or low.startswith("/guard "):
+            self._guard(raw.partition(" ")[2] if " " in raw else "")
+            return True
         # ── 本地文件 + Plan/Work ──────────────────────────────────
         if low.startswith("/read") and not low.startswith("/readonly"):
             self._read_file(raw.partition(" ")[2] if " " in raw else "")

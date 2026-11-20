@@ -20,6 +20,8 @@ COMMANDS = [
     "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/readonly", "/quit",
     # 本地文件 + Plan/Work 工作流
     "/read", "/files", "/plan", "/approve", "/work", "/reject",
+    # 分级权限管理
+    "/guard",
 ]
 
 BANNER = """
@@ -60,6 +62,16 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
                 支持 `#3`、完整目录名、id、唯一的名字片段
   /clean        删除所有空会话（没目标、没对话、没结果）。恢复时也会自动清
   /quit         退出（自动保存；空会话不保存）
+
+分级权限管理（查看规则 → 管理运行模式 → 按具体操作审批）：
+  /guard            默认展示 L0..L3 / UNKNOWN 各级规则与当前状态
+  /guard status     目标 / 环境 / 身份 / 只读模式 / 待审批明细
+  /guard L0..L3     只查看该级规则（**不是解锁开关**；L3 展示最高风险警告）
+  /guard pending    待审批请求清单（编号 / 操作 / 目标 / 剩余有效期）
+  /guard approve <id>   审批该具体请求（一次性票据，内容变化即失效）
+  /guard deny <id>      拒绝该请求
+  /guard revoke <id>    撤销已签发未消费的票据
+  /guard readonly on|off   运行期只读开关（退出只读**不突破权限矩阵**）
 
 本地文件与计划（读文件 → 出计划 → 确认 → 执行）：
   /read <路径>      授权并读取一个本地文件（路径必须由你给出，不做全盘扫描）

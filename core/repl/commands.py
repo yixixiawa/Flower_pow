@@ -270,6 +270,10 @@ class _CommandMixin(_Base):
         else:
             print("⚠ 已放开写操作（readonly=off）：攻击性外部工具放行，"
                   "破坏性 POC 会真实执行。")
+            print("  注意：取消只读**不代表获得新的权限**——所有请求仍必须经过")
+            print("  API Policy → Request Gateway → Approval Check → Audit 全链路，")
+            print("  L1 仍仅限隔离测试环境、L2 仍逐请求审批、L3 / UNKNOWN 仍拒绝；")
+            print("  不能因为 readonly=false 就跳过策略。")
             print("  只对已获书面授权的目标这么做；/readonly on 可随时收回。")
 
     # ── 剧本模式动作 ──────────────────────────────────────────────

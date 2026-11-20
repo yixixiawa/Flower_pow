@@ -14,7 +14,7 @@
 ``loop``              主循环与 ``_handle`` 命令分发
 ``commands``          目标 / 工具 / 凭证 / 轮询 / 状态 / 资产 / 发现
 ``session``           误报 / 对话轮 / 模型 / 报告 / 会话存取
-``workflow``          本地文件（/read /files）与 Plan/Work（/plan /approve /work /reject）
+``workflow``          本地文件（/read /files）与 Plan/Work（/plan /approve /work /reject）\n``guard``             分级权限管理（/guard status|L0..L3|pending|approve|deny|revoke）
 ``entry``             ``run_repl`` 启动入口
 =====================  ==========================================================
 
@@ -37,6 +37,7 @@ from core.repl.consts import (
     PHASE_ALIAS,
 )
 from core.repl.context import _ContextMixin
+from core.repl.guard import _GuardMixin
 from core.repl.history import _HistoryMixin
 from core.repl.loop import _LoopMixin
 from core.repl.session import _SessionMixin
@@ -44,6 +45,7 @@ from core.repl.workflow import _WorkflowMixin
 
 
 class Repl(
+    _GuardMixin,
     _WorkflowMixin,
     _SessionMixin,
     _CommandMixin,
