@@ -183,6 +183,14 @@ class _ToolRunnerBase:
         # 请求继承。同样挂 ContextVar 做并发隔离——并发请求 A 的实名
         # 身份不得泄漏进并发请求 B 的台账/审计/决策。
         self._cv_identity: ContextVar[str] = ContextVar("runner_identity", default="")
+        # 本次工具调用是否已完成逐请求人工审批（上传/删除类 REVIEW）。
+        # 探测器（HttpDetector）内部还会再判一次：没有这个标记，Runner
+        # 审批通过的上传会在 Detector 层被同一个 REVIEW 再拦一次——
+        # 表现为"批了也发不出去"。标记随 execute 重置、随 ContextVar
+        # 隔离，不会泄漏到下一次调用或并发任务。
+        self._cv_policy_approved: ContextVar[bool] = ContextVar(
+            "runner_policy_approved", default=False,
+        )
         # 审批人的真实身份（第四轮整改 #4）：由注入审批通道的调用方
         # （repl / 全自动模式）显式设置；不设置时回退到通道对象自带的
         # 身份属性，再回退到函数名——审批审计必须能追责到"谁批的"。
@@ -205,6 +213,11 @@ class _ToolRunnerBase:
     @_identity.setter
     def _identity(self, value: str) -> None:
         self._cv_identity.set(value)
+
+    @property
+    def _policy_approved_now(self) -> bool:
+        """本次 execute 是否已取得逐请求审批（供探测器复核时透传）。"""
+        return self._cv_policy_approved.get()
 
     def reset_target_scope(self) -> None:
         """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
@@ -361,6 +374,8 @@ class _ToolRunnerBase:
     async def execute(self, name: str, args: dict[str, Any], session) -> str:
         """执行一次工具调用。**任何异常都转成文本返回给模型，不向上抛。**"""
         started = time.perf_counter()
+        # 审批标记是"本次调用"的事实：每次进来先归零，不跨调用继承
+        self._cv_policy_approved.set(False)
         # **按 schema 归一实参类型**，必须在展开之前：模型会把布尔写成字符串
         # （`"false"` 在 Python 里恒为真 → `overwrite="false"` 真的会覆盖、
         # `undo="false"` 真的会撤销），也会把枚举写错大小写（`"MD"` → 判断全落空、
@@ -900,11 +915,12 @@ class _ToolRunnerBase:
         )
         lines = [
             "【已拦截】（策略）删除操作未通过测试对象台账检查，请求未发出。",
+            f"  对象：{url}",
             f"  理由：{reason}",
             "  台账按目标 + 轮次 + 账号身份 + 对象标识四元组匹配：",
             "  只放行本次测试**执行成功并取得对象标识**后登记的对象；",
-            "  删除预置测试数据需对**本次请求**逐次审批（运行期审批通道，",
-            "  参数变化后不会复用）。",
+            "  审批是第二道门，**不能替代对象身份验证**——未登记的对象",
+            "  即使审批通过也不会被删除（需先创建/上传取到 ID 再删）。",
         ]
         return "\n".join(lines)
 
@@ -1135,6 +1151,9 @@ class _ToolRunnerBase:
                 "authenticated_approver": authenticated,
             },
         )
+        # 审批已完成：本次调用内层探测器（Detector 再判一次）凭此标记
+        # 放行同类 REVIEW（上传/删除），不再重复问人。
+        self._cv_policy_approved.set(True)
         return True
 
     def _policy_allow(self, session, d, url: str = "") -> str | None:

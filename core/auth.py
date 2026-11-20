@@ -132,10 +132,12 @@ class Authenticator:
 
     def client(self) -> httpx.Client:
         if self._c is None or self._c.is_closed:
-            from core.gateway import gateway_sync_client
+            from core.proxy import build_client_kwargs
 
-            # 客户端构造统一收敛到 core.gateway（代理/超时/TLS 与全工程同一份）
-            self._c = gateway_sync_client(self.cfg, self._base_url)
+            # 代理决策收敛到 core/proxy.py：默认全部目标都走代理。
+            kw = build_client_kwargs(self.cfg, self._base_url)
+            # build_client_kwargs 为 httpx.AsyncClient 设计，这里同步客户端同样吃这些键
+            self._c = httpx.Client(**kw)
         return self._c
 
     def close(self) -> None:

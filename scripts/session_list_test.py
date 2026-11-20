@@ -16,6 +16,9 @@
   6. 裸命令 ``sessions`` 也能命中（不会被当成自然语言喂给模型）
   7. MCP ``sessions`` 服务返回标题/阶段/可读时间/对话轮数
   8. 相对 ``data_dir`` 按配置文件所在目录解析（与 CWD 无关）
+  9. ``/sessions `` + Tab 补出**本地全部会话名**（尾随空格不得吞候选）；
+     ``/sessions <关键词>`` 按名字/标题/目标过滤，序号仍是全量序号
+ 10. 无控制台环境（管道/重定向）不因 ``patch_stdout`` 崩掉（可降级）
 
 运行：.venv/Scripts/python.exe scripts/session_list_test.py
 """
@@ -225,8 +228,97 @@ def scenario_repl_listing(tmp: Path) -> None:
     check("可恢复会话" in buf3.getvalue(), "裸命令 sessions 直接列出会话（不喂给模型）")
 
 
+def scenario_tab_completion(tmp: Path) -> None:
+    print("\n场景5 /sessions + 空格 → Tab 补出本地全部会话")
+    from prompt_toolkit.document import Document
+
+    base = tmp / "s5tab" / "sessions"
+    make(base, "20260101_甲任务", target="http://a.test", title="甲任务", age=30)
+    make(base, "20260102_乙任务", target="http://b.test", title="乙任务", age=20)
+    make(base, "20260103_丙任务", target="http://c.test", title="丙任务", age=10)
+    cfg = FakeCfg(str(tmp / "s5tab"))
+    repl = Repl(cfg, Session(target="http://cur.test"), agent=False, probes=[])
+
+    comp = repl._completer()
+    # 关键回归：以前 get_completions 用 line.split()，尾随空格被吞掉、
+    # "/sessions " 只剩 1 段 → 一个候选都不出（用户看到的"Tab 没反应"）。
+    got = [c.text for c in comp.get_completions(Document("/sessions "), None)]
+    check(len(got) >= 4, f"「/sessions 」后 Tab 出候选，实={got}")
+    check("all" in got, "候选含 all（看全量）")
+    check(all(n.startswith("2026010") for n in got if n != "all"),
+          f"候选含本地全部会话名（不截断），实={got}")
+    got_prefix = [c.text for c in comp.get_completions(Document("/sessions 20260102"), None)]
+    check(got_prefix == ["20260102_乙任务"], f"按前缀收窄候选，实={got_prefix}")
+
+    # 候选必须"真能用"：/sessions <会话名> 精确过滤
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        repl._sessions("乙任务")
+    out = buf.getvalue()
+    check("20260102_乙任务" in out and "20260101_甲任务" not in out,
+          f"关键词过滤只留匹配项，实={out[:160]!r}")
+    check("#2" in out, f"过滤后仍印全量序号（/resume #2 与屏上一致），实={out[:80]!r}")
+
+    # 过滤无命中：说清楚，而不是静默
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        repl._sessions("不存在的关键词")
+    out2 = buf2.getvalue()
+    check("没有匹配" in out2 and "/sessions" in out2,
+          f"无命中给出可操作的提示，实={out2[:120]!r}")
+
+
+def scenario_stdout_guard(tmp: Path) -> None:
+    print("\n场景6 无控制台环境不因 patch_stdout 崩掉（session 挂掉的根因）")
+    import core.repl.entry as entry_mod
+
+    state = {"entered": False, "exited": False}
+
+    class _Ok:
+        def __enter__(self):
+            state["entered"] = True
+            return None
+
+        def __exit__(self, *a):
+            state["exited"] = True
+            return False
+
+    class _Boom:
+        def __enter__(self):
+            raise entry_mod.NoConsoleScreenBufferError()
+
+        def __exit__(self, *a):
+            return False
+
+    old_patch, old_avail = entry_mod.patch_stdout, entry_mod.available
+    try:
+        # ① 非 TTY（管道/重定向/测试环境）：直接跳过，不碰控制台
+        entry_mod.available = lambda **kw: False
+        entry_mod.patch_stdout = lambda: _Ok()
+        with entry_mod._stdout_guard():
+            pass
+        check(not state["entered"], "非 TTY → 不接管屏幕（没有提示符可被冲掉）")
+
+        # ② 是 TTY 但拿不到控制台句柄：吞掉异常，REPL 继续跑
+        entry_mod.available = lambda **kw: True
+        entry_mod.patch_stdout = lambda: _Boom()
+        entered_body = False
+        with entry_mod._stdout_guard():
+            entered_body = True
+        check(entered_body, "patch_stdout 抛 NoConsoleScreenBufferError → 降级继续（不崩）")
+
+        # ③ 正常路径：进入/退出都被调用
+        state["entered"] = state["exited"] = False
+        entry_mod.patch_stdout = lambda: _Ok()
+        with entry_mod._stdout_guard():
+            pass
+        check(state["entered"] and state["exited"], "正常路径：接管并正确收尾")
+    finally:
+        entry_mod.patch_stdout, entry_mod.available = old_patch, old_avail
+
+
 def scenario_mcp_payload(tmp: Path) -> None:
-    print("\n场景5 MCP sessions 服务的可读字段")
+    print("\n场景7 MCP sessions 服务的可读字段")
     from types import SimpleNamespace
 
     from mcp_server import services
@@ -248,7 +340,7 @@ def scenario_mcp_payload(tmp: Path) -> None:
 
 
 def scenario_relative_data_dir(tmp: Path) -> None:
-    print("\n场景6 相对 data_dir 跟配置文件走")
+    print("\n场景8 相对 data_dir 跟配置文件走")
     from core.config_loader import load_config
 
     proj = tmp / "proj"
@@ -277,6 +369,8 @@ def main() -> int:
         scenario_updated_at(tmp)
         scenario_limit_and_latest(tmp)
         scenario_repl_listing(tmp)
+        scenario_tab_completion(tmp)
+        scenario_stdout_guard(tmp)
         scenario_mcp_payload(tmp)
         scenario_relative_data_dir(tmp)
     total = OK + FAIL

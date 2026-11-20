@@ -212,3 +212,35 @@ class FileMixin:
                 else "要重新生成报告用 export_report。"
             )
         )
+
+    # ── 用户授权的本地文件（**与沙箱文件是两套边界**）───────────────
+    #
+    # read_file/write_file 管的是"项目产物沙箱"（output/ 与 POC 目录）；
+    # 下面三个管的是"用户用 /read 显式授权的任意本地文件"，只读、只认
+    # file_id。两套边界刻意不合并：沙箱是"受限目录里的读写"，本地授权是
+    # "用户点名的一份只读输入"，合并会让任何一边的放宽污染另一边。
+
+    async def _h_list_session_files(self, session, **_kw) -> str:
+        from core.files.tools import run_local_tool
+
+        return run_local_tool("list_session_files", {}, session)
+
+    async def _h_read_local_file(
+        self, session, file_id: str = "", start: int = 1, lines: int = 400, **_kw,
+    ) -> str:
+        from core.files.tools import run_local_tool
+
+        return run_local_tool(
+            "read_local_file",
+            {"file_id": file_id, "start": start, "lines": lines},
+            session,
+        )
+
+    async def _h_grep_local_file(
+        self, session, file_id: str = "", pattern: str = "", **_kw,
+    ) -> str:
+        from core.files.tools import run_local_tool
+
+        return run_local_tool(
+            "grep_local_file", {"file_id": file_id, "pattern": pattern}, session,
+        )

@@ -14,6 +14,7 @@
 ``loop``              主循环与 ``_handle`` 命令分发
 ``commands``          目标 / 工具 / 凭证 / 轮询 / 状态 / 资产 / 发现
 ``session``           误报 / 对话轮 / 模型 / 报告 / 会话存取
+``workflow``          本地文件（/read /files）与 Plan/Work（/plan /approve /work /reject）
 ``entry``             ``run_repl`` 启动入口
 =====================  ==========================================================
 
@@ -39,9 +40,11 @@ from core.repl.context import _ContextMixin
 from core.repl.history import _HistoryMixin
 from core.repl.loop import _LoopMixin
 from core.repl.session import _SessionMixin
+from core.repl.workflow import _WorkflowMixin
 
 
 class Repl(
+    _WorkflowMixin,
     _SessionMixin,
     _CommandMixin,
     _LoopMixin,

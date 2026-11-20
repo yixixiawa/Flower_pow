@@ -116,6 +116,16 @@ class _CommandMixin(_Base):
         self.session.session_id = new_id
         self.session._dir_name = ""
         self.session.created_at = _t.time()
+        # 计划是**旧会话身份**下确认的：session_id 一换，票据与计划都对不上了。
+        # 显式清掉，别留一个"看起来还能 /work"的僵尸计划在屏幕上。
+        if getattr(self, "_active_plan", None) is not None:
+            try:
+                self.active_plan = None
+            except Exception:  # noqa: BLE001
+                self._active_plan = None
+        self._plan_token = ""
+        # 文件授权与目标无关（是用户给的输入），换目标时**保留**：
+        # 同一份接口文档常常要对着几个目标看。只有 /reset 才清空。
 
     def _reset(self, args: str = "") -> None:
         """彻底重置：销毁当前所有数据，开启全新会话。

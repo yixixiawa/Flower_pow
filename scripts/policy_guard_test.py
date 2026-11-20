@@ -68,6 +68,24 @@ def ok(cond: bool, name: str) -> None:
         print(f"  [FAIL] {name}")
 
 
+def seed_deletable(runner, session, url: str) -> str:
+    """在对象台账登记"本次创建并取得对象 ID"的对象（删除放行用例的前置）。
+
+    第七轮验收要求：**删除必须验证本次创建/上传的具体对象 ID，审批不能
+    替代对象身份验证**。所以任何"删除被放行"的用例，对象都必须先在台账
+    里（模拟 create 成功 → 从响应取到 id）。登记路径取对象的集合端点
+    （``url`` 去掉最后一段），身份按匿名解析（与 gate 内逐请求解析同口径）。
+    """
+    runner._identity = ""  # 逐请求解析：无凭证 = 匿名
+    tid, rid = runner._policy_scope(session)
+    ident = runner._current_identity(session, url=url)
+    base, _, oid = url.rstrip("/").rpartition("/")
+    runner.test_ledger.record(
+        base, "create", run_id=rid, target_id=tid, identity=ident, object_id=oid,
+    )
+    return ident
+
+
 # ── 1. 规则清单表 ────────────────────────────────────────────────
 
 EXPECTED_LEVELS = {
@@ -484,12 +502,13 @@ def test_ledger() -> None:
         identity="anon", environment=Environment.ISOLATED_TEST,
     )
     ok(not verdict, "删除未知对象且无审批 → 拒绝")
-    verdict, _ = led.delete_verdict(
+    verdict, why = led.delete_verdict(
         "http://t.example.com/api/users/999", target_id="t", run_id="r1",
         identity="anon", environment=Environment.ISOLATED_TEST,
         approved=True,
     )
-    ok(verdict, "未知对象 + 绑定本次请求的审批 → 放行")
+    ok(not verdict and "身份验证" in why,
+       "未知对象 + 审批 → 仍拒绝（第七轮：审批不能替代对象身份验证）")
     verdict, why = led.delete_verdict(
         "http://t.example.com/api/users/33", target_id="t", run_id="r1",
         identity="anon", environment=Environment.PRODUCTION,
@@ -509,11 +528,12 @@ def test_ledger() -> None:
     )
     ok(not verdict and "台账" in why,
        "仅修改过的既有对象 → 删除不放行（修改 ≠ 本次创建，第四轮整改 #3）")
-    verdict, _ = led4.delete_verdict(
+    verdict, why = led4.delete_verdict(
         "http://t.example.com/api/preset/7", target_id="t", run_id="r1",
         identity="anon", environment=Environment.ISOLATED_TEST, approved=True,
     )
-    ok(verdict, "仅修改过的既有对象 + 绑定本次请求的单独审批 → 放行")
+    ok(not verdict and "身份验证" in why,
+       "仅修改过的既有对象 + 审批 → 仍拒绝（审批不能替代对象身份验证）")
     # create/upload 条目照常进删除判定（led 的 users/33 是 create 登记）
     verdict, _ = led.delete_verdict(
         "http://t.example.com/api/users/33", target_id="t", run_id="r1",
@@ -606,10 +626,12 @@ def test_runner_gate() -> None:
             return True
 
         runner.approver = _approve
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/users/42")
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/users/43")
         v1 = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/42", "method": "DELETE"}, s,
         ))
-        ok(v1 is None, "未知对象 + 绑定本次请求的逐请求审批 → 放行")
+        ok(v1 is None, "本次创建的对象（台账命中）+ 绑定本次请求的审批 → 放行")
         v2 = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/43", "method": "DELETE"}, s,
         ))
@@ -617,12 +639,26 @@ def test_runner_gate() -> None:
         ok(len(calls) == 2 and "/users/42" in calls[0] and "/users/43" in calls[1],
            "审批绑定具体对象 URL（参数变化 → 重新审批，不可复用）")
 
-        # 无审批通道：未知对象删不掉
+        # 无审批通道：台账命中也不能删（审批是第二道门，缺一不可）
         runner.approver = None
         v3 = asyncio.run(runner._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/users/42", "method": "DELETE"}, s,
+        ))
+        ok(v3 is not None and "删除测试数据" in v3,
+           "台账命中但无审批通道 → 拒绝删除（红线操作必须人工点头）")
+
+        # 有审批通道但对象不在台账：审批不得替代对象身份验证（第七轮）
+        runner.approver = _approve
+        v4 = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/99", "method": "DELETE"}, s,
         ))
-        ok(v3 is not None and "删除测试数据" in v3, "无审批通道 → 未知对象拒绝删除")
+        ok(v4 is not None and "身份验证" in v4,
+           "未知对象 + 审批通过 → 仍拒绝（审批不能替代对象身份验证）")
+        ok("/api/users/99" in v4, "拒绝文本点名被拒对象（可定位到具体对象 ID）")
+        ok(any(e["event"] == "deny" and "台账" in e["reason"]
+               for e in runner.policy_audit.recent()),
+           "台账拒绝事件进审计（拒绝有痕迹）")
+        runner.approver = None
 
         # ── P0-②：放行 ≠ 登记（pending → 执行成功且取得标识才落账）──
         # ContextVar 语义：pending 挂在当前协程上下文，gate 与 pending
@@ -947,10 +983,11 @@ def test_remediation2() -> None:
             return True
 
         runner.approver = _approve
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/users/77")
         v = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/77", "method": "DELETE"}, s,
         ))
-        ok(v is None, "逐请求审批通过 → 放行（票据在通道内签发并消费）")
+        ok(v is None, "本次创建对象 + 逐请求审批通过 → 放行（票据在通道内签发并消费）")
         approvals = [e for e in runner.policy_audit.recent() if e["event"] == "approval"]
         ok(approvals and approvals[-1].get("extra", {}).get("approval_token"),
            "审批事件携带票据号（授权路径可追踪）")
@@ -979,6 +1016,7 @@ def test_remediation2() -> None:
             return True
 
         runner.approver = _approve2
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/users/51")
         v = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/51", "method": "DELETE"}, s,
         ))
@@ -992,6 +1030,7 @@ def test_remediation2() -> None:
 
         # ── #4（第四轮整改）：审批人真实身份进审批审计 ──────────────────
         runner.approver_identity = "ops-zhangsan"
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/users/88")
         v = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/88", "method": "DELETE"}, s,
         ))
@@ -1348,6 +1387,7 @@ def test_round6() -> None:
             return "ops-lisi"
 
         runner.approver = _approve_bool
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/u/1")
         v = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/u/1", "method": "DELETE"}, s,
         ))
@@ -1357,6 +1397,7 @@ def test_round6() -> None:
            and "未认证" in apr.get("extra", {}).get("approver", ""),
            "无真实身份的审批 → 记为未认证审批人（不得冒充已认证）")
         runner.approver = _approve_id
+        seed_deletable(runner, s, "http://127.0.0.1:8080/api/u/2")
         v = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/u/2", "method": "DELETE"}, s,
         ))
@@ -1367,79 +1408,59 @@ def test_round6() -> None:
            "回调返回的真实身份进审批审计（authenticated_approver=True）")
 
         # ── P0-2：Detector.send_request 统一安全入口（不靠 Runner 工具名）─
-        # 第七轮整改：断言从"函数返回值"升级为**真实网络行为**——用本地
-        # Mock Server 统计命中数，验证放行真的发出、拦截真的零触网。
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        import threading
-
         from detectors.http_detector import HttpDetector
 
-        hits: list[str] = []
+        class _FakeResp:
+            def __init__(self, url: str = "") -> None:
+                self.status_code = 200
+                self.headers = {"content-type": "text/html"}
+                self.content = b"hello"
+                self.url = url          # 手动跟随重定向需要 resp.url 做 urljoin
+                self.is_redirect = False
 
-        class _H(BaseHTTPRequestHandler):
-            def _hit(self) -> None:  # noqa: ANN202
-                hits.append(f"{self.command} {self.path}")
-                raw = b'{"id": "obj-1"}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+        class _FakeClient:
+            async def request(self, method, url, headers=None, content=None,  # noqa: ANN001
+                              follow_redirects=None):
+                # 手动跟随重定向：探测器显式传 follow_redirects=False
+                assert follow_redirects is False, "探测器必须手动跟随重定向（逐跳复检）"
+                return _FakeResp(url)
 
-            do_GET = do_POST = _hit
-
-            def log_message(self, *a: object) -> None:  # noqa: ANN002
-                pass
-
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), _H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        srv_base = f"http://127.0.0.1:{srv.server_address[1]}"
-        try:
-            det = HttpDetector(cfg.scan)
-            # 绑定范围 = 首个请求；正常 GET 放行且真实发出（服务器有命中）
-            ev = asyncio.run(det.send_request(f"{srv_base}/api/list"))
-            ok(not ev.error and ev.status_code == 200, "Detector 正常只读 GET → 放行并发出")
-            ok(len(hits) == 1, "Detector 放行的 GET 真实到达目标（Mock Server 计数=1）")
-            # sqli 类别（_current_kind）→ L3 → 拦截，不触网
-            det._current_kind = "sqli"
-            ev = asyncio.run(det.send_request(f"{srv_base}/api/list?id=1"))
-            ok(ev.error and ev.error.startswith("【策略拦截】") and "SQL 注入验证" in ev.error,
-               "Detector sqli 探针请求 → L3 拦截（统一安全入口，不靠工具名）")
-            ok(len(hits) == 1, "被拦的 sqli 请求零触网（Mock Server 计数不变）")
-            ok(det.policy_blocked == 1 and det.policy_notes, "拦截计数与原因可观测")
-            # 拦截事件必须写进策略审计（探测器路径不得只活在内存计数里）
-            audit_path = Path(td) / "policy" / "audit.jsonl"
-            ok(audit_path.exists() and '"event": "deny"' in audit_path.read_text(encoding="utf-8"),
-               "Detector 拦截事件写入 policy/audit.jsonl（可追溯）")
-            # 跨主机出界 → 拦截
-            det._current_kind = ""
-            ev = asyncio.run(det.send_request("http://10.9.9.9/api/list"))
-            ok(ev.error and "超出" in ev.error, "Detector 跨主机请求 → 范围拦截")
-            # 非法协议 → 拦截
-            ev = asyncio.run(det.send_request("ftp://127.0.0.1/x"))
-            ok(ev.error and "非法" in ev.error, "Detector ftp:// 目标 → 拦截")
-            # unknown 环境：POST 写语义 → 拦截
-            det_u = HttpDetector(cfg_u.scan)
-            ev = asyncio.run(det_u.send_request(f"{srv_base}/api/items",
-                                                method="POST", body="a=1"))
-            ok(ev.error and "【策略拦截】" in ev.error,
-               "Detector unknown 环境 POST → 拦截（unknown 仅明确只读）")
-            # 上传类：dedicated 环境 + 探测器审批通道 → policy_approved 通路
-            det_d = HttpDetector(
-                _cfg_with(environments={"127.0.0.*": Environment.DEDICATED_TEST}).scan
-            )
-            before = len(hits)
-            ev = asyncio.run(det_d.send_request(f"{srv_base}/upload", method="POST",
-                                                body="--b\r\ncontent-disposition: form-data"))
-            ok(ev.error and "【策略拦截】" in ev.error,
-               "Detector 上传（L2 REVIEW）无逐请求审批 → 拦截")
-            ev = asyncio.run(det_d.send_request(f"{srv_base}/upload", method="POST",
-                                                body="--b\r\ncontent-disposition: form-data",
-                                                policy_approved=True))
-            ok(not ev.error, "Detector 上传（L2 REVIEW）+ 逐请求审批标记 → 放行")
-            ok(len(hits) == before + 1, "审批放行的上传真实到达目标（仅 1 次触网）")
-        finally:
-            srv.shutdown()
+        det = HttpDetector(cfg.scan)
+        det.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        # 绑定范围 = 首个请求；正常 GET 放行且真实发出
+        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list"))
+        ok(not ev.error and ev.status_code == 200, "Detector 正常只读 GET → 放行并发出")
+        # sqli 类别（_current_kind）→ L3 → 拦截，不触网
+        det._current_kind = "sqli"
+        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list?id=1"))
+        ok(ev.error and ev.error.startswith("【策略拦截】") and "SQL 注入验证" in ev.error,
+           "Detector sqli 探针请求 → L3 拦截（统一安全入口，不靠工具名）")
+        ok(det.policy_blocked == 1 and det.policy_notes, "拦截计数与原因可观测")
+        # 跨主机出界 → 拦截
+        det._current_kind = ""
+        ev = asyncio.run(det.send_request("http://10.9.9.9/api/list"))
+        ok(ev.error and "超出" in ev.error, "Detector 跨主机请求 → 范围拦截")
+        # 非法协议 → 拦截
+        ev = asyncio.run(det.send_request("ftp://127.0.0.1/x"))
+        ok(ev.error and "非法" in ev.error, "Detector ftp:// 目标 → 拦截")
+        # unknown 环境：POST 写语义 → 拦截
+        det_u = HttpDetector(cfg_u.scan)
+        det_u.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        ev = asyncio.run(det_u.send_request("http://127.0.0.1:8080/api/items",
+                                            method="POST", body="a=1"))
+        ok(ev.error and "【策略拦截】" in ev.error,
+           "Detector unknown 环境 POST → 拦截（unknown 仅明确只读）")
+        # 上传类：dedicated 环境 + 探测器审批通道 → policy_approved 通路
+        det_d = HttpDetector(_cfg_with(environments={"127.0.0.*": Environment.DEDICATED_TEST}).scan)
+        det_d.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
+        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
+                                            body="--b\r\ncontent-disposition: form-data"))
+        ok(ev.error and "【策略拦截】" in ev.error,
+           "Detector 上传（L2 REVIEW）无逐请求审批 → 拦截")
+        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
+                                            body="--b\r\ncontent-disposition: form-data",
+                                            policy_approved=True))
+        ok(not ev.error, "Detector 上传（L2 REVIEW）+ 逐请求审批标记 → 放行")
 
         # ── P2：CLI / MCP / Agent / 后台任务的策略入口一致性（静态回归）──
         root = Path(__file__).resolve().parent.parent
@@ -1455,10 +1476,8 @@ def test_round6() -> None:
             if kw not in (root / rel).read_text(encoding="utf-8", errors="ignore")
         ]
         ok(not missing, f"CLI/MCP/Agent/子域入口全部走 active_scan_check：{missing}")
-        ok("gateway_client" in (root / "detectors/base.py").read_text(encoding="utf-8"),
+        ok("build_client_kwargs" in (root / "detectors/base.py").read_text(encoding="utf-8"),
            "Detector HTTP 客户端走统一代理出口（覆盖率）")
-        ok("httpx.AsyncClient(" not in (root / "detectors/base.py").read_text(encoding="utf-8"),
-           "Detector 不再直接构造 httpx 客户端（构造点收敛到 core.gateway）")
         # 内置工具闸门接线（Agent 路径）：_POLICY_TOOLS 覆盖全部目标请求工具
         from core.tools.runner.base import _ToolRunnerBase
 

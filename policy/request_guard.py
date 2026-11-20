@@ -801,3 +801,35 @@ _BUILTIN_TOOL_COMMAND: dict[str, str] = {
 
 # 过闸的内置工具名集合（runner 引用；guard 是权威，不得各自漂移）
 BUILTIN_POLICY_TOOLS: frozenset[str] = frozenset(_BUILTIN_TOOL_COMMAND)
+
+
+# ── AUTH 操作的唯一授权入口 ───────────────────────────────────────
+# 权限矩阵**没有 AUTH 授权行**（提交凭证/登录不属于矩阵授权过的能力）。
+# 运行期唯一合法的 AUTH 途径是"人改代码加白名单"——与 L3 同一纪律：
+# 不存在配置旁路，也不存在"测试环境就自动允许登录"。
+#
+# 为什么需要这个入口：Planner（固定剧本）会直接调 core.auth.Authenticator
+# 登录，不经过 Runner 的 login 工具闸门。如果不在 Planner 自己这里拦一道，
+# "login 工具默认拒绝"就只是关掉了 Agent 路径、留下了剧本路径——
+# 同一件事两个结论，等于没有策略。
+AUTH_OPERATION_WHITELIST: frozenset[str] = frozenset()
+
+
+def auth_operation_allowed(target: str) -> tuple[bool, str]:
+    """AUTH 类操作（登录/提交凭证）的授权判定。
+
+    返回 ``(是否允许, 理由)``。默认拒绝；唯一放行方式是在
+    :data:`AUTH_OPERATION_WHITELIST` 里显式写入目标主机——那是代码级
+    变更，需要评审，不是改配置文件能开的口子。
+    """
+    try:
+        host = (urlparse(target or "").hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host and host in AUTH_OPERATION_WHITELIST:
+        return True, f"AUTH 操作目标 {host} 在代码级白名单内"
+    return False, (
+        "AUTH 操作（提交凭证/登录）没有权限矩阵授权行，默认拒绝执行。"
+        "确有需要请在 policy.request_guard.AUTH_OPERATION_WHITELIST 中"
+        "显式登记目标主机（代码级变更，需评审）。"
+    )

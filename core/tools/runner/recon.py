@@ -27,7 +27,13 @@ class ReconMixin:
         target = self._normalize_target(url) if url else self._target_of(session)
         det = HttpDetector(self.cfg.scan)
         try:
-            ev = await det.send_request(target, method=method or "GET", headers=headers, body=body or "")
+            ev = await det.send_request(
+                target, method=method or "GET", headers=headers, body=body or "",
+                # 闸门若已完成逐请求人工审批（上传/删除类 REVIEW），把这次
+                # 审批透传给探测器——否则同一个 REVIEW 会在 Detector 层
+                # 被再拦一次，"批了也发不出去"。
+                policy_approved=self._policy_approved_now,
+            )
         finally:
             await det.aclose()
         if ev.error:

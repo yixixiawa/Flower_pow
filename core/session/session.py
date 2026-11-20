@@ -10,6 +10,7 @@ import shutil
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from core.state import Finding
 from core.state import ScanResult
 from core.state import Severity
@@ -25,6 +26,7 @@ from core.session.models import as_list
 from core.session.models import as_phase
 from core.session.models import as_str
 from core.session.tasks import TaskManager
+from core.files import FileAccess, FileContext, FileRecord
 
 
 class Session:
@@ -46,9 +48,13 @@ class Session:
         conversations: list[ConversationTurn] | None = None,
         tasks: TaskManager | None = None,
         updated_at: float | None = None,
+        files: list[dict[str, Any]] | None = None,
     ) -> None:
         self.target = target.rstrip("/")
-        self.session_id = session_id or f"{int(time.time())}"
+        # session_id 是身份/台账的隔离维度（identity = base|sess|tgt）：
+        # 同一秒创建的两次会话如果同 id，两个会话的台账条目、审计事件、
+        # 删除判定就全部串在一起。秒级时间戳不够，补随机后缀。
+        self.session_id = session_id or f"{int(time.time())}-{uuid4().hex[:6]}"
         # 磁盘上的目录名。多数时候与 session_id 相同；从旧快照载入时可能
         # 不同（旧版目录名是纯数字，而 id 字段是另一串），所以单独记一份。
         self._dir_name = ""
@@ -81,6 +87,20 @@ class Session:
         # 以前 from_dict 不传这个参数，载入后恒等于 created_at——列表里
         # 每个会话都显示"创建时间"，看起来像"更新时间没生效"。
         self.updated_at = float(updated_at or self.created_at)
+        # 本地文件上下文（用户显式授权的文件清单 + 解析缓存）。
+        # **只存路径 + SHA256 + 元数据**，不复制内容：把用户文件拷进项目
+        # data 目录，等于把可能的密钥复制一份到"可能被分享"的地方。
+        self.files: FileContext = FileContext(
+            FileAccess(self.session_id, records=[
+                r for r in (FileRecord.from_dict(x) for x in (files or [])) if r
+            ])
+        )
+
+    # ── 文件上下文 ────────────────────────────────────────────────
+    def attach_files(self, access: FileAccess) -> FileContext:
+        """换一份文件台账（载入/换会话时用）。跨 session_id 的记录会被丢弃。"""
+        self.files = FileContext(access)
+        return self.files
 
     # ── 轮次 ──────────────────────────────────────────────────────
     @property
@@ -172,6 +192,8 @@ class Session:
             # 后台任务台账：running 的任务在 from_dict 里会被如实改写成
             # interrupted（进程退出后任务不可能还活着）
             "tasks": self.tasks.to_dict(),
+            # 文件清单只记元数据（路径/大小/MIME/SHA256），正文按需重读
+            "files": [r.to_dict() for r in self.files.records()],
         }
 
     @classmethod
@@ -206,6 +228,8 @@ class Session:
             # 旧快照没有 tasks 字段——缺省就是空台账，向前兼容不需要升 version
             tasks=TaskManager.from_dict(as_dict(d.get("tasks"))),
             updated_at=as_float(d.get("updated_at"), 0.0) or None,
+            # 旧快照没有 files 字段：缺省空清单，向前兼容不升 version
+            files=[f for f in as_list(d.get("files")) if isinstance(f, dict)],
         )
 
     @property

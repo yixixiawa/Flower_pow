@@ -247,7 +247,7 @@ class _SessionMixin(_Base):
         print(f"   剩余 {left} 个会话用 /sessions 查看")
 
     def _sessions(self, arg: str = "") -> None:
-        """``/sessions [N|all]``：列出可恢复的会话（默认全量，带序号）。
+        """``/sessions [N|all|关键词]``：列出可恢复的会话（默认全量，带序号）。
 
         以前这里硬编码 ``limit=10`` 且只印名字：会话一多，老会话就永远
         看不见，也无法"按编号挑"。现在：
@@ -255,6 +255,9 @@ class _SessionMixin(_Base):
         * 默认**列出全部**，超过 20 条时提示可用 ``/sessions N`` 只看最近 N 条
         * 每条带序号 ``#1``，``/resume #1`` 直接选
         * 显示标题（第一轮对话）、更新时间、阶段、资产/发现/对话条数、目标
+        * **关键词过滤**：``/sessions 甲`` 只列名字/标题/目标里含"甲"的
+          会话——Tab 补全出来的候选（会话名）因此是真能用的参数，
+          不是只能看不能输入的装饰
         """
         items = list_sessions(self._sessions_dir(), limit=None)
         if not items:
@@ -264,17 +267,35 @@ class _SessionMixin(_Base):
 
         show = items
         want = (arg or "").strip().lower()
+        keyword = ""
         if want and want not in ("all", "a"):
             try:
                 n = int(want)
                 show = items[: max(1, n)]
             except ValueError:
-                print("用法：/sessions [N|all]（N=只看最近 N 条，默认全部）")
-                return
+                # 非数字 → 按关键词过滤（名字 / 标题 / 目标）
+                keyword = want
+                show = [
+                    (name, s) for name, s in items
+                    if keyword in name.lower()
+                    or keyword in (getattr(s, "display_title", "") or "").lower()
+                    or keyword in (getattr(s, "target", "") or "").lower()
+                ]
+                if not show:
+                    print(f"没有匹配「{arg.strip()}」的会话（共 {len(items)} 个，"
+                          f"用 /sessions 看全量）")
+                    return
 
         total = len(items)
-        print(f"\n可恢复会话（共 {total} 个，用 /resume <编号|会话名> 载入）：")
-        for i, (name, s) in enumerate(show, 1):
+        # 编号必须始终是"全量列表里的序号"：过滤后仍印同一个 #N，
+        # 这样屏幕上看到的 #N 和 /resume #N 选中永远是同一个会话。
+        order = {name: i for i, (name, _s) in enumerate(items, 1)}
+        if keyword:
+            print(f"\n匹配「{keyword.strip()}」的会话（{len(show)}/{total} 个）：")
+        else:
+            print(f"\n可恢复会话（共 {total} 个，用 /resume <编号|会话名> 载入）：")
+        for name, s in show:
+            i = order.get(name, 0)
             try:
                 when = _t.strftime("%Y-%m-%d %H:%M", _t.localtime(s.updated_at))
             except (ValueError, OSError, OverflowError):

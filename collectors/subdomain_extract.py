@@ -255,13 +255,12 @@ class SubdomainCollector:
         host = urlparse(url).hostname or ""
         c = self._clients.get(host)
         if c is None or c.is_closed:
-            from core.gateway import gateway_client
+            from core.proxy import build_client_kwargs
 
             # 被动源是**公网服务**，不是被测目标——代理决策要用它自己的
             # 主机名，而不是被枚举的那个域名。用错的话，枚举内网域名时
             # 会拿内网主机名去决策，结果一个被动源都连不上。
-            # 构造点统一在 core.gateway（不得各写一套出口参数）。
-            c = gateway_client(self.cfg, url)
+            c = httpx.AsyncClient(**build_client_kwargs(self.cfg, url))
             self._clients[host] = c
         return c
 

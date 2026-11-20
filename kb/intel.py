@@ -343,12 +343,16 @@ class IntelStore:
 
         url = ENDPOINTS[name]
         try:
-            # P1-⑥：全工程唯一 HTTP 出口——客户端构造收敛到 core.gateway
+            # P1-⑥：全工程唯一 HTTP 出口——代理决策收敛到 core/proxy.py
             # （这里查的是 CVE 情报端点，不是被测目标，但出口纪律一致：
             # 任何裸 httpx.Client 都是无审计的独立出口）。
-            from core.gateway import gateway_sync_client
+            if self.cfg is not None:
+                from core.proxy import build_client_kwargs
 
-            with gateway_sync_client(self.cfg, url, timeout=self.timeout) as c:
+                client_kw = build_client_kwargs(self.cfg, url)
+            else:
+                client_kw = {"timeout": self.timeout, "follow_redirects": True}
+            with httpx.Client(**client_kw) as c:
                 resp = c.get(url)
                 resp.raise_for_status()
                 data = resp.json()

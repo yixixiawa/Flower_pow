@@ -248,6 +248,15 @@ class Planner:
             user = session.credentials.get("username", "")
             pwd = session.credentials.get("password", "")
             if user and pwd:
+                # AUTH 操作（登录）没有矩阵授权行：与 Runner 的 login 工具
+                # 同一结论。不在这里拦，剧本模式就是一条绕过闸门的登录路径。
+                from policy.request_guard import auth_operation_allowed
+
+                auth_ok, auth_why = auth_operation_allowed(base)
+                if not auth_ok:
+                    t.notes.append(auth_why)
+                    self.log(f"   [!] {auth_why}")
+                    return
                 t.actions.append("登录取凭证")
                 res = auth.login(base, api_assets, user, pwd)
                 for n in res.notes:
@@ -346,22 +355,30 @@ class Planner:
             return
 
         if not token:
-            t.actions.append("补取凭证")
-            auth = Authenticator(self.cfg.scan, verbose=False)
-            try:
-                res = auth.login(
-                    base, api,
-                    session.credentials.get("username", ""),
-                    session.credentials.get("password", ""),
-                )
-                if res.ok:
-                    token = res.token
-                    session.credentials["token"] = token
-                    self.log("   已取得凭证")
-                else:
-                    self.log("   [!] 无凭证，仅做免鉴权侧测试")
-            finally:
-                auth.close()
+            # AUTH 无矩阵授权：与 Runner 的 login 工具同口径，默认不发起登录。
+            from policy.request_guard import auth_operation_allowed
+
+            auth_ok, auth_why = auth_operation_allowed(base)
+            if not auth_ok:
+                t.notes.append(auth_why)
+                self.log(f"   [!] {auth_why}（仅做免鉴权侧测试）")
+            else:
+                t.actions.append("补取凭证")
+                auth = Authenticator(self.cfg.scan, verbose=False)
+                try:
+                    res = auth.login(
+                        base, api,
+                        session.credentials.get("username", ""),
+                        session.credentials.get("password", ""),
+                    )
+                    if res.ok:
+                        token = res.token
+                        session.credentials["token"] = token
+                        self.log("   已取得凭证")
+                    else:
+                        self.log("   [!] 无凭证，仅做免鉴权侧测试")
+                finally:
+                    auth.close()
 
         det = ApiAuthzDetector(self.cfg.scan, self.poc_map)
         try:

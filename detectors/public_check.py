@@ -308,11 +308,10 @@ class PublicResourceChecker:
     # ── HTTP ──────────────────────────────────────────────────────
     def client(self, url: str = "") -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            from core.gateway import gateway_client
+            from core.proxy import build_client_kwargs
 
-            # 核验发的是真实请求，客户端构造统一收敛到 core.gateway
-            # （代理决策与全工程同一份，不得另起一个构造点）
-            self._client = gateway_client(self.cfg, url)
+            # 核验发的是真实请求，代理决策必须走统一入口（默认全部走代理）
+            self._client = httpx.AsyncClient(**build_client_kwargs(self.cfg, url))
         return self._client
 
     async def aclose(self) -> None:

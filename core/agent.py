@@ -157,6 +157,14 @@ class Agent:
         return out
 
     def _system(self) -> dict[str, str]:
+        extra = self.llm.tool_note if getattr(self.llm, "tool_note", "") else ""
+        # 已授权本地文件：只把**清单**（名字 + file_id）放进 system 提示。
+        # 正文一律走 read_local_file 的「工具结果」通道——system 里的文字
+        # 有指令效力，而文件内容是不可信数据，两者绝不能混。
+        files = getattr(self.session, "files", None)
+        if files is not None and files.records():
+            note = files.prompt_note()
+            extra = f"{extra}\n{note}" if extra else note
         return {
             "role": "system",
             "content": P.AGENT_SYSTEM
@@ -167,7 +175,7 @@ class Agent:
                 state_text=self.runner.state_text(self.session),
                 tool_names=self.tool_names(),
                 readonly=self.cfg.scan.readonly,
-                extra=self.llm.tool_note if getattr(self.llm, "tool_note", "") else "",
+                extra=extra,
             ),
         }
 

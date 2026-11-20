@@ -66,6 +66,21 @@ class Completer(PromptCompleter):
         candidates = [arg for arg in self.args_map.get(command, []) if arg.startswith(tail)]
         return candidates, len(tail)
 
+    def _arg_candidates(self, line: str) -> tuple[list[str], str]:
+        """解析"``/cmd <当前参数>``" →（候选, 正在补的那一段）。
+
+        **必须用 partition 而不是 split**：``/sessions `` 敲了空格还没输
+        参数时，``split()`` 会把尾随空格吞掉、只剩 ``["/sessions"]``，
+        于是"空格之后要出候选"这件事永远不成立（用户看到的症状就是
+        Tab 没反应）。partition 保留空尾段 → 空前缀 → 列出全部候选。
+        """
+        head, sep, tail = line.partition(" ")
+        if not sep:
+            return [], ""
+        command = head.strip().lstrip("/")
+        current = tail.rsplit(" ", 1)[-1]
+        return [arg for arg in self.args_map.get(command, []) if arg.startswith(current)], current
+
     def complete(self, text: str) -> tuple[str, list[str], int]:
         """Return the legacy completion result used by non-terminal callers."""
         candidates, tail_length = self._candidates(text)
@@ -91,14 +106,9 @@ class Completer(PromptCompleter):
             return
 
         # 参数补全
-        parts = line.split()
-        if len(parts) == 2:
-            cmd = parts[0].lstrip("/")
-            current_arg = parts[1]
-            if cmd in self.args_map:
-                for arg in self.args_map[cmd]:
-                    if arg.startswith(current_arg):
-                        yield Completion(arg, start_position=-len(current_arg))
+        candidates, current = self._arg_candidates(line)
+        for arg in candidates:
+            yield Completion(arg, start_position=-len(current))
 
 
 FlowerCompleter = Completer

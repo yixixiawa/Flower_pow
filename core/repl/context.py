@@ -27,8 +27,12 @@ else:
 
 
 class _ContextMixin(_Base):
-    def _session_ids(self, limit: int = 20) -> list[str]:
-        """可恢复的会话 id——用于 ``/resume <Tab>`` 补全。"""
+    def _session_ids(self, limit: int | None = 20) -> list[str]:
+        """可恢复的会话 id——用于 ``/resume <Tab>`` / ``/sessions <Tab>``。
+
+        ``limit=None`` 表示全量（``/sessions`` 的 Tab 要"本地所有会话"，
+        不能在这里偷偷截断——截断等于让用户看不见老会话）。
+        """
         try:
             base = Path(self.cfg.data_dir) / "sessions"
             return [name for name, _s in list_sessions(base, limit=limit)]
@@ -41,6 +45,7 @@ class _ContextMixin(_Base):
         参数候选刻意做得比 ``/help`` 写的更多——``/help`` 是给人看的，
         补全是给手不用离开键盘的人用的。
         """
+        ids = self._session_ids()
         args: dict[str, list[str]] = {
             "report": ["md", "html", "json", "all"],
             "assets": ["port", "path", "api", "endpoint", "secret", "internal", "js"],
@@ -50,7 +55,12 @@ class _ContextMixin(_Base):
             "phase": ["recon", "model", "exploit", "iterate"],
             "agent": ["on", "off"],
             "readonly": ["on", "off"],
-            "resume": self._session_ids(),
+            "resume": ids[:20],
+            # /read 补的是路径前缀没用（本地文件名枚举等于帮用户列目录），
+            # 所以只补"已授权过的文件"，方便 /files --drop 与 /plan 引用
+            "files": ["--drop", "--clear"],
+            # /sessions 的参数 = 全部会话名 + all（空格即出候选，见 _sessions）
+            "sessions": ["all", *ids],
             # 标题编号只列已存在的 + 下一个（避免补出一堆不存在的编号）
             "title": [str(i) for i in range(1, len(self.session.conversations) + 2)],
         }

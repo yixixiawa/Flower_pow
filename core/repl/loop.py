@@ -325,6 +325,25 @@ class _LoopMixin(_Base):
         if low.startswith("/readonly"):
             self._set_readonly(raw)
             return True
+        # ── 本地文件 + Plan/Work ──────────────────────────────────
+        if low.startswith("/read") and not low.startswith("/readonly"):
+            self._read_file(raw.partition(" ")[2] if " " in raw else "")
+            return True
+        if low.startswith("/files") or low.startswith("/file "):
+            self._files(raw.partition(" ")[2] if " " in raw else "")
+            return True
+        if low.startswith("/plan"):
+            self._plan(raw.partition(" ")[2] if " " in raw else "")
+            return True
+        if low.startswith("/approve") or low.startswith("/confirm"):
+            self._approve_plan(raw.partition(" ")[2] if " " in raw else "")
+            return True
+        if low == "/work" or low.startswith("/work "):
+            self._work(raw.partition(" ")[2] if " " in raw else "")
+            return True
+        if low in ("/reject", "/deny"):
+            self._reject_plan()
+            return True
         if low == "/auto":
             await self._autopilot()
             return True

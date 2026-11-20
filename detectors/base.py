@@ -21,7 +21,7 @@ import re
 import string
 import time
 from abc import ABC, abstractmethod
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -164,13 +164,15 @@ class Detector(ABC):
         self._policy_bound: str = ""       # 首个请求绑定范围（scheme://netloc）
         self.policy_blocked = 0            # 被策略拦截的请求数（可观测）
         self.policy_notes: list[str] = []  # 拦截原因（进探测器 notes / 报告）
-        # 统一出口（第七轮整改）：所有目标面请求经 core.gateway.HttpGateway
-        # 发出——重定向逐跳复检 + 拒绝事件写审计。懒创建。
-        self._gateway = None
-        self._policy_audit = None
         # 当前探测类别（sqli/rce/fileread/upload）——批量 sweep 时由探测
         # 器写入，作为 POC 声明维度进分类（payload 编码与否都逃不过类别）。
         self._current_kind = ""
+        # 策略审计（Detector 层拦截必须与 Runner 同源落盘，否则"探测器
+        # 批量打点被拦"在审计里看不见）。懒创建，失败不影响扫描。
+        self._policy_audit = None
+        # 单次请求最多跟随多少跳重定向。每一跳都要重新过策略检查
+        # （跨主机/跨端口的重定向不得被跟随）。
+        self._MAX_REDIRECTS = 5
         # 写操作（上传）的人工审批通道：ExploitProbeDetector 注入；
         # None = 无通道 → REVIEW 类请求一律拦截。
         self.approver = None
@@ -191,6 +193,52 @@ class Detector(ABC):
             self._policy_bound = ""
         return self._policy_bound
 
+    def _audit_deny(
+        self, url: str, method: str, command: str, category: str,
+        decision: str, reason: str,
+    ) -> None:
+        """把 Detector 层的拒绝写进与 Runner 同一份审计。
+
+        为什么必须写：批量探测被拦时，调用方拿到的是 ``Evidence.error``，
+        一旦这个对象没进报告，事后就只剩"扫描没产出"这一种解释。
+        审计是唯一能证明"拦了、拦的是哪一条"的地方。写失败静默——
+        审计是旁路，不能反过来把扫描卡死（与 PolicyAudit 的设计一致）。
+        """
+        try:
+            if self._policy_audit is None:
+                from policy.audit_logger import PolicyAudit
+
+                root = str(getattr(self.cfg, "audit_dir", "") or "./data")
+                enabled = bool(getattr(getattr(self.cfg, "policy", None), "audit", True))
+                self._policy_audit = PolicyAudit(root, enabled=enabled)
+            host = ""
+            try:
+                host = urlparse(url or "").hostname or ""
+            except ValueError:
+                host = ""
+            self._policy_audit.log(
+                "deny",
+                command=command,
+                decision=decision or "DENY",
+                category=category,
+                url=url,
+                reason=reason,
+                extra={
+                    "gateway": "detector",
+                    "method": (method or "").upper(),
+                    "identity": f"anonymous@{host}" if host else "",
+                },
+            )
+        except Exception:  # noqa: BLE001 —— 审计失败不得影响扫描
+            pass
+
+    def _blocked(
+        self, url: str, method: str, command: str, category: str,
+        decision: str, reason: str,
+    ) -> str:
+        self._audit_deny(url, method, command, category, decision, reason)
+        return reason
+
     async def _policy_check(
         self, url: str, method: str, body: str, poc: "POC | None" = None,
         *, policy_approved: bool = False,
@@ -204,10 +252,13 @@ class Detector(ABC):
         * 七维度分类（路径/方法/参数/请求体/POC 声明）→ 映射矩阵命令；
         * ``decide()`` 判 ALLOW 才放行——L3（SQLi/RCE）任何环境都拦，
           unknown 环境只放行明确只读，写语义请求按矩阵拒绝；
-        * REVIEW（L2 上传，dedicated 环境）→ 仅当 ``policy_approved``
-          （探测器 approver 通道对该次上传的逐请求人工审批）为真才放行。
+        * REVIEW（L2 上传/删除，测试环境）→ 仅当 ``policy_approved``
+          （Runner 闸门已对该次请求完成逐请求人工审批）为真才放行。
+
+        **每一次拒绝都写审计**（:meth:`_audit_deny`）——探测器是批量
+        打点，这里漏一条审计，事后就说不清"哪些请求被拦了"。
         """
-        from policy.api_policy import ApiCategory, Decision, Environment, decide
+        from policy.api_policy import ApiCategory, Decision, decide
         from policy.request_guard import (
             RequestGuard,
             classify_request,
@@ -218,20 +269,29 @@ class Detector(ABC):
         if self._policy_guard is None:
             self._policy_guard = RequestGuard(self.cfg)
         guard = self._policy_guard
+        method_u = (method or "GET").upper()
         try:
             url_n = validate_target_url(url)
         except ValueError as exc:
-            return f"目标 URL 非法：{exc}"
+            return self._blocked(
+                url, method_u, "", ApiCategory.UNKNOWN, "DENY",
+                f"目标 URL 非法：{exc}",
+            )
         bound = self._policy_scope_bind(url_n)
         if bound and not in_scope(url_n, bound):
-            return f"请求目标超出本检测器绑定的范围（{bound}）"
-        method_u = (method or "GET").upper()
+            return self._blocked(
+                url_n, method_u, "", ApiCategory.UNKNOWN, "DENY",
+                f"请求目标超出本检测器绑定的范围（{bound}）",
+            )
         cls = classify_request(
             url_n, method=method_u, body=body,
             poc_hint=(poc.id if poc is not None else "") or self._current_kind,
         )
         if not cls.command:
-            return f"请求分类 UNKNOWN（{'；'.join(cls.signals[:3])}），默认拒绝"
+            return self._blocked(
+                url_n, method_u, "", cls.category, "UNKNOWN",
+                f"请求分类 UNKNOWN（{'；'.join(cls.signals[:3])}），默认拒绝",
+            )
         env = guard.environment_for(url_n)
         clearly_read_only = (
             method_u in ("GET", "HEAD", "OPTIONS") and cls.category == ApiCategory.READ
@@ -247,56 +307,14 @@ class Detector(ABC):
         if d.decision == Decision.ALLOW:
             return ""
         if d.decision == Decision.REVIEW and policy_approved:
-            # 上传类 REVIEW：探测器 approver 通道已对该次上传逐请求
-            # 人工审批（attack.py），凭该放行标记通过。
+            # 上传/删除类 REVIEW：Runner 闸门已对该次请求完成逐请求
+            # 人工审批（一次性票据），凭该放行标记通过。L3/DENY/UNKNOWN
+            # 不受此影响（decide 对它们根本不返回 REVIEW）。
             return ""
-        return f"权限矩阵拒绝：{d.command or '未知操作'} → {d.decision}（{d.reason}）"
-
-    # ── 统一 Gateway（第七轮整改）─────────────────────────────────
-    def _policy_audit_sink(self):
-        """探测器路径的策略审计器（懒创建，写同一份 audit.jsonl）。
-
-        此前探测器被拦的请求只在内存计数里——"拦住了"这件事不可追溯。
-        审计失败不抛异常（PolicyAudit 自己吞），不阻断扫描。
-        """
-        if self._policy_audit is None:
-            from policy.audit_logger import PolicyAudit
-
-            enabled = bool(getattr(getattr(self.cfg, "policy", None), "audit", True))
-            self._policy_audit = PolicyAudit(
-                getattr(self.cfg, "data_dir", "") or "./data", enabled=enabled
-            )
-        return self._policy_audit
-
-    def gateway(self):
-        """取统一出口（懒创建，一个探测器一份，复用连接池）。"""
-        if self._gateway is None:
-            from core.gateway import HttpGateway
-
-            self._gateway = HttpGateway(
-                self.cfg,
-                self._gateway_check,
-                audit=self._policy_audit_sink(),
-                target_id=str(getattr(self.cfg, "target_id", "") or ""),
-            )
-        return self._gateway
-
-    async def _gateway_check(self, url: str, method: str, body: str, approved: bool) -> str:
-        """Gateway 的默认检查器（无 POC 上下文时）。"""
-        return await self._policy_check(url, method, body, None, policy_approved=approved)
-
-    def _make_gateway_checker(self, poc: "POC | None", policy_approved: bool):
-        """按本次请求的 POC 上下文生成检查器——**逐跳**调用。
-
-        不能把 poc 存到 self 上：一个探测器会并发跑多条 POC，实例级
-        状态会被别的协程覆盖（分类维度错乱）。闭包按调用隔离。
-        """
-        async def checker(url: str, method: str, body: str, approved: bool) -> str:
-            return await self._policy_check(
-                url, method, body, poc, policy_approved=policy_approved or approved,
-            )
-
-        return checker
+        return self._blocked(
+            url_n, method_u, d.command, d.category or cls.category, d.decision,
+            f"权限矩阵拒绝：{d.command or '未知操作'} → {d.decision}（{d.reason}）",
+        )
 
     # ── HTTP 客户端 ──────────────────────────────────────────────
     def client(self, url: str = "") -> httpx.AsyncClient:
@@ -307,8 +325,7 @@ class Detector(ABC):
         若后续请求换了主机（跨主机的检测器），代理决策与已建好的客户端不一致，
         此时**重建客户端**——比"用错代理静默扫描"要安全得多。
         """
-        from core.gateway import gateway_client
-        from core.proxy import resolve_proxy_for
+        from core.proxy import build_client_kwargs, resolve_proxy_for
 
         host = ""
         if url:
@@ -333,9 +350,9 @@ class Detector(ABC):
             # 代理决策统一收敛到 core/proxy.py：显式配置 > 自动探测到的代理。
             # 默认**全部目标都走代理**（内网也走），这样挂了 Burp/Clash
             # 就能看到全部流量——内网/本机也不拦截。
-            # 构造点唯一收敛到 core.gateway.gateway_client（第七轮整改）：
-            # 全工程不得再有第二个 httpx 客户端构造点。
-            self._client = gateway_client(self.cfg, url or self._client_url_hint)
+            self._client = httpx.AsyncClient(
+                **build_client_kwargs(self.cfg, url or self._client_url_hint)
+            )
             self._client_proxy = wanted
         return self._client
 
@@ -346,8 +363,6 @@ class Detector(ABC):
             await self._client.aclose()
             self._client = None
         self._client_proxy = None
-        if self._gateway is not None:
-            await self._gateway.aclose()
 
     async def __aenter__(self) -> "Detector":
         return self
@@ -387,17 +402,26 @@ class Detector(ABC):
         的 license 注释——压缩 bundle 动辄几百 KB，接口路径全在后面。
         JS 分析传 ``cfg.js_max_bytes``（默认 2MB）。
 
-        **统一安全入口（第六轮整改 P0-2/P0-5 + 第七轮统一 Gateway）**：
-        请求经 :class:`core.gateway.HttpGateway` 发出——**每一跳**（含
-        重定向后的跳）发出前都重新过 :meth:`_policy_check`：目标范围 +
-        操作分类 + 环境绑定。被拦请求不触网，返回带 ``error`` 的
-        Evidence（以 ``【策略拦截】`` 开头）；拦截计数进 ``policy_blocked``，
-        拒绝事件由 Gateway 写入策略审计（探测器路径同样可追溯）。
+        **统一安全入口（第六轮整改 P0-2/P0-5）**：发出前过
+        :meth:`_policy_check`——目标范围 + 操作分类 + 环境绑定逐请求
+        约束，被拦请求不触网，返回带 ``error`` 的 Evidence（error 以
+        ``【策略拦截】`` 开头，调用方可识别）；拦截计数与原因进
+        ``policy_blocked`` / ``policy_notes``。
         ``policy_approved`` 仅用于上传类 REVIEW（探测器 approver 已对
         该次上传逐请求人工审批后传入），不能放行 L3/DENY/UNKNOWN。
         """
+        # ── 策略前置：被拦请求根本不建客户端、不触网 ──────────────────
         # 有效性方法先定（POC 声明的 method 优先），分类按真实要发的请求算
         method = (poc.request.method if poc else method) or method
+        block = await self._policy_check(
+            url, method, body, poc, policy_approved=policy_approved,
+        )
+        if block:
+            self.policy_blocked += 1
+            self.policy_notes.append(f"{method} {url[:80]} → {block[:160]}")
+            ev = Evidence(url=url, method=method, request_headers=dict(headers or {}))
+            ev.error = f"【策略拦截】{block}"
+            return ev
         req_headers = dict(poc.request.headers if poc else {})
         req_headers.update(headers or {})
 
@@ -412,26 +436,65 @@ class Detector(ABC):
             ev.expected = _expect_of(poc)
         started = time.perf_counter()
         try:
-            res = await self.gateway().request(
-                method, url,
-                headers=req_headers,
-                content=body or None,
-                checker=self._make_gateway_checker(poc, policy_approved),
-                approved=policy_approved,
+            # ── 重定向：**手动跟随，每一跳重新过策略检查** ──────────────
+            # httpx 自带的 follow_redirects=True 会把 302 直接跟到底，
+            # 中间不经过任何策略判定——目标只要回一个 Location:
+            # http://elsewhere/，请求就带着原请求头飞出了授权范围。
+            # 所以这里关掉自动跟随，自己走一跳、判一跳。
+            follow = bool(getattr(self.cfg, "follow_redirects", True))
+            client = self.client(url)
+            cur_url = url
+            cur_method = method
+            cur_body = body
+            resp = await client.request(
+                cur_method, cur_url, headers=req_headers,
+                content=cur_body or None, follow_redirects=False,
             )
+            hops = 0
+            while follow and resp.is_redirect and hops < self._MAX_REDIRECTS:
+                loc = resp.headers.get("location") or ""
+                if not loc:
+                    break
+                nxt = urljoin(str(resp.url), loc)
+                # 303/302/301 → 浏览器语义会改成 GET；307/308 保留方法与请求体
+                nxt_method = cur_method if resp.status_code in (307, 308) else "GET"
+                nxt_body = cur_body if nxt_method == cur_method else ""
+                block = await self._policy_check(
+                    nxt, nxt_method, nxt_body, poc,
+                    policy_approved=policy_approved,
+                )
+                if block:
+                    self.policy_blocked += 1
+                    self.policy_notes.append(f"重定向 {nxt[:80]} → {block[:160]}")
+                    ev.error = f"【策略拦截】重定向目标被拒绝：{block}"
+                    ev.status_code = resp.status_code
+                    ev.response_headers = {
+                        k.lower(): v for k, v in resp.headers.items()
+                    }
+                    ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    return ev
+                hops += 1
+                cur_url, cur_method, cur_body = nxt, nxt_method, nxt_body
+                resp = await client.request(
+                    cur_method, cur_url, headers=req_headers,
+                    content=cur_body or None, follow_redirects=False,
+                )
+            if resp.is_redirect:
+                # 还有下一跳但已到上限：不猜、不跟，明确报错（fail-closed）
+                ev.error = (
+                    f"【策略拦截】重定向超过 {self._MAX_REDIRECTS} 跳，"
+                    "停止跟随（无法确认后续目标是否在授权范围内）"
+                )
+                ev.status_code = resp.status_code
+                ev.response_headers = {k.lower(): v for k, v in resp.headers.items()}
+                ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                return ev
+            url = cur_url
+            method = cur_method
         except Exception as exc:  # noqa: BLE001
             ev.error = f"{type(exc).__name__}: {exc}"
             ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
             return ev
-
-        if res.blocked or res.response is None:
-            # 被拦请求**一跳都没发出去**（或在重定向第 N 跳被拦）
-            self.policy_blocked += 1
-            self.policy_notes.append(f"{method} {url[:80]} → {res.reason[:160]}")
-            ev.error = f"【策略拦截】{res.reason}"
-            ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
-            return ev
-        resp = res.response
 
         ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
         ev.status_code = resp.status_code

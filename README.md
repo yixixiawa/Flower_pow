@@ -154,7 +154,7 @@ All 26 are tab-completable.
 /agent on|off     agent / scripted mode       /phase NAME      jump to a phase
 /next  /run       advance / one more round    /poll            run until exhausted
 /backfill         backfill raw traffic        /auto            fully automatic
-/resume [id]      load a session              /sessions        list resumable sessions
+/resume [id]      load a session              /sessions        list resumable sessions (space+Tab for all)
 /reset            wipe and start over         /clean           drop empty sessions
 /key              reset the API key           /title           rename the session
 /chats            conversation history         /kickoff         model introduces itself
@@ -281,7 +281,7 @@ poc/builtin/           built-in rules    poc/community/  pulled rules
 - **33 条声明式 POC 规则**，分 10 类：CVE 探针、路径探针、响应头检查、指纹识别、JS 逻辑、API 鉴权、文件操作、源码泄露、注入、RCE。规则只写确定性的那半——发什么包、匹配什么特征；「这个 200 算不算漏洞」由证据决定。
 - **检索驱动打击面**：指纹 → 混合检索（余弦 + BM25）→ 模型重排 → 只跑相关的规则，并上永远跑一遍的基线集。500 个接口的目标不会被 16500 个盲目请求犁一遍。
 - **18 个 CLI 命令**：交互会话、一次性扫描、高危探针、JS 审计、子域批量、POC 库、知识库、会话、代理诊断、引擎状态。
-- **25 个会话内命令**，全部 Tab 可补全。
+- **32 个会话内命令**，全部 Tab 可补全；含本地文件（`/read` `/files`）与 Plan/Work 工作流（`/plan` `/approve` `/work` `/reject`）。
 
 #### 攻击链，而不是一串漏洞
 
@@ -334,16 +334,59 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 | L0 | 查询详情 / 查询列表 | 目标 + 环境 + 账号身份已绑定，且只读 |
 | L1 | 创建 / 修改测试数据 | **仅隔离测试环境（isolated_test）** |
 | L2 | 上传测试文件 | **仅专门测试环境（dedicated_test）+ 逐请求审批** |
-| L2 | 删除测试数据 | 测试环境 + 逐请求审批 + 台账判定 |
+| L2 | 删除测试数据 | 测试环境 + 台账（本次创建且取得对象 ID）+ 逐请求审批 |
 | L3 | 批量删除 / SQL 注入验证 / 命令执行 / 定时任务执行 | **一律拒绝，审批不设出路** |
 
 硬约束：
 
 * **目标范围**：请求 URL 必须落在绑定目标的授权范围内——scheme、hostname、**端口**规范化比较，绑定目标带路径前缀时请求路径不得越出；出界按"未绑定"拒绝。
 * **没有配置级审批**：`policy.approvals` 不再生效。审批只存在于运行期，**逐请求、绑定具体对象 URL**——参数一变就必须重新审批。
-* **对象台账**：只有**执行成功并从响应取得对象标识**的创建/上传才会登记，按 目标 + 轮次 + 账号身份 + 对象标识 四元组匹配；未知对象没有绑定本次请求的审批就删不掉。
+* **对象台账**：只有**执行成功并从响应取得对象标识**的创建/上传才会登记，按 目标 + 轮次 + 账号身份 + 对象标识 四元组匹配；未登记的对象**一律删不掉**——审批是第二道门，不能替代对象身份验证。
 * **审计是写操作的先决条件**：审计 JSONL 无法持久化时，写操作与审批**拒绝执行**；只读操作放行但状态行可见告警。
 * **账号身份**：凭证以 `cred:<头名>:<指纹>`（+ 显式声明的角色）绑定，不同 token 是不同身份；未认证请求显式记为 `anonymous@<host>`。
+
+#### 安全验收：不以"测试全绿"为依据
+
+`pytest/脚本全过`**不等于**安全功能通过——断言被删、被跳过、被放宽，全都还是会绿。所以安全相关的结论单独由验收框架给出：
+
+```bash
+python scripts/security_acceptance.py            # 终端看需求表与未过用例
+python scripts/security_acceptance.py --json     # 机读结果
+python scripts/security_acceptance.py --init-baseline   # 用例增删后重建断言基线
+```
+
+* **六级状态**：`UNIT_PASS` / `INTEGRATION_PASS` / `SECURITY_PASS` / `FAIL` / `NOT_TESTED` / `INCONCLUSIVE`。**未测与不确定永不折算成通过**，P0 失败直接整体 `FAIL`，P1 失败不得标完整通过。
+* **16 条需求 / 56 个用例**，覆盖 L3 全环境拒绝、UNKNOWN 默认拒绝、EXPORT/AUTH 无授权、fileread 不得映射 L0、所有 HTTP 过统一出口、Runner/Detector/Collector/Scheduler/CLI/MCP/后台任务无旁路、范围外拒绝、重定向逐跳复检、身份三元组绑定、并发不污染、台账、审批、审计，以及本地文件授权与 Plan/Work 闸门。
+* **验行为不验返回值**：本地双端口 Mock（A=被测目标、B=外部主机）计数真实到达的请求，证明"被拒的请求没有触网"；httpx 发送级追踪判定"是否经统一出口、有没有未治理的发送"；拒绝事件必须落审计 JSONL。
+* **防造 PASS**：预期结果外置在 `catalog.py`（用例代码改不动预期）、断言数基线（删断言即低于基线 → `FAIL`）、完整性检查（删用例 / 删负向用例 / 出现跳过标记 → `FAIL`）。
+* 全程只用本地 Mock 与隔离环境，**不打生产目标**。
+
+#### 对话式读文件：Plan → 确认 → Work
+
+你手上有接口文档、源码、导出的表格，想让它"先看懂，再给方案，别急着动手"：
+
+```
+› /read ./docs/api.md
+› /read ./src/routes/user.ts
+› /plan 分析这两份材料里的鉴权问题，先给整改计划，暂时不要改任何文件
+   → 输出计划（目标 / 输入文件 sha256 / 分析 / 步骤 / 风险 / 副作用 / 待授权项 / 预期 / 未决问题）
+› /approve y      # 确认这份计划（一次性票据）
+› /work           # 执行；每步仍过权限矩阵与统一 Gateway
+```
+
+**三个阶段，边界是代码画的，不是提示词：**
+
+| 阶段 | 能做什么 | 结构上做不到什么 |
+|---|---|---|
+| **读** | 只读**你点名的文件**（`/read` 或工具 `read_local_file`） | 没有遍历磁盘的入口；跨会话、路径穿越、符号链接/联接、系统目录一律拒绝；内容按不可信数据处理 |
+| **Plan** | 读已授权文件、出结构化计划 | 零工具调用、零请求、零写盘（有测试盯着）；本地写操作与 L3 步骤在**构建期**就被拒 |
+| **Work** | 只执行**已确认**的计划 | 未确认/计划被改/文件变了/过期 → 拒绝；每步仍走原闸门：L3 拒、UNKNOWN 拒、生产环境拒、删除查台账；每步落 `work_step` 审计 |
+
+三条容易误解的地方，说清楚：
+
+- **确认 ≠ 放权**。`/approve` 只签"这份计划可以开始跑"，不改变任何 L0–L3 判定。计划里写着"删这个对象"，执行时照样被台账拦下。
+- **文件不是全盘可见**。授权粒度是"文件"不是"目录"；同一份文件在另一个会话里读不到。文件内容只作为「工具结果 / 不可信数据」进入对话，**永远不进 system 提示**。
+- **解析失败就说失败**。坏 JSON、坏编码、缺 PDF 解析器、压缩炸弹、超时，都会明确标注并保留原文——不会把"没读成"伪装成"读到了空的"。
 
 #### MCP Server
 
@@ -385,7 +428,7 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 
 #### 会话内命令
 
-26 个，全部 Tab 可补全。
+32 个，全部 Tab 可补全。
 
 ```
 /target [URL]    设定或查看目标              /status          当前状态
@@ -396,7 +439,10 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 /agent on|off    切换 Agent / 剧本           /phase 名称      跳到某个阶段
 /next  /run      推进 / 再跑一轮             /poll            跑到穷尽
 /backfill        从历史回填原始报文           /auto            一键全自动
-/resume [id]     载入会话                    /sessions        可恢复会话列表
+/resume [id]     载入会话                    /sessions        可恢复会话列表（空格+Tab 出全部会话名）
+/read <路径>     授权并读取一个本地文件      /files           已授权文件清单（--drop / --clear）
+/plan <目标>     只读分析 → 生成执行计划     /approve y|n     确认这份计划（一次性票据）
+/work            执行已确认的计划            /reject          拒绝当前计划（终态）
 /reset           彻底重置                    /clean           删空会话
 /key             重设 API Key                /title           改会话标题
 /chats           对话历史                    /kickoff         让模型自我介绍一轮
