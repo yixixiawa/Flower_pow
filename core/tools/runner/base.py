@@ -1089,13 +1089,15 @@ class _ToolRunnerBase:
             )
             return False
         # ── GUARD 台账：已审批票据的预检（/guard approve 签发的一次性票据）──
-        from policy.guard_registry import get_registry
+        from policy.guard_registry import environment_for_target, get_registry
 
         reg = self._guard_registry(session)
+        cur_env = environment_for_target(self.cfg, session.target)
         ok_reg, _why_reg, reg_approver = reg.match_approved(
             session_id=session.session_id, target_id=tid, run_id=rid,
             url=url, method=method,
             fingerprint=req_digest or "", identity=ident,
+            environment=cur_env,
         )
         if ok_reg:
             self.policy_audit.log(
@@ -1115,8 +1117,13 @@ class _ToolRunnerBase:
                 session_id=session.session_id, target_id=tid, run_id=rid,
                 url=url, method=method,
                 fingerprint=req_digest or "", level=d.level,
-                command=d.command, environment="", identity=ident,
-                kind="", reason=d.reason,
+                command=d.command,
+                # schedule2 §一.3：登记必须带真实 environment 和 kind——
+                # 审批时要与当前环境核对，kind 决定上传/删除的细分规则。
+                environment=environment_for_target(self.cfg, session.target),
+                identity=ident,
+                kind=(d.category or "").lower(),
+                reason=d.reason,
             )
             grd_note = (
                 f"GUARD 编号 {req_grd.request_id}，可 /guard pending 查看、"

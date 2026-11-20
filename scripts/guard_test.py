@@ -382,20 +382,17 @@ def scenario_audit(tmp: Path) -> None:
     check("yixixiawa" in raw, "审计记录真实审批主体")
     check("s12" in raw and "t12" in raw, "审计含 session_id / target_id")
 
-    # 审计不可持久化 → 敏感操作（审批）必须拒绝
+    # 审计不可持久化 → 登记/审批两级都必须拒绝（schedule2 §一.1/§一.2）
     reg_off = get_registry(str(tmp / "d12-off"), audit_enabled=False)
-    req4, _ = reg_off.register(
+    req4, why4 = reg_off.register(
         session_id="s12x", target_id="t12x", run_id="r12x",
         url="http://127.0.0.1:8080/api/users/8", method="DELETE",
         fingerprint="fp12x", level="L2", command="删除测试数据",
         environment=Environment.ISOLATED_TEST,
         identity="anonymous@127.0.0.1", kind="delete", reason="",
     )
-    ok, _m, _t = reg_off.approve(req4.request_id, session_id="s12x",
-                                 target_id="t12x",
-                                 environment=Environment.ISOLATED_TEST,
-                                 approver="interactive:x")
-    check(not ok, "审计持久化失败 → 审批必须拒绝")
+    check(req4 is None and "审计" in (why4 or ""),
+          f"审计不可持久化 → 登记失败且不静默，实={why4!r}")
 
 
 # ── 场景13 Runner 集成：L2 被拦 → pending → /guard 审批 → 放行 ─────
@@ -539,6 +536,240 @@ def scenario_expiry(tmp: Path) -> None:
     reg._ttl = 300
 
 
+# ── 场景16 consume 审计失败 → Runner 不得执行请求 ──────────────────
+
+
+def scenario_consume_audit_fail(tmp: Path) -> None:
+    print("\n场景16 consume 审计失败时 Runner 拒绝执行")
+    d = tmp / "d16"
+    cfg = cfg_for(env=Environment.DEDICATED_TEST, data_dir=str(d))
+    s = new_session()
+    runner = ToolRunner(cfg, root=str(tmp))
+    url = "http://127.0.0.1:8080/upload"
+
+    blocked = asyncio.run(runner._policy_gate(
+        "http_request", {"url": url, "method": "POST", "body": "a=1"}, s,
+    ))
+    check(blocked is not None and "GRD-" in blocked, "上传被拦并给出 GUARD 编号")
+    reg = get_registry(str(d))
+    rid = reg.pending(s.session_id)[0].request_id
+    ok, _m, tok = reg.approve(rid, session_id=s.session_id,
+                              target_id=s.result.target_id or s.target,
+                              environment=Environment.DEDICATED_TEST,
+                              approver="interactive:yixixiawa")
+    check(ok, "审批通过（审计正常）")
+
+    # 模拟审计故障（PolicyAudit.enabled=False → log 返回 False）；
+    # 绑定字段全部取登记时的真实值，保证失败点只有"审计"一个。
+    reg.audit.enabled = False
+    rec = next(r for r in reg._items.values() if r.token == tok)
+    ok2, why2 = reg.consume(
+        tok, session_id=s.session_id, target_id=s.result.target_id or s.target,
+        run_id=s.result.current_run_id, url=rec.url, method=rec.method,
+        fingerprint=rec.fingerprint, identity=rec.identity,
+        environment=rec.environment,
+    )
+    check(not ok2 and "审计" in why2, f"审计失败 → 消费失败，实={why2!r}")
+    check(any(r.status == "APPROVED" and r.token == tok
+              for r in reg._items.values()),
+          "票据状态回滚为 APPROVED（一致：未消费成功也未丢失）")
+    reg.audit.enabled = True
+
+    # Runner 不得执行：审计恢复前门闸仍拒绝
+    reg.audit.enabled = False
+    still = asyncio.run(runner._policy_gate(
+        "http_request", {"url": url, "method": "POST", "body": "a=1"}, s,
+    ))
+    check(still is not None, "审计失败期间 Runner 门闸仍拒绝执行同一请求")
+    reg.audit.enabled = True
+
+
+# ── 场景17 register 审计失败 → 无有效审批请求 ───────────────────────
+
+
+def scenario_register_audit_fail(tmp: Path) -> None:
+    print("\n场景17 register 审计失败不生成有效审批请求")
+    reg = get_registry(str(tmp / "d17"), audit_enabled=False)
+    req, why = reg.register(
+        session_id="s17", target_id="t17", run_id="r17",
+        url="http://127.0.0.1:8080/api/users/1", method="DELETE",
+        fingerprint="fp17", level="L2", command="删除测试数据",
+        environment=Environment.DEDICATED_TEST,
+        identity="anonymous@127.0.0.1", kind="delete", reason="",
+    )
+    check(req is None and "审计" in (why or ""),
+          f"登记失败且明确报告（不静默），实={why!r}")
+    check(reg.pending("s17") == [], "没有可审批的请求残留")
+
+
+# ── 场景18 上传环境细分：仅专门测试环境可审批 ───────────────────────
+
+
+def scenario_upload_env(tmp: Path) -> None:
+    print("\n场景18 上传审批环境细分")
+    reg = get_registry(str(tmp / "d18"))
+
+    # 普通测试环境（isolated_test）审批失败
+    req_a, _ = reg.register(
+        session_id="s18", target_id="t18", run_id="r18",
+        url="http://127.0.0.1:8080/upload", method="POST",
+        fingerprint="fp18a", level="L2", command="上传测试文件",
+        environment=Environment.ISOLATED_TEST,
+        identity="anonymous@127.0.0.1", kind="upload", reason="",
+    )
+    ok, msg_a, _ = reg.approve(req_a.request_id, session_id="s18",
+                               target_id="t18",
+                               environment=Environment.ISOLATED_TEST,
+                               approver="interactive:x")
+    check(not ok and "专门测试环境" in msg_a,
+          f"上传在普通测试环境（isolated）审批失败，实={msg_a!r}")
+
+    # 登记环境 ≠ 当前环境 → 旧审批失效
+    ok, msg_b, _ = reg.approve(req_a.request_id, session_id="s18",
+                               target_id="t18",
+                               environment=Environment.DEDICATED_TEST,
+                               approver="interactive:x")
+    check(not ok and "环境已变化" in msg_b,
+          f"环境变化 → 旧登记拒绝审批，实={msg_b!r}")
+
+    # 专门测试环境可审批；换回普通环境消费时仍受约束
+    req_b, _ = reg.register(
+        session_id="s18", target_id="t18", run_id="r18",
+        url="http://127.0.0.1:8080/upload", method="POST",
+        fingerprint="fp18b", level="L2", command="上传测试文件",
+        environment=Environment.DEDICATED_TEST,
+        identity="anonymous@127.0.0.1", kind="upload", reason="",
+    )
+    ok, _m, tok = reg.approve(req_b.request_id, session_id="s18",
+                              target_id="t18",
+                              environment=Environment.DEDICATED_TEST,
+                              approver="interactive:x")
+    check(ok, "上传在专门测试环境审批通过")
+    ok2, why2 = reg.consume(
+        tok, session_id="s18", target_id="t18", run_id="r18",
+        url=req_b.url, method="POST", fingerprint="fp18b",
+        identity="anonymous@127.0.0.1",
+        environment=Environment.ISOLATED_TEST,
+    )
+    check(not ok2 and "目标环境" in why2,
+          f"专门环境签发的票据换普通环境消费 → 失败，实={why2!r}")
+
+
+# ── 场景19 删除未登记对象：审批后仍被台账拒绝 ───────────────────────
+
+
+def scenario_delete_requires_ledger(tmp: Path) -> None:
+    print("\n场景19 删除未登记对象，审批后仍拒绝")
+    d = tmp / "d19"
+    cfg = cfg_for(env=Environment.DEDICATED_TEST, data_dir=str(d))
+    s = new_session()
+    runner = ToolRunner(cfg, root=str(tmp))
+    url = "http://127.0.0.1:8080/api/users/9999"
+
+    blocked = asyncio.run(runner._policy_gate(
+        "http_request", {"url": url, "method": "DELETE"}, s,
+    ))
+    check(blocked is not None, "删除被拦")
+    reg = get_registry(str(d))
+    pend = reg.pending(s.session_id)
+    check(bool(pend), "删除请求进入待审批队列")
+    ok, _m, _tok = reg.approve(pend[0].request_id, session_id=s.session_id,
+                               target_id=s.result.target_id or s.target,
+                               environment=Environment.DEDICATED_TEST,
+                               approver="interactive:yixixiawa")
+    check(ok, "GUARD 审批签发成功")
+    still = asyncio.run(runner._policy_gate(
+        "http_request", {"url": url, "method": "DELETE"}, s,
+    ))
+    check(still is not None and ("台账" in still or "生命周期" in still),
+          "审批不能替代对象台账验证：未登记对象仍拒绝")
+
+
+# ── 场景20 身份变化 → 票据消费失败 ─────────────────────────────────
+
+
+def scenario_identity_change(tmp: Path) -> None:
+    print("\n场景20 身份变化导致票据失效")
+    reg = get_registry(str(tmp / "d20"))
+    req, _ = reg.register(
+        session_id="s20", target_id="t20", run_id="r20",
+        url="http://127.0.0.1:8080/api/users/1", method="DELETE",
+        fingerprint="fp20", level="L2", command="删除测试数据",
+        environment=Environment.ISOLATED_TEST,
+        identity="anonymous@127.0.0.1", kind="delete", reason="",
+    )
+    ok, _m, tok = reg.approve(req.request_id, session_id="s20",
+                              target_id="t20",
+                              environment=Environment.ISOLATED_TEST,
+                              approver="interactive:x")
+    check(ok, "审批签发")
+    ok2, why2 = reg.consume(
+        tok, session_id="s20", target_id="t20", run_id="r20",
+        url=req.url, method="DELETE", fingerprint="fp20",
+        identity="cred:authorization:abcd1234",
+        environment=Environment.ISOLATED_TEST,
+    )
+    check(not ok2 and "账号身份" in why2,
+          f"身份变化 → 消费失败并作废，实={why2!r}")
+
+
+# ── 场景21 审批人身份可信性 + L3 全环境拒绝 ────────────────────────
+
+
+def scenario_approver_identity(tmp: Path) -> None:
+    print("\n场景21 审批人身份可信性；L3 全环境永久拒绝")
+    reg = get_registry(str(tmp / "d21"))
+    req, _ = reg.register(
+        session_id="s21", target_id="t21", run_id="r21",
+        url="http://127.0.0.1:8080/api/users/2", method="DELETE",
+        fingerprint="fp21", level="L2", command="删除测试数据",
+        environment=Environment.ISOLATED_TEST,
+        identity="anonymous@127.0.0.1", kind="delete", reason="",
+    )
+    for bad, label in (
+        ("auto-mode", "自动模式标签"),
+        ("some_function", "函数名"),
+        ("True", "裸布尔字符串"),
+        ("interactive:", "空前缀"),
+        ("  ", "空白"),
+    ):
+        ok, msg, _ = reg.approve(req.request_id, session_id="s21",
+                                 target_id="t21",
+                                 environment=Environment.ISOLATED_TEST,
+                                 approver=bad)
+        check(not ok and "不可信" in msg, f"{label} 不可作为审批人，实={msg!r}")
+
+    ok, msg, tok = reg.approve(req.request_id, session_id="s21",
+                               target_id="t21",
+                               environment=Environment.ISOLATED_TEST,
+                               approver="interactive:yixixiawa")
+    check(ok, "可信身份审批通过")
+    raw = (tmp / "d21" / "policy" / "audit.jsonl").read_text(encoding="utf-8")
+    check("approver_source" in raw and "authenticated_approver" in raw,
+          "审计保留身份来源与认证状态字段")
+
+    # L3 在所有环境下拒绝登记（永久拒绝，与环境无关）
+    for env in (Environment.PRODUCTION, Environment.DEDICATED_TEST,
+                Environment.ISOLATED_TEST, Environment.UNKNOWN):
+        r3, why3 = reg.register(
+            session_id="s21", target_id="t21", run_id="r21",
+            url="http://127.0.0.1:8080/x", method="GET",
+            fingerprint=f"fp-l3-{env}", level="L3", command="SQL 注入验证",
+            environment=env, identity="anonymous@127.0.0.1",
+            kind="sqli", reason="",
+        )
+        check(r3 is None, f"L3 在 {env} 仍拒绝进入审批队列")
+    # UNKNOWN 同理（既有场景3+4 已覆盖一部分，这里按环境再补一遍）
+    r4, _ = reg.register(
+        session_id="s21", target_id="t21", run_id="r21",
+        url="http://127.0.0.1:8080/x", method="PROPFIND",
+        fingerprint="fp-unk2", level="UNKNOWN", command="未知",
+        environment=Environment.UNKNOWN, identity="anonymous@127.0.0.1",
+        kind="", reason="",
+    )
+    check(r4 is None, "UNKNOWN 不能进入审批队列")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -553,6 +784,12 @@ def main() -> int:
         scenario_runner_integration(tmp)
         scenario_repl_pending(tmp)
         scenario_expiry(tmp)
+        scenario_consume_audit_fail(tmp)
+        scenario_register_audit_fail(tmp)
+        scenario_upload_env(tmp)
+        scenario_delete_requires_ledger(tmp)
+        scenario_identity_change(tmp)
+        scenario_approver_identity(tmp)
     print(f"\n{PASS}/{PASS + len(FAIL)} 项通过")
     if FAIL:
         print("失败：")
