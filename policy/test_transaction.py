@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from policy.request_guard import normalize_url_path
+
 # 响应里的对象标识：JSON 的 "id"/"uuid"/"slug"/"user_id" 等字段值
 _ID_FIELD_RE = re.compile(
     r'["\'](?:[a-z_]+_)?(?:id|uuid|slug|token)["\']\s*[:=]\s*["\']?([A-Za-z0-9_\-]{4,64})["\']',
@@ -209,7 +211,10 @@ class TestLedger:
 
         * 环境不是测试环境 → 拒（测试环境的删除权限不得推导到生产，
           这条边界在这里再拦一道，即使决策层已经判过）；
-        * 四元组（目标/run/身份/对象标识）对得上 → 放行；
+        * **本次创建/上传且取得对象标识**的对象（四元组对得上）→ 放行
+          （第四轮整改 #3：仅**修改过**的既有对象、无法识别对象标识的
+          对象**不得**认定为本次创建——它们不是本次测试建立的，删了
+          就是删到别人的数据；对它们的删除一律走单独审批）；
         * 对象未知 + **绑定本次请求**的单独审批 → 放行（如预置测试
           用户清理——审批由运行期通道逐请求给出，参数变化即重新审批）；
         * 对象未知 + 无审批 → 拒。
@@ -220,8 +225,8 @@ class TestLedger:
             return False, "目标为生产环境：删除测试数据的权限不得推导到生产环境"
         if environment not in Environment.TEST_ENVS:
             return False, f"目标环境为 {environment or '未知'}，不满足测试环境条件"
-        if self.known(url, run_id=run_id, target_id=target_id, identity=identity):
-            return True, "四元组（目标/run/身份/对象标识）匹配台账：本次测试生命周期内建立/修改过"
+        if self._deletable(url, run_id=run_id, target_id=target_id, identity=identity):
+            return True, "四元组（目标/run/身份/对象标识）匹配台账：本次测试创建/上传并取得标识的对象"
         if approved:
             return True, "对象不在台账中，但已获绑定本次请求的单独审批（逐请求，不可复用）"
         return (
@@ -229,6 +234,49 @@ class TestLedger:
             "对象不在本次测试生命周期台账中且无单独审批——"
             "删除范围只能覆盖本次建立的测试对象",
         )
+
+    def _deletable(
+        self, url: str, *, run_id: str, target_id: str, identity: str,
+    ) -> bool:
+        """删除判定的**严格口径**（第四轮整改 #3）：
+
+        只有 ``action in ("create", "upload")`` 且带具体 ``object_id`` 的
+        登记条目才算"本次测试建立的对象"：
+
+        * ``update`` 条目 = **修改过的既有对象**——对象是别人建的，
+          修改过不代表有权删，一律不进删除判定（走单独审批）；
+        * 无 ``object_id`` 的条目（delete 记录、历史遗留）同样不算——
+          无法识别对象标识就无从确认"删的就是建的那个"。
+        """
+        if not target_id or not run_id or not identity:
+            return False
+        key = self._key(url)
+        cands = candidate_ids(url)
+        for o in reversed(self._objects):
+            if o.action not in ("create", "upload") or not o.object_id:
+                continue
+            if o.target_id != target_id or o.run_id != run_id or o.identity != identity:
+                continue
+            if o.url == key:
+                # 完全同键：登记的标识必须能在删除 URL 里对上号
+                if cands and o.object_id not in cands:
+                    continue
+                return True
+            # 跨端点按 id 命中：同主机 + 删除路径在登记路径前缀之下
+            if o.object_id in cands:
+                try:
+                    p_reg = urlparse(o.url or "")
+                    p_del = urlparse(key)
+                except ValueError:
+                    continue
+                if (p_reg.netloc or "") != (p_del.netloc or ""):
+                    continue
+                base_dir = normalize_url_path(p_reg.path or "").rstrip("/")
+                del_path = normalize_url_path(p_del.path or "/")
+                if not base_dir or not del_path.startswith(base_dir + "/"):
+                    continue
+                return True
+        return False
 
     def objects_of(self, run_id: str = "") -> list[TrackedObject]:
         if not run_id:

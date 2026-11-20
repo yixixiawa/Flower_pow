@@ -1,24 +1,31 @@
 """接口测试生命周期权限控制（policy/，111.md）的回归测试（不触网）。
 
-锁死八件事：
-  1. 规则清单表：十条矩阵规则 + EXPORT/AUTH 显式化两条 = 12 条、
-     严格六列、等级与矩阵一致、L3 无执行路径；
-  2. decide()：L0 有条件允许 / L1 仅隔离测试环境（含导出数据）/
+锁死十件事：
+  1. 规则清单表：**恰好十条矩阵命令**（第四轮整改：删除 EXPORT/AUTH
+     的自造规则行）、严格六列、等级与矩阵一致、L3 无执行路径；
+  2. decide()：L0 有条件允许 / L1 仅隔离测试环境 /
      L2 上传仅 dedicated_test 且逐请求审批 / L2 删除单独审批 /
-     L3 一律拒绝；AUTH 显式落「认证操作」L0；
-  3. classify_request()：九类接口分类齐全、EXPORT 独立、更高风险为准；
+     L3 一律拒绝；矩阵外命令（含 EXPORT/AUTH 类别映射出的空命令）
+     → UNKNOWN 默认拒绝；
+  3. classify_request()：九类接口分类齐全、EXPORT/AUTH 独立分类且
+     保留风险信号、更高风险为准；
   4. 目标范围统一校验 in_scope：scheme+hostname+port 规范化比较、
-     路径前缀授权；所有工具走同一把尺子；目标 URL 合法性校验
-     （非法目标/协议/端口明确拒绝）；
+     路径前缀授权 + **路径规范化防绕过**（编码点段/双斜杠/反斜杠/
+     尾斜杠在比对前摊平）；目标 URL 合法性校验；
   5. 审批只在运行期逐请求发生——配置级审批整体无效；审批 =
-     一次性票据（精确匹配、单次消费、带过期时间）；
+     一次性票据（精确匹配、单次消费、带过期时间、绑定请求指纹与
+     **真实审批人身份**）；
   6. 台账四元组（目标/run/身份/对象标识）**严格**匹配（维度缺失
      即未知；跨端点按 id 命中须同主机且在登记路径前缀下），创建
-     真实请求成功（2xx/3xx）并取得对象标识才登记；
+     真实请求成功（2xx/3xx）并取得对象标识才登记；**删除判定只认
+     本次创建/上传的对象——仅修改过的既有对象一律走单独审批**；
   7. 审计持久化是写操作与审批的先决条件；只读放行但告警；
-     写操作放行留痕本身必须落盘成功；
+     写操作放行留痕本身必须落盘成功；审批审计带真实审批人；
   8. Runner 集成：exploit_probe 与其他工具同一 _policy_ctx / in_scope，
-     放行 ≠ 登记（pending → 执行成功后落账）。
+     放行 ≠ 登记（pending → 执行成功后落账）；
+  9. 身份逐请求解析：无凭证明确匿名、不继承前次实名身份；
+ 10. 并发状态隔离：pending 台账与身份挂 ContextVar，并发工具调用
+     互不污染。
 
 运行：.venv/Scripts/python.exe scripts/policy_guard_test.py
 """
@@ -68,18 +75,18 @@ EXPECTED_LEVELS = {
     "创建测试数据": "L1", "修改测试数据": "L1",
     "上传测试文件": "L2", "删除测试数据": "L2",
     "批量删除": "L3", "SQL 注入验证": "L3", "命令执行": "L3", "定时任务执行": "L3",
-    "导出数据": "L1", "认证操作": "L0",
 }
 EXPECTED_ALLOW = {
     "查询详情": "有条件允许", "查询列表": "有条件允许",
     "创建测试数据": "仅隔离测试环境", "修改测试数据": "仅隔离测试环境",
     "上传测试文件": "需要专门测试环境", "删除测试数据": "需要单独审批",
-    "导出数据": "仅隔离测试环境", "认证操作": "有条件允许",
 }
 
 
 def test_rules_table() -> None:
-    ok(len(RULES) == 12, f"10 条矩阵规则 + EXPORT/AUTH 显式 2 条（实际 {len(RULES)}）")
+    ok(len(RULES) == 10, f"恰好十条矩阵命令（第四轮整改：EXPORT/AUTH 自造规则已删，实际 {len(RULES)}）")
+    ok(rule_for_command("导出数据") is None, "「导出数据」规则已删除（EXPORT 无矩阵授权行）")
+    ok(rule_for_command("认证操作") is None, "「认证操作」规则已删除（AUTH 无矩阵授权行）")
     for r in RULES:
         ok(len(r.to_row()) == 6, f"{r.command} 严格六列")
         ok(r.handling == "拒绝执行", f"{r.command} 条件不满足统一拒绝执行")
@@ -92,14 +99,15 @@ def test_rules_table() -> None:
     if r_level := rule_for_command("删除测试数据"):
         ok(r_level.level == "L2", "删除保持 L2")
     table = rules_table_markdown()
-    ok(len([ln for ln in table.splitlines() if ln.startswith("|")]) == 14, "表格含表头+分隔+12 行")
+    ok(len([ln for ln in table.splitlines() if ln.startswith("|")]) == 12, "表格含表头+分隔+10 行")
     ok(rule_for_command("不存在的命令") is None, "矩阵外命令查不到规则")
-    # 第三轮整改 #3：EXPORT/AUTH 显式独立映射，L0 查询命令只留给 READ——
-    # 不得为通过分类器而把新类别映射到 L0。
-    ok(COMMAND_FOR_CATEGORY[ApiCategory.EXPORT] == "导出数据",
-       "EXPORT 显式映射「导出数据」（L1，无隐式 L0 授权）")
-    ok(COMMAND_FOR_CATEGORY[ApiCategory.AUTH] == "认证操作",
-       "AUTH 显式映射「认证操作」（不自动归入普通 READ）")
+    # 第四轮整改 #1：EXPORT/AUTH 保持独立分类与风险信号，但**没有矩阵
+    # 授权行**——命令映射为空串，decide() 判 UNKNOWN 默认拒绝。不得为
+    # 通过分类器而把新类别映射进任何矩阵命令。
+    ok(COMMAND_FOR_CATEGORY[ApiCategory.EXPORT] == "",
+       "EXPORT 命令映射为空（无授权依据 → UNKNOWN，不映射 L0/L1）")
+    ok(COMMAND_FOR_CATEGORY[ApiCategory.AUTH] == "",
+       "AUTH 命令映射为空（无授权依据 → UNKNOWN，不映射 L0）")
     l0_mapped = {k for k, v in COMMAND_FOR_CATEGORY.items() if v in ("查询详情", "查询列表")}
     ok(l0_mapped == {ApiCategory.READ}, f"仅 READ 映射 L0 查询命令（实际 {l0_mapped}）")
 
@@ -159,19 +167,14 @@ def test_decide() -> None:
     # 未知命令 → UNKNOWN
     d = decide("未知命令")
     ok(d.decision == Decision.UNKNOWN, "矩阵外命令 → UNKNOWN")
-
-    # 第二轮整改 #2：EXPORT/AUTH 显式化——不再隐式 L0
+    # 第四轮整改 #1：自造的「导出数据」「认证操作」规则已删除——
+    # 矩阵外命令一律 UNKNOWN，不存在任何 L0/L1 旁路
     d = decide("导出数据", environment=Environment.ISOLATED_TEST,
                identity_bound=True, target_bound=True)
-    ok(d.decision == Decision.ALLOW, "导出数据（L1）隔离测试环境 → 允许")
-    for env in (Environment.PRODUCTION, Environment.DEDICATED_TEST, Environment.UNKNOWN):
-        d = decide("导出数据", environment=env, identity_bound=True, target_bound=True)
-        ok(d.decision == Decision.DENY, f"导出数据 {env} → 拒绝（不再隐式 L0 放行）")
-    d = decide("认证操作", environment=Environment.PRODUCTION,
+    ok(d.decision == Decision.UNKNOWN, "导出数据（规则已删）→ UNKNOWN 默认拒绝")
+    d = decide("认证操作", environment=Environment.ISOLATED_TEST,
                identity_bound=True, target_bound=True)
-    ok(d.decision == Decision.ALLOW, "认证操作（L0）绑定齐全 → 允许（显式规则行）")
-    d = decide("认证操作", identity_bound=True, target_bound=False)
-    ok(d.decision == Decision.DENY, "认证操作目标未绑定 → 拒绝")
+    ok(d.decision == Decision.UNKNOWN, "认证操作（规则已删）→ UNKNOWN 默认拒绝")
 
 
 # ── 3. classify_request 七维度识别 ────────────────────────────────
@@ -181,11 +184,17 @@ def test_classify() -> None:
     c = classify_request("http://t.example.com/api/users/1", "GET")
     ok(c.category == ApiCategory.READ and c.command == "查询详情", "GET 详情 → READ")
     c = classify_request("http://t.example.com/api/users/export", "GET")
-    ok(c.category == ApiCategory.EXPORT, "EXPORT 独立分类")
-    ok(c.command == "导出数据", "EXPORT → 导出数据（L1，不再隐式落 L0 查询）")
+    ok(c.category == ApiCategory.EXPORT, "EXPORT 独立分类（保留）")
+    ok(c.command == "", "EXPORT 命令映射为空 → 决策 UNKNOWN（第四轮整改）")
+    ok(c.risk_level == "L0" or c.signals, "EXPORT 保留识别信号（审计可见识别出了导出）")
     c = classify_request("http://t.example.com/api/login", "POST", body="u=1&p=2")
     ok(c.category == ApiCategory.AUTH, "POST /login → AUTH（不按 POST 升级为 CREATE）")
-    ok(c.command == "认证操作", "AUTH → 认证操作（显式 L0 规则行）")
+    ok(c.command == "", "AUTH 命令映射为空 → 决策 UNKNOWN（第四轮整改）")
+    # 路径规范化：编码变体不得逃过分类信号（第四轮整改 #5）
+    c = classify_request("http://t.example.com/api/users/%65xport", "GET")
+    ok(c.category == ApiCategory.EXPORT, "编码路径（%65xport）仍识别为 EXPORT")
+    c = classify_request("http://t.example.com/api/users/export/", "GET")
+    ok(c.category == ApiCategory.EXPORT, "尾斜杠不影响分类")
     c = classify_request("http://t.example.com/api/users/1", "DELETE")
     ok(c.command == "删除测试数据", "DELETE → 删除测试数据")
     c = classify_request(
@@ -247,6 +256,23 @@ def test_scope() -> None:
     ok(in_scope("http://h:8080/anything", "http://h:8080"), "根绑定 → 全路径在范围内")
     ok(not in_scope("not-a-url", "http://h:8080"), "请求 URL 解析失败 → 不在范围内（fail-closed）")
     ok(not in_scope("http://h:8080/", ""), "绑定目标为空 → 不在范围内（fail-closed）")
+
+    # ── 第四轮整改 #5：路径规范化防前缀绕过 ──────────────────────────
+    # 编码点段：字面量前缀比对会把它们误判"在 /app 内"
+    ok(not in_scope("http://h:8080/app/%2e%2e/other", "http://h:8080/app"),
+       "编码点段（%2e%2e）→ 规范化后出界")
+    ok(not in_scope("http://h:8080/app/%252e%252e/secret", "http://h:8080/app"),
+       "多层编码点段（%252e%252e）→ 逐层解码后出界")
+    ok(not in_scope("http://h:8080/app/%2e%2e%2fother", "http://h:8080/app"),
+       "编码点段+编码斜杠混合 → 出界")
+    ok(not in_scope("http://h:8080/app/../other", "http://h:8080/app"),
+       "明文点段（..）→ 出界")
+    # 冗余形态：规范化后仍是同一路径 → 不影响正常访问
+    ok(in_scope("http://h:8080/app//sub", "http://h:8080/app"), "双斜杠折叠 → 仍在前缀内")
+    ok(in_scope("http://h:8080/app/./sub", "http://h:8080/app"), "点段冗余（.）→ 仍在前缀内")
+    ok(in_scope("http://h:8080/app/sub/", "http://h:8080/app"), "尾斜杠 → 仍在前缀内")
+    ok(in_scope("http://h:8080/app/%2Fsub", "http://h:8080/app"),
+       "编码斜杠解码为路径分隔 → 仍在前缀内（语义路径）")
 
 
 def test_guard() -> None:
@@ -461,6 +487,31 @@ def test_ledger() -> None:
         identity="anon", environment=Environment.PRODUCTION,
     )
     ok(not verdict and "不得推导" in why, "生产环境一律不删（即使台账已知）")
+    # ── 第四轮整改 #3：删除判定只认本次创建/上传的对象 ──────────────
+    # 仅修改过的既有对象（update 条目）不得认定为本次创建
+    led4 = TestLedger()
+    led4.record("http://t.example.com/api/preset/7", "update", run_id="r1",
+                target_id="t", identity="anon", object_id="7")
+    ok(led4.known("http://t.example.com/api/preset/7", target_id="t",
+                  run_id="r1", identity="anon"),
+       "update 条目在 known() 里可见（修改过 ≠ 不是本次动过）")
+    verdict, why = led4.delete_verdict(
+        "http://t.example.com/api/preset/7", target_id="t", run_id="r1",
+        identity="anon", environment=Environment.ISOLATED_TEST,
+    )
+    ok(not verdict and "台账" in why,
+       "仅修改过的既有对象 → 删除不放行（修改 ≠ 本次创建，第四轮整改 #3）")
+    verdict, _ = led4.delete_verdict(
+        "http://t.example.com/api/preset/7", target_id="t", run_id="r1",
+        identity="anon", environment=Environment.ISOLATED_TEST, approved=True,
+    )
+    ok(verdict, "仅修改过的既有对象 + 绑定本次请求的单独审批 → 放行")
+    # create/upload 条目照常进删除判定（led 的 users/33 是 create 登记）
+    verdict, _ = led.delete_verdict(
+        "http://t.example.com/api/users/33", target_id="t", run_id="r1",
+        identity="anon", environment=Environment.ISOLATED_TEST,
+    )
+    ok(verdict, "本次创建并取得标识的对象 → 删除判定照常放行")
     ok(len(led.objects_of("r1")) == 2, "按 run_id 分桶取对象")
     led.clear(run_id="r1")
     ok(not led.known("http://t.example.com/api/users/33", target_id="t",
@@ -498,6 +549,30 @@ def test_runner_gate() -> None:
         runner.reset_target_scope()
         ok(runner._identity == "", "reset_target_scope 重置身份上下文")
         ok(runner._current_identity(s).startswith("anonymous@"), "无凭证 → 显式匿名身份")
+
+        # ── 第四轮整改 #2：身份逐请求解析，不继承前次实名身份 ─────────
+        id_d = runner._observe_identity(
+            {"Authorization": "Bearer token-D"}, "http://127.0.0.1:8080/", session=s,
+        )
+        ok(id_d.startswith("cred:"), "带凭证请求 → 实名身份（逐请求解析）")
+        id_anon = runner._observe_identity({}, "http://127.0.0.1:8080/", session=s)
+        ok(id_anon.startswith("anonymous@127.0.0.1") and runner._identity == "",
+           "无凭证请求 → 明确回到匿名（不继承前次实名身份，第四轮整改 #2）")
+        ok(runner._observe_identity(
+            {"Authorization": "Bearer token-E"}, "http://127.0.0.1:8080/", session=s,
+        ).startswith("cred:"), "恢复凭证 → 实名身份重新解析")
+        # 头部工具（exploit_probe/external_tool）不继承实名身份：gate 内显式重置。
+        # 注意 ContextVar 语义：asyncio.run 的任务拷贝上下文，任务内的赋值
+        # 不回传外层——所以把"设残留身份 → 过 gate → 读身份"放进同一协程。
+        async def _probe_identity() -> str:
+            runner._identity = "cred:authorization:abcd1234ef"  # 模拟前次实名残留
+            await runner._policy_gate(
+                "exploit_probe", {"url": "http://127.0.0.1:8080/", "kinds": "fileread"}, s,
+            )
+            return runner._identity
+
+        ok(asyncio.run(_probe_identity()) == "",
+           "exploit_probe gate 不继承前次实名身份（匿名解析）")
 
         # ── DELETE → L2 删除：REVIEW 且无审批通道 → 拒（不触网）────
         out = asyncio.run(runner.execute(
@@ -542,18 +617,23 @@ def test_runner_gate() -> None:
         ok(v3 is not None and "删除测试数据" in v3, "无审批通道 → 未知对象拒绝删除")
 
         # ── P0-②：放行 ≠ 登记（pending → 执行成功且取得标识才落账）──
-        v = asyncio.run(runner._policy_gate(
-            "http_request",
-            {"url": "http://127.0.0.1:8080/api/users", "method": "POST", "body": '{"name":"t"}'},
-            s,
-        ))
+        # ContextVar 语义：pending 挂在当前协程上下文，gate 与 pending
+        # 读取放同一协程内（与真实 agent 循环的 await 语义一致）。
+        async def _gate_create():
+            v = await runner._policy_gate(
+                "http_request",
+                {"url": "http://127.0.0.1:8080/api/users", "method": "POST", "body": '{"name":"t"}'},
+                s,
+            )
+            return v, runner._pending_ledger
+
+        v, pend = asyncio.run(_gate_create())
         ok(v is None, "隔离测试环境的创建放行")
         tid, rid = runner._policy_scope(s)
-        ident = runner._current_identity(s)
+        ident = (pend or {}).get("identity", "")
         ok(not runner.test_ledger.known("http://127.0.0.1:8080/api/users",
                                         target_id=tid, run_id=rid, identity=ident),
            "放行未执行 → 尚未登记（放行 ≠ 登记）")
-        pend = runner._pending_ledger
         ok(pend is not None and pend["action"] == "create", "放行的创建挂 pending 台账")
         # 执行成功但响应没有对象标识 → 不登记
         runner._commit_pending_ledger(pend, '{"ok":true}')
@@ -743,7 +823,9 @@ def test_remediation2() -> None:
         ))
         ok(verdict is None, "合法目标 + 范围内只读探针仍放行")
 
-        # ── #2：EXPORT 显式 L1——unknown 环境下导出被拒（旧行为是隐式放行）
+        # ── #1（第四轮整改）：EXPORT/AUTH 无矩阵授权 → UNKNOWN 默认拒绝 ──
+        # 矩阵恰好十条命令；EXPORT/AUTH 只有独立分类与风险信号，
+        # 没有授权依据时必须映射为 UNKNOWN/DENY，任何环境都不放行。
         cfg_u = _cfg_with()  # 不绑定环境表 → 环境判不出 = unknown
         cfg_u.data_dir = td
         runner_u = ToolRunner(cfg_u, root=td)
@@ -751,23 +833,22 @@ def test_remediation2() -> None:
             "http_request", {"url": "http://127.0.0.1:8080/api/users/export", "method": "GET"},
             s,
         ))
-        ok(verdict is not None and "导出数据" in verdict and "已拦截" in verdict,
-           "EXPORT（导出数据 L1）unknown 环境 → 拒绝（无隐式 L0 授权）")
-        # 隔离测试环境下导出按 L1 显式放行
+        ok(verdict is not None and "已拦截" in verdict,
+           "EXPORT（无矩阵授权行）unknown 环境 → UNKNOWN 默认拒绝")
+        # 隔离测试环境下导出**同样拒绝**——EXPORT 没有任何授权出路
         verdict = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/users/export", "method": "GET"},
             s,
         ))
-        ok(verdict is None, "EXPORT（导出数据 L1）隔离测试环境 → 显式放行")
-        # AUTH 显式 L0——登录放行，且审计里有「认证操作」命令名
+        ok(verdict is not None and "已拦截" in verdict,
+           "EXPORT 隔离测试环境同样拒绝（无授权依据即 UNKNOWN/DENY）")
+        # AUTH 同样无矩阵授权行 → 登录请求 UNKNOWN 拒绝（不得映射 L0）
         verdict = asyncio.run(runner._policy_gate(
             "http_request", {"url": "http://127.0.0.1:8080/api/login",
                              "method": "POST", "body": "u=1&p=2"}, s,
         ))
-        ok(verdict is None, "AUTH（认证操作 L0）绑定齐全 → 放行")
-        ok(any(e["command"] == "认证操作" and e["event"] == "allow"
-               for e in runner.policy_audit.recent()),
-           "AUTH 授权以显式命令名「认证操作」进审计（可追踪）")
+        ok(verdict is not None and "已拦截" in verdict,
+           "AUTH（无矩阵授权行）→ UNKNOWN 默认拒绝（不映射 L0）")
 
         # ── #5：审批票据——精确匹配、单次消费、带过期时间、绑定请求指纹 ──
         led = ApprovalLedger(ttl=60.0)
@@ -899,6 +980,25 @@ def test_remediation2() -> None:
         ok(v is None and len(calls2) == 2,
            "请求体变更 → 重新审批（票据绑定请求内容指纹，旧票不复用）")
 
+        # ── #4（第四轮整改）：审批人真实身份进审批审计 ──────────────────
+        runner.approver_identity = "ops-zhangsan"
+        v = asyncio.run(runner._policy_gate(
+            "http_request", {"url": "http://127.0.0.1:8080/api/users/88", "method": "DELETE"}, s,
+        ))
+        ok(v is None, "显式审批人身份：删除审批通过放行")
+        aprs = [e for e in runner.policy_audit.recent() if e["event"] == "approval"]
+        ok(aprs and aprs[-1].get("extra", {}).get("approver") == "ops-zhangsan",
+           "审批审计 extra.approver = 显式声明的真实审批人（第四轮整改 #4）")
+        ok("ops-zhangsan" in aprs[-1]["reason"], "审批理由行也带审批人（可追责到人）")
+        ok(aprs[-1].get("extra", {}).get("identity"), "审批审计带请求身份（谁在什么身份下获批）")
+        runner.approver_identity = ""
+        ok(runner._approver_label().endswith("_approve2"),
+           "未显式声明 → 回退通道函数名（不再是笼统的 type 名）")
+        _chan = type("Chan", (), {"approver_id": "alice@corp"})()
+        runner.approver = _chan
+        ok(runner._approver_label() == "alice@corp", "通道对象自带身份属性 → 用真实身份")
+        runner.approver = _approve2
+
         # ── #4b：台账登记生命周期纪律 ─────────────────────────────────
         ok(runner.test_ledger.record("http://x/api/obj", "create", run_id="",
                                      target_id="t", object_id="9") is None,
@@ -988,6 +1088,51 @@ def test_remediation2() -> None:
            "坏 extra 以 repr 摘要入账（待写队列永远可安全写盘）")
 
 
+def test_concurrency_isolation() -> None:
+    """第四轮整改 #6：Runner 并发状态污染——pending 台账与身份挂 ContextVar。"""
+    from core.tools.runner import ToolRunner
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg = _cfg_with(environments={"127.0.0.*": Environment.ISOLATED_TEST})
+        cfg.data_dir = td
+        runner = ToolRunner(cfg, root=td)
+        s = Session(target="http://127.0.0.1:8080")
+
+        async def _fake_http(session, **kwargs):  # noqa: ANN001, ANN202
+            url = str(kwargs.get("url") or "")
+            tail = url.rstrip("/").split("/")[-1]
+            return (
+                f"POST {url}\n状态码：201  耗时：1ms  正文大小：46B\n"
+                f'正文（46 字符）：\n{{"ok":true,"data":{{"id":"{tail}-obj"}}}}'
+            )
+
+        runner._h_http_request = _fake_http
+
+        async def _two():
+            return await asyncio.gather(
+                runner.execute("http_request", {
+                    "url": "http://127.0.0.1:8080/api/alpha",
+                    "method": "POST", "body": "{}",
+                }, s),
+                runner.execute("http_request", {
+                    "url": "http://127.0.0.1:8080/api/beta",
+                    "method": "POST", "body": "{}",
+                }, s),
+            )
+
+        outs = asyncio.run(_two())
+        ok(all("状态码：201" in o for o in outs), "并发创建两次都执行成功")
+        tid, rid = runner._policy_scope(s)
+        ident = runner._current_identity(s)
+        ok(runner.test_ledger.known("http://127.0.0.1:8080/api/alpha/alpha-obj",
+                                    target_id=tid, run_id=rid, identity=ident),
+           "并发 A 的 pending 未被 B 覆盖（alpha-obj 已登记，第四轮整改 #6）")
+        ok(runner.test_ledger.known("http://127.0.0.1:8080/api/beta/beta-obj",
+                                    target_id=tid, run_id=rid, identity=ident),
+           "并发 B 的 pending 未被 A 覆盖（beta-obj 已登记，第四轮整改 #6）")
+        ok(runner._pending_ledger is None, "并发执行后无遗留 pending 条目")
+
+
 def test_http_exit() -> None:
     """P1-⑥：全工程 HTTP 出口收敛——httpx Client 构造点必须用统一代理出口
     （build_client_kwargs 或 resolve_proxy_for）。"""
@@ -1026,6 +1171,7 @@ def main() -> int:
     test_ledger()
     test_runner_gate()
     test_remediation2()
+    test_concurrency_isolation()
     test_http_exit()
     test_wheel_packages()
     print(

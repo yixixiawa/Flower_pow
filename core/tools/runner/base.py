@@ -23,6 +23,7 @@ import hashlib
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -166,11 +167,39 @@ class _ToolRunnerBase:
         # 待登记台账条目（P0-②）：闸门放行 ≠ 对象存在。放行的写操作先
         # 挂到 pending，handler **执行成功**且能从响应取得对象标识后才
         # 真正进台账——"创建成功并取得对象标识后登记"。
-        self._pending_ledger: dict[str, Any] | None = None
-        # 账号身份上下文（P1-7）：set_target 初始化为匿名，请求带凭证头时
-        # 升级为实名（_observe_identity）。绝不固定为 True——它是决策的
-        # 真实入参，也进审计与台账。
-        self._identity: str = ""
+        # **并发隔离（第四轮整改 #6）**：pending 挂在 ContextVar 上——
+        # 每次 asyncio 任务有自己的上下文副本，并发执行的两个工具调用
+        # 各挂各的 pending，不会互相覆盖/串登记（实例属性会被并发放大成
+        # 状态污染：A 的登记条目吃到 B 的响应、或干脆被覆盖丢失）。
+        self._cv_pending: ContextVar[dict[str, Any] | None] = ContextVar(
+            "runner_pending_ledger", default=None,
+        )
+        # 账号身份上下文（P1-7 + 第四轮整改 #2）：**逐请求解析**，不跨
+        # 请求继承。同样挂 ContextVar 做并发隔离——并发请求 A 的实名
+        # 身份不得泄漏进并发请求 B 的台账/审计/决策。
+        self._cv_identity: ContextVar[str] = ContextVar("runner_identity", default="")
+        # 审批人的真实身份（第四轮整改 #4）：由注入审批通道的调用方
+        # （repl / 全自动模式）显式设置；不设置时回退到通道对象自带的
+        # 身份属性，再回退到函数名——审批审计必须能追责到"谁批的"。
+        self.approver_identity: str = ""
+
+    # pending / identity 走 ContextVar，实例属性形式保留（历史测试与
+    # 调用点按 `runner._pending_ledger` 读写），property 只是转发。
+    @property
+    def _pending_ledger(self) -> dict[str, Any] | None:
+        return self._cv_pending.get()
+
+    @_pending_ledger.setter
+    def _pending_ledger(self, value: dict[str, Any] | None) -> None:
+        self._cv_pending.set(value)
+
+    @property
+    def _identity(self) -> str:
+        return self._cv_identity.get()
+
+    @_identity.setter
+    def _identity(self, value: str) -> None:
+        self._cv_identity.set(value)
 
     def reset_target_scope(self) -> None:
         """清掉**与目标绑定**的运行期缓存（换目标 / 彻底重置时调用）。
@@ -504,24 +533,28 @@ class _ToolRunnerBase:
         "删除测试数据": "delete",
     }
 
-    def _current_identity(self, session) -> str:
-        """当前会话的**真实账号身份上下文**（P1-7，不固定 True）。
+    def _current_identity(self, session, url: str = "") -> str:
+        """当前**账号身份**（P1-7 + 第四轮整改 #2，不固定 True）。
 
-        * 请求声明过凭证（Authorization/Cookie/X-API-Key）→ 实名身份；
-        * 否则随目标绑定显式声明为 ``anonymous@<host>``——匿名也是被
-          记录、可审计的身份（未认证请求的执行主体就是它），不是
-          "随便放行"的占位：它会进决策入参、审计与台账。
-        * 会话没有目标 → 没有身份（identity_bound=False，全量拒绝）。
+        身份是**逐请求解析**的（见 _observe_identity）：本次请求声明了
+        凭证 → 实名身份；否则显式匿名 ``anonymous@<host>``——**不继承
+        前次请求的身份**。匿名归属优先取本次请求 URL 的主机（url 给出
+        时），退回会话目标主机。
+
+        * 无凭证 → ``anonymous@<host>``：匿名也是被记录、可审计的身份
+          （未认证请求的执行主体就是它），不是"随便放行"的占位；
+        * 会话没有目标、也没有请求 URL → 没有身份（identity_bound=
+          False，全量拒绝）。
         """
         if self._identity:
             return self._identity
-        t = str(getattr(session, "target", "") or "")
-        if not t:
+        src = url or str(getattr(session, "target", "") or "")
+        if not src:
             return ""
         try:
-            host = urlparse(t).hostname or t
+            host = urlparse(src).hostname or src
         except ValueError:
-            host = t
+            host = src
         return f"anonymous@{host}"
 
     def _policy_ctx(self, session, url: str):
@@ -530,15 +563,15 @@ class _ToolRunnerBase:
         ``bound_target`` = 会话绑定的目标 URL。**范围比对在 guard 里做**：
         请求 URL 必须与 bound_target 同主机才算 target_bound（P0-3）——
         只知道"会话有目标"不算绑定，跨主机请求一律按未绑定拒绝。
-        ``identity_bound`` / ``identity`` = 真实账号身份上下文（P1-7）：
-        凭证头升级实名、无凭证显式匿名，绝不固定为 True。
+        ``identity_bound`` / ``identity`` = **本次请求**解析出的账号身份
+        （第四轮整改 #2：逐请求解析，匿名显式、不继承前次）。
         真正的牙齿在 L1/L2 的**环境门**上：判不出环境就是 unknown，
         一律按条件不满足拒绝执行。
         """
         from policy.request_guard import GuardContext
 
         r = getattr(session, "result", None)
-        ident = self._current_identity(session)
+        ident = self._current_identity(session, url=url)
         return GuardContext(
             target_id=(getattr(r, "target_id", "") or getattr(session, "target", "")),
             run_id=getattr(r, "current_run_id", "") or "",
@@ -656,6 +689,9 @@ class _ToolRunnerBase:
                 url = self._validate_http_url(
                     self._normalize_target(str(args.get("url") or session.target or ""))
                 )
+                # 第四轮整改 #2：探针不携带凭证头——身份逐请求解析为匿名，
+                # **不继承**前次 http_request 的实名身份。
+                self._identity = ""
                 # 第三轮整改 #1：决策**统一走 RequestGuard.check_probe**——
                 # 范围（in_scope）/环境/身份判定与 http_request 同一条代码
                 # 路径，runner 不再直接调用 api_policy.decide() 自行拼决策
@@ -672,6 +708,9 @@ class _ToolRunnerBase:
                     # 第二轮整改 #1：给了目标的工具调用，目标同样过合法性
                     # 校验（http/https、端口合法）——堵 file:// 等协议混淆。
                     url = self._validate_http_url(self._normalize_target(url))
+                # 第四轮整改 #2：外部工具同样不继承前次实名身份（凭证由
+                # 工具自己的参数体系管理，runner 层身份按匿名解析）。
+                self._identity = ""
                 d = guard.check_tool(tool, dict(args), ctx=self._policy_ctx(session, url))
                 blk = await self._review_or_allow(d, session, url, req_ctx={
                     "method": "", "tool": tool,
@@ -706,22 +745,31 @@ class _ToolRunnerBase:
     # runner 只保留引用别名（历史测试引用），不得复制一份自行漂移。
     _PROBE_KIND_COMMAND = _PROBE_KIND_COMMAND_SHARED
 
-    def _observe_identity(self, headers: dict, url: str, body: str = "", session=None) -> None:
-        """从真实请求观察账号身份（P1-④：**真实账号绑定**，非凭证类型标记）。
+    # 逐请求都要重新解析的凭证头（第四轮整改 #2）
+    _CRED_HEADERS = frozenset(
+        {"authorization", "cookie", "x-api-key", "x-auth-token", "x-token"}
+    )
 
-        旧实现的 ``cred:authorization`` 只记了"用了哪类凭证"，同一头名下
-        的管理员 token 和普通用户 token 身份完全混同。整改后：
+    def _observe_identity(self, headers: dict, url: str, body: str = "", session=None) -> str:
+        """**逐请求**解析账号身份（P1-④ + 第四轮整改 #2）。
+
+        旧实现是"看见凭证就升级 `_identity`，看不见就保留"——实名身份
+        会从上一次带凭证的请求**残留**到下一次不带凭证的请求：台账四元
+        组、审计、决策全部错挂在已失效的身份下。整改后每次请求都重新
+        解析，**无凭证明确回到匿名，不继承前次身份**：
 
         * 凭证值指纹：``cred:<头名>:<sha256 前 10 位>`` —— 不同 token /
-          会话 = 不同身份，可区分同一头名下的多个账号；
+          会话 = 不同身份，可区分同一头名下的多个账号（凭证值本身永不
+          进身份标签，只进指纹）；
         * 角色以**显式声明**为准（不猜）：``session.credentials["role"]``
-          （登录流程或用户配置写入，如 admin / user）→ ``@<角色>`` 后缀；
-          其次认目标自定义角色头（X-User-Role / X-Role / X-Admin）的值；
-        * 无凭证 → ``anonymous@<host>``（由 _current_identity 现算）。
-        凭证值本身永不进身份标签（只进指纹）。
+          → ``@<角色>`` 后缀；其次认目标自定义角色头（X-User-Role 等）；
+        * 无凭证 → 重置为空串，由 ``_current_identity`` 现算
+          ``anonymous@<url 主机>``——换账号、去凭证、换目标自然归位。
+
+        返回本次请求的身份串。
         """
         for h, v in (headers or {}).items():
-            if str(h).lower() in ("authorization", "cookie", "x-api-key", "x-auth-token", "x-token"):
+            if str(h).lower() in self._CRED_HEADERS:
                 fp = hashlib.sha256(str(v or "").encode("utf-8")).hexdigest()[:10]
                 ident = f"cred:{str(h).lower()}:{fp}"
                 role = ""
@@ -734,7 +782,10 @@ class _ToolRunnerBase:
                             role = str(rv)[:32]
                             break
                 self._identity = f"{ident}@{role}" if role else ident
-                return
+                return self._identity
+        # 无凭证：本次请求显式匿名（清掉任何前次实名残留）
+        self._identity = ""
+        return self._current_identity(session, url=url)
 
     def _history_hint(self, url: str) -> str:
         """历史行为提示（P1-6）：台账里同主机出现过的写操作，喂给分类器。"""
@@ -774,7 +825,7 @@ class _ToolRunnerBase:
             url,
             run_id=rid,
             target_id=tid,
-            identity=self._current_identity(session),
+            identity=self._current_identity(session, url=url),
             environment=self.policy_guard.environment_for(url),
             approved=approved,
         )
@@ -908,6 +959,37 @@ class _ToolRunnerBase:
             object_id=obj_id,
         )
 
+    def _approver_label(self) -> str:
+        """审批人的**真实身份**（第四轮整改 #4）——审批审计必须能追责到人。
+
+        解析顺序（都不满足回退，最终兜底 "unknown-approver"）：
+
+        1. ``self.approver_identity`` —— 注入审批通道的调用方（repl /
+          全自动模式 / MCP）显式声明的操作者身份；
+        2. 通道对象自带的身份属性（``approver_id`` / ``username`` /
+          ``display_name`` / ``name``）—— 自定义审批类声明的"我是谁"；
+        3. ``__qualname__`` / ``__name__`` / 类型名 —— 裸函数通道至少
+          记到函数级。
+
+        旧的 ``type(self.approver).__name__`` 会把闭包、lambda、不同人
+        注入的通道都记成同一个 "function"——审批人和审批事件对不上号。
+        """
+        if self.approver_identity.strip():
+            return self.approver_identity.strip()[:60]
+        a = self.approver
+        if a is None:
+            return "none"
+        for attr in ("approver_id", "username", "user", "display_name", "name"):
+            v = getattr(a, attr, None)
+            if isinstance(v, str) and v.strip() and attr != "name":
+                return v.strip()[:60]
+        label = (
+            getattr(a, "__qualname__", None)
+            or getattr(a, "__name__", None)
+            or type(a).__name__
+        )
+        return (str(label)[:60] or "unknown-approver")
+
     async def _policy_review(
         self, d, session, url: str, *, method: str = "", req_digest: str = "",
     ) -> bool:
@@ -923,7 +1005,7 @@ class _ToolRunnerBase:
         from policy.api_policy import PermissionLevel
 
         tid, rid = self._policy_scope(session)
-        ident = self._current_identity(session)
+        ident = self._current_identity(session, url=url)
         if getattr(d, "level", "") == PermissionLevel.L3:
             # L3 一律拒绝，审批不设出路——通道层面再拦一道
             self.policy_audit.log(
@@ -939,9 +1021,7 @@ class _ToolRunnerBase:
                 reason=d.reason + "；无审批通道，拒绝执行",
             )
             return False
-        approver_label = str(
-            getattr(self.approver, "__name__", None) or type(self.approver).__name__
-        )[:60]
+        approver_label = self._approver_label()
         ok = bool(
             await self.approver(
                 f"策略审批：{d.command}（{d.level}）{method or 'GET'} {url[:80]}\n  {d.reason}"
@@ -951,7 +1031,8 @@ class _ToolRunnerBase:
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision="DENY",
                 category=d.category, url=url, target_id=tid, run_id=rid,
-                reason="运行期审批拒绝：" + d.reason,
+                reason=f"运行期审批拒绝（审批人 {approver_label}）：" + d.reason,
+                extra={"approver": approver_label, "identity": ident},
             )
             return False
         token = self.approvals.issue(
@@ -970,18 +1051,20 @@ class _ToolRunnerBase:
             self.policy_audit.log(
                 "deny", command=d.command, level=d.level, decision="DENY",
                 category=d.category, url=url, target_id=tid, run_id=rid,
-                reason=f"审批票据消费失败（{why}）：{d.reason}",
+                reason=f"审批票据消费失败（审批人 {approver_label}；{why}）：{d.reason}",
+                extra={"approver": approver_label},
             )
             return False
         self.policy_audit.log(
             "approval", command=d.command, level=d.level, decision="ALLOW",
             category=d.category, url=url, target_id=tid, run_id=rid,
-            reason="运行期审批通过（一次性票据，单次有效）：" + d.reason,
+            reason=f"运行期审批通过（审批人 {approver_label}，一次性票据，单次有效）：" + d.reason,
             extra={
                 "approval_token": token.token,
                 "method": token.method,
                 "request_digest": token.request_digest,
                 "approver": token.approver,
+                "identity": ident,
             },
         )
         return True
@@ -1023,7 +1106,7 @@ class _ToolRunnerBase:
                 "action": action,
                 "run_id": rid,
                 "target_id": tid,
-                "identity": self._current_identity(session),
+                "identity": self._current_identity(session, url=url),
             }
         return None
 

@@ -28,18 +28,20 @@ Hybrid 决策规则：
 * 测试环境允许删除测试用户，**不得推导为生产环境允许删除**；
 * 条件不满足时，统一处理为**拒绝执行**。
 
-EXPORT / AUTH 显式化整改（第二轮）::
+EXPORT / AUTH 无矩阵授权（第四轮整改，收紧）::
 
-    矩阵原文没有 EXPORT/AUTH 行，旧实现把两者隐式映射进 L0 查询命令——
-    导出（/export、/download、/dump、/backup）与认证操作（提交凭证）
-    就这样拿到了"隐式 L0 授权"，授权路径既不显式也不可追踪。整改后：
+    矩阵原文恰好十条命令，**没有 EXPORT/AUTH 行**——导出（数据外带）
+    与认证操作（提交凭证）都不是矩阵授权过的能力。此前两轮曾为它们
+    各造一条规则（「导出数据」L1、「认证操作」L0），本质仍是"为通过
+    分类器而新增允许范围"。整改后：
 
-    * EXPORT → 「导出数据」独立规则（L1，仅隔离测试环境）——导出是
-      数据外带动作，比只读查询风险高，收紧而不是放权；
-    * AUTH → 「认证操作」独立规则（L0，仅限建立测试前状态）——
-      行为与旧映射等价，但**授权依据在矩阵里有一行可查**。
-
-    两条都是**收窄或显式化**，不扩大任何允许范围。
+    * ApiCategory.EXPORT / ApiCategory.AUTH 保持**独立分类**与风险信号
+      （分类器照常识别、审计照常记录识别信号）；
+    * 但 COMMAND_FOR_CATEGORY 映射为空串 → ``decide()`` 判 UNKNOWN →
+      **默认拒绝执行**。没有明确授权依据的类别一律 UNKNOWN/DENY，
+      不得为通过分类器而映射进任何矩阵命令；
+    * 导出/认证需求要合法落地，只能走"人改代码加白名单"（与 L3 同一
+      唯一合法途径），不存在配置旁路。
 """
 
 from __future__ import annotations
@@ -202,24 +204,11 @@ RULES: list[PolicyRule] = [
         default_status="禁止",
         deny_when="任何情形",
     ),
-    # ── 显式化整改（第二轮）：矩阵原文无 EXPORT/AUTH 行，旧实现隐式
-    # 映射进 L0 查询命令。以下两条把授权依据摆到明面上：
-    # EXPORT 收紧为 L1（仅隔离测试环境），AUTH 保持 L0 但规则可查。
-    PolicyRule(
-        command="导出数据",
-        level=PermissionLevel.L1,
-        allow_when="仅隔离测试环境（导出是数据外带动作，按 L1 收紧）",
-        default_status="非隔离测试环境默认拒绝",
-        deny_when="目标环境不是隔离测试环境",
-    ),
-    PolicyRule(
-        command="认证操作",
-        level=PermissionLevel.L0,
-        allow_when="有条件允许：目标、环境与账号身份已完成绑定，仅用于建立测试前状态（登录/登出/换取 token）",
-        default_status="允许（条件满足时）",
-        deny_when="目标/环境/账号身份未绑定，或行为超出建立测试前状态（如凭证爆破、批量取 token）",
-    ),
 ]
+# 矩阵**恰好十条命令**（第四轮整改）：不再为 EXPORT/AUTH 新增规则行——
+# 矩阵原文没有这两类，为它们造行就是"为通过分类器而扩大允许范围"。
+# EXPORT/AUTH 保持独立分类与风险信号（识别层），但命令映射为空串，
+# decide() 判 UNKNOWN 默认拒绝（决策层）——授权依据必须来自矩阵本身。
 
 _RULE_BY_COMMAND = {r.command: r for r in RULES}
 
@@ -242,14 +231,15 @@ def rules_table_markdown() -> str:
 # ── 接口分类 → 命令映射 ──────────────────────────────────────────
 
 # 分类本身独立（EXPORT 不是 READ），但落到权限矩阵时需要一条命令。
-# **显式映射整改（第二轮）**：EXPORT/AUTH 不再隐式复用 L0 查询命令——
-# EXPORT 落独立的「导出数据」（L1，仅隔离测试环境），AUTH 落独立的
-# 「认证操作」（L0，仅限建立测试前状态）。分类字段仍然独立记录，
-# 审计里看得到它原来是 EXPORT/AUTH，且授权依据在矩阵里各有一行。
+# **第四轮整改**：EXPORT/AUTH 在矩阵里**没有授权行**——映射为空串，
+# ``decide()`` 判 UNKNOWN 默认拒绝。分类器照常识别这两类并保留风险
+# 信号（审计可见它识别出了 EXPORT/AUTH），但**没有明确授权依据就
+# 不得映射进任何矩阵命令**——不得为通过分类器而把新类别映射到 L0，
+# 也不得为它们新增矩阵行（矩阵恰好十条，不扩大允许范围）。
 COMMAND_FOR_CATEGORY: dict[str, str] = {
     ApiCategory.READ: "查询详情",
-    ApiCategory.EXPORT: "导出数据",
-    ApiCategory.AUTH: "认证操作",
+    ApiCategory.EXPORT: "",
+    ApiCategory.AUTH: "",
     ApiCategory.CREATE: "创建测试数据",
     ApiCategory.UPDATE: "修改测试数据",
     ApiCategory.UPLOAD: "上传测试文件",

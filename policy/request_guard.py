@@ -142,7 +142,9 @@ def classify_request(
         if _rank(cat) > worst_rank:
             worst, worst_rank = cat, _rank(cat)
 
-    path = urlparse(url or "").path or "/"
+    # 路径同样规范化（第四轮整改 #5）：编码变体（%65xport、%2Fexport）
+    # 不得逃过分类信号——先摊平再匹配，识别与范围比对同一把尺子。
+    path = normalize_url_path(urlparse(url or "").path or "/")
     low_path = path.lower()
 
     # ── 维度 1：URL 路径 ─────────────────────────────────────────
@@ -258,9 +260,60 @@ def _map_command(category: str, signals: list[str]) -> str:
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+# ── URL 路径规范化（第四轮整改 #5：防路径前缀绕过）──────────────────
+# 攻击者可以用编码与点段让"前缀比对"看走眼：
+#   /app/%2e%2e/other   → 百分号编码的 ..，字面量前缀比对会判"在 /app 内"
+#   /app/..%2fother     → 同上变体
+#   /app//other         → 双斜杠折叠出与登记不同的路径形态
+#   /app/./other        → 点段冗余
+#   /app\other          → 反斜杠在部分服务端等价 /
+#   /app/sub/           → 尾斜杠不影响同一资源
+# 一律先规范化成**真实语义路径**再做前缀比对，绕过形态在比对前就被摊平。
+
+_MAX_UNQUOTE = 3  # 重复解码上限（%252e → %2e → . 的多层编码）
+
+
+def normalize_url_path(path: str) -> str:
+    """URL 路径规范化：多层解码 → 反斜杠归一 → 折叠斜杠 → 解析点段。
+
+    返回以 ``/`` 开头的规范化路径。解析失败按根路径处理（fail-closed：
+    与 in_scope 的"解析失败 = 出界"同向，不会因规范化异常而放行）。
+    """
+    p = path or "/"
+    try:
+        from urllib.parse import unquote
+
+        for _ in range(_MAX_UNQUOTE):
+            dec = unquote(p)
+            if dec == p:
+                break
+            p = dec
+    except Exception:  # noqa: BLE001 —— 解码失败按原样继续（后续仍会滤点段）
+        pass
+    p = p.replace("\\", "/")
+    # 折叠连续斜杠
+    while "//" in p:
+        p = p.replace("//", "/")
+    # 解析 . / .. 点段（逐段扫描，.. 弹出上一段；越界弹出按根处理）
+    segs: list[str] = []
+    for seg in p.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if segs:
+                segs.pop()
+            continue
+        segs.append(seg)
+    return "/" + "/".join(segs)
+
 
 def _endpoint(url: str) -> tuple[str, str, int, str] | None:
-    """URL → (scheme, hostname, port, path)，全部规范化。解析失败返回 None。"""
+    """URL → (scheme, hostname, port, path)，全部规范化。解析失败返回 None。
+
+    path 经 :func:`normalize_url_path` 规范化（第四轮整改 #5）：编码的 ``..``、
+    双斜杠、点段冗余在前缀比对之前摊平，``/app/%2e%2e/other`` 不会再
+    被字面量前缀比对误判为"在 /app 内"。
+    """
     try:
         p = urlparse(url or "")
         scheme = (p.scheme or "").lower()
@@ -272,7 +325,7 @@ def _endpoint(url: str) -> tuple[str, str, int, str] | None:
         return None
     if port is None:
         port = _DEFAULT_PORTS.get(scheme, 0)
-    return scheme, host, port, p.path or "/"
+    return scheme, host, port, normalize_url_path(p.path or "/")
 
 
 def in_scope(url: str, bound_target: str) -> bool:
@@ -590,8 +643,6 @@ _CATEGORY_FOR_COMMAND: dict[str, str] = {
     "批量删除": ApiCategory.DELETE,
     "查询详情": ApiCategory.READ,
     "查询列表": ApiCategory.READ,
-    "导出数据": ApiCategory.EXPORT,
-    "认证操作": ApiCategory.AUTH,
     "创建测试数据": ApiCategory.CREATE,
     "修改测试数据": ApiCategory.UPDATE,
 }
