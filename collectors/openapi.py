@@ -133,12 +133,10 @@ class OpenApiCollector:
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            from core.proxy import build_client_kwargs
+            from core.gateway import gateway_client
 
-            # 代理决策收敛到 core/proxy.py：默认全部目标都走代理。
-            self._client = httpx.AsyncClient(
-                **build_client_kwargs(self.cfg, self._base_url)
-            )
+            # 客户端构造统一收敛到 core.gateway（代理/超时/UA 全工程同一份）
+            self._client = gateway_client(self.cfg, self._base_url)
         return self._client
 
     async def aclose(self) -> None:

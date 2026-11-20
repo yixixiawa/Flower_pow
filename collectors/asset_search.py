@@ -247,16 +247,13 @@ async def search_assets(
     assets: list[Asset] = []
     errors: list[str] = []
     seen: set[tuple[str, str]] = set()
-    # 客户端参数统一走 core/proxy.build_client_kwargs（含 timeout/proxy/UA）——
-    # **不要再单独传 timeout**：build_client_kwargs 里已经有一份，重复传
-    # 会 TypeError（这个坑本测试的 MockTransport 第一次就跑出来了）。
+    # 客户端统一从 core.gateway 构造（全工程唯一 httpx 构造点）；
+    # 代理/超时/UA 仍走 core/proxy.build_client_kwargs，不另立一套。
     # cfg 为空（直接当库调用）时给一份最小配置，不碰代理决策。
-    if cfg is not None:
-        client_kw = build_client_kwargs(cfg, "https://quake.360.net")
-    else:
-        client_kw = {"timeout": 15.0, "trust_env": False}
     try:
-        async with httpx.AsyncClient(**client_kw) as client:
+        from core.gateway import gateway_client
+
+        async with gateway_client(cfg, "https://quake.360.net") as client:
             for p in avail:
                 try:
                     got, err = await _DISPATCH[p](client, q, limit)

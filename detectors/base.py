@@ -164,6 +164,10 @@ class Detector(ABC):
         self._policy_bound: str = ""       # 首个请求绑定范围（scheme://netloc）
         self.policy_blocked = 0            # 被策略拦截的请求数（可观测）
         self.policy_notes: list[str] = []  # 拦截原因（进探测器 notes / 报告）
+        # 统一出口（第七轮整改）：所有目标面请求经 core.gateway.HttpGateway
+        # 发出——重定向逐跳复检 + 拒绝事件写审计。懒创建。
+        self._gateway = None
+        self._policy_audit = None
         # 当前探测类别（sqli/rce/fileread/upload）——批量 sweep 时由探测
         # 器写入，作为 POC 声明维度进分类（payload 编码与否都逃不过类别）。
         self._current_kind = ""
@@ -248,6 +252,52 @@ class Detector(ABC):
             return ""
         return f"权限矩阵拒绝：{d.command or '未知操作'} → {d.decision}（{d.reason}）"
 
+    # ── 统一 Gateway（第七轮整改）─────────────────────────────────
+    def _policy_audit_sink(self):
+        """探测器路径的策略审计器（懒创建，写同一份 audit.jsonl）。
+
+        此前探测器被拦的请求只在内存计数里——"拦住了"这件事不可追溯。
+        审计失败不抛异常（PolicyAudit 自己吞），不阻断扫描。
+        """
+        if self._policy_audit is None:
+            from policy.audit_logger import PolicyAudit
+
+            enabled = bool(getattr(getattr(self.cfg, "policy", None), "audit", True))
+            self._policy_audit = PolicyAudit(
+                getattr(self.cfg, "data_dir", "") or "./data", enabled=enabled
+            )
+        return self._policy_audit
+
+    def gateway(self):
+        """取统一出口（懒创建，一个探测器一份，复用连接池）。"""
+        if self._gateway is None:
+            from core.gateway import HttpGateway
+
+            self._gateway = HttpGateway(
+                self.cfg,
+                self._gateway_check,
+                audit=self._policy_audit_sink(),
+                target_id=str(getattr(self.cfg, "target_id", "") or ""),
+            )
+        return self._gateway
+
+    async def _gateway_check(self, url: str, method: str, body: str, approved: bool) -> str:
+        """Gateway 的默认检查器（无 POC 上下文时）。"""
+        return await self._policy_check(url, method, body, None, policy_approved=approved)
+
+    def _make_gateway_checker(self, poc: "POC | None", policy_approved: bool):
+        """按本次请求的 POC 上下文生成检查器——**逐跳**调用。
+
+        不能把 poc 存到 self 上：一个探测器会并发跑多条 POC，实例级
+        状态会被别的协程覆盖（分类维度错乱）。闭包按调用隔离。
+        """
+        async def checker(url: str, method: str, body: str, approved: bool) -> str:
+            return await self._policy_check(
+                url, method, body, poc, policy_approved=policy_approved or approved,
+            )
+
+        return checker
+
     # ── HTTP 客户端 ──────────────────────────────────────────────
     def client(self, url: str = "") -> httpx.AsyncClient:
         """取 HTTP 客户端。
@@ -257,7 +307,8 @@ class Detector(ABC):
         若后续请求换了主机（跨主机的检测器），代理决策与已建好的客户端不一致，
         此时**重建客户端**——比"用错代理静默扫描"要安全得多。
         """
-        from core.proxy import build_client_kwargs, resolve_proxy_for
+        from core.gateway import gateway_client
+        from core.proxy import resolve_proxy_for
 
         host = ""
         if url:
@@ -282,9 +333,9 @@ class Detector(ABC):
             # 代理决策统一收敛到 core/proxy.py：显式配置 > 自动探测到的代理。
             # 默认**全部目标都走代理**（内网也走），这样挂了 Burp/Clash
             # 就能看到全部流量——内网/本机也不拦截。
-            self._client = httpx.AsyncClient(
-                **build_client_kwargs(self.cfg, url or self._client_url_hint)
-            )
+            # 构造点唯一收敛到 core.gateway.gateway_client（第七轮整改）：
+            # 全工程不得再有第二个 httpx 客户端构造点。
+            self._client = gateway_client(self.cfg, url or self._client_url_hint)
             self._client_proxy = wanted
         return self._client
 
@@ -295,6 +346,8 @@ class Detector(ABC):
             await self._client.aclose()
             self._client = None
         self._client_proxy = None
+        if self._gateway is not None:
+            await self._gateway.aclose()
 
     async def __aenter__(self) -> "Detector":
         return self
@@ -334,26 +387,17 @@ class Detector(ABC):
         的 license 注释——压缩 bundle 动辄几百 KB，接口路径全在后面。
         JS 分析传 ``cfg.js_max_bytes``（默认 2MB）。
 
-        **统一安全入口（第六轮整改 P0-2/P0-5）**：发出前过
-        :meth:`_policy_check`——目标范围 + 操作分类 + 环境绑定逐请求
-        约束，被拦请求不触网，返回带 ``error`` 的 Evidence（error 以
-        ``【策略拦截】`` 开头，调用方可识别）；拦截计数与原因进
-        ``policy_blocked`` / ``policy_notes``。
+        **统一安全入口（第六轮整改 P0-2/P0-5 + 第七轮统一 Gateway）**：
+        请求经 :class:`core.gateway.HttpGateway` 发出——**每一跳**（含
+        重定向后的跳）发出前都重新过 :meth:`_policy_check`：目标范围 +
+        操作分类 + 环境绑定。被拦请求不触网，返回带 ``error`` 的
+        Evidence（以 ``【策略拦截】`` 开头）；拦截计数进 ``policy_blocked``，
+        拒绝事件由 Gateway 写入策略审计（探测器路径同样可追溯）。
         ``policy_approved`` 仅用于上传类 REVIEW（探测器 approver 已对
         该次上传逐请求人工审批后传入），不能放行 L3/DENY/UNKNOWN。
         """
-        # ── 策略前置：被拦请求根本不建客户端、不触网 ──────────────────
         # 有效性方法先定（POC 声明的 method 优先），分类按真实要发的请求算
         method = (poc.request.method if poc else method) or method
-        block = await self._policy_check(
-            url, method, body, poc, policy_approved=policy_approved,
-        )
-        if block:
-            self.policy_blocked += 1
-            self.policy_notes.append(f"{method} {url[:80]} → {block[:160]}")
-            ev = Evidence(url=url, method=method, request_headers=dict(headers or {}))
-            ev.error = f"【策略拦截】{block}"
-            return ev
         req_headers = dict(poc.request.headers if poc else {})
         req_headers.update(headers or {})
 
@@ -368,13 +412,26 @@ class Detector(ABC):
             ev.expected = _expect_of(poc)
         started = time.perf_counter()
         try:
-            resp = await self.client(url).request(
-                method, url, headers=req_headers, content=body or None
+            res = await self.gateway().request(
+                method, url,
+                headers=req_headers,
+                content=body or None,
+                checker=self._make_gateway_checker(poc, policy_approved),
+                approved=policy_approved,
             )
         except Exception as exc:  # noqa: BLE001
             ev.error = f"{type(exc).__name__}: {exc}"
             ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
             return ev
+
+        if res.blocked or res.response is None:
+            # 被拦请求**一跳都没发出去**（或在重定向第 N 跳被拦）
+            self.policy_blocked += 1
+            self.policy_notes.append(f"{method} {url[:80]} → {res.reason[:160]}")
+            ev.error = f"【策略拦截】{res.reason}"
+            ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return ev
+        resp = res.response
 
         ev.elapsed_ms = int((time.perf_counter() - started) * 1000)
         ev.status_code = resp.status_code

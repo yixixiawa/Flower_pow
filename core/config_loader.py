@@ -51,6 +51,9 @@ class ScanConfig(BaseModel):
     # model_post_init 回填（同一 PolicyConfig 对象，不序列化）。
     # None = 独立构造的 ScanConfig（测试/库调用）→ 环境按 unknown 处理。
     policy: "PolicyConfig | None" = Field(default=None, exclude=True, repr=False)
+    # 策略审计落盘目录——Detector 统一 Gateway 的拒绝留痕写这里
+    # （由 Config.model_post_init 从 data_dir 回填，独立构造时为 ""）。
+    data_dir: str = Field(default="")
     # 代理例外表：命中的主机会**直连**，不走 proxy。
     # 这是**唯一**的直连出口——用户自己写进配置的显式声明，
     # 不是从 Windows 注册表 ProxyOverride 里继承来的副作用。
@@ -248,6 +251,10 @@ class Config(BaseModel):
         # 运行期改 policy.environments 对探测器立即可见，不存在两份漂移。
         if getattr(self.scan, "policy", None) is None:
             self.scan.policy = self.policy
+        # 探测器侧审计目录与主配置一致：拒绝事件必须落进同一份
+        # <data_dir>/policy/audit.jsonl，复盘才能按轮次对账。
+        if not getattr(self.scan, "data_dir", ""):
+            self.scan.data_dir = self.data_dir
     data_dir: str = Field(default="./data")
 
 

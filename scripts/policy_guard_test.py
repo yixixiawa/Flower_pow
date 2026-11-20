@@ -1367,54 +1367,79 @@ def test_round6() -> None:
            "回调返回的真实身份进审批审计（authenticated_approver=True）")
 
         # ── P0-2：Detector.send_request 统一安全入口（不靠 Runner 工具名）─
+        # 第七轮整改：断言从"函数返回值"升级为**真实网络行为**——用本地
+        # Mock Server 统计命中数，验证放行真的发出、拦截真的零触网。
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
         from detectors.http_detector import HttpDetector
 
-        class _FakeResp:
-            def __init__(self) -> None:
-                self.status_code = 200
-                self.headers = {"content-type": "text/html"}
-                self.content = b"hello"
+        hits: list[str] = []
 
-        class _FakeClient:
-            async def request(self, method, url, headers=None, content=None):  # noqa: ANN001
-                return _FakeResp()
+        class _H(BaseHTTPRequestHandler):
+            def _hit(self) -> None:  # noqa: ANN202
+                hits.append(f"{self.command} {self.path}")
+                raw = b'{"id": "obj-1"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
 
-        det = HttpDetector(cfg.scan)
-        det.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
-        # 绑定范围 = 首个请求；正常 GET 放行且真实发出
-        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list"))
-        ok(not ev.error and ev.status_code == 200, "Detector 正常只读 GET → 放行并发出")
-        # sqli 类别（_current_kind）→ L3 → 拦截，不触网
-        det._current_kind = "sqli"
-        ev = asyncio.run(det.send_request("http://127.0.0.1:8080/api/list?id=1"))
-        ok(ev.error and ev.error.startswith("【策略拦截】") and "SQL 注入验证" in ev.error,
-           "Detector sqli 探针请求 → L3 拦截（统一安全入口，不靠工具名）")
-        ok(det.policy_blocked == 1 and det.policy_notes, "拦截计数与原因可观测")
-        # 跨主机出界 → 拦截
-        det._current_kind = ""
-        ev = asyncio.run(det.send_request("http://10.9.9.9/api/list"))
-        ok(ev.error and "超出" in ev.error, "Detector 跨主机请求 → 范围拦截")
-        # 非法协议 → 拦截
-        ev = asyncio.run(det.send_request("ftp://127.0.0.1/x"))
-        ok(ev.error and "非法" in ev.error, "Detector ftp:// 目标 → 拦截")
-        # unknown 环境：POST 写语义 → 拦截
-        det_u = HttpDetector(cfg_u.scan)
-        det_u.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
-        ev = asyncio.run(det_u.send_request("http://127.0.0.1:8080/api/items",
-                                            method="POST", body="a=1"))
-        ok(ev.error and "【策略拦截】" in ev.error,
-           "Detector unknown 环境 POST → 拦截（unknown 仅明确只读）")
-        # 上传类：dedicated 环境 + 探测器审批通道 → policy_approved 通路
-        det_d = HttpDetector(_cfg_with(environments={"127.0.0.*": Environment.DEDICATED_TEST}).scan)
-        det_d.client = lambda url="": _FakeClient()  # type: ignore[method-assign]
-        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
-                                            body="--b\r\ncontent-disposition: form-data"))
-        ok(ev.error and "【策略拦截】" in ev.error,
-           "Detector 上传（L2 REVIEW）无逐请求审批 → 拦截")
-        ev = asyncio.run(det_d.send_request("http://127.0.0.1:8080/upload", method="POST",
-                                            body="--b\r\ncontent-disposition: form-data",
-                                            policy_approved=True))
-        ok(not ev.error, "Detector 上传（L2 REVIEW）+ 逐请求审批标记 → 放行")
+            do_GET = do_POST = _hit
+
+            def log_message(self, *a: object) -> None:  # noqa: ANN002
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        srv_base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            det = HttpDetector(cfg.scan)
+            # 绑定范围 = 首个请求；正常 GET 放行且真实发出（服务器有命中）
+            ev = asyncio.run(det.send_request(f"{srv_base}/api/list"))
+            ok(not ev.error and ev.status_code == 200, "Detector 正常只读 GET → 放行并发出")
+            ok(len(hits) == 1, "Detector 放行的 GET 真实到达目标（Mock Server 计数=1）")
+            # sqli 类别（_current_kind）→ L3 → 拦截，不触网
+            det._current_kind = "sqli"
+            ev = asyncio.run(det.send_request(f"{srv_base}/api/list?id=1"))
+            ok(ev.error and ev.error.startswith("【策略拦截】") and "SQL 注入验证" in ev.error,
+               "Detector sqli 探针请求 → L3 拦截（统一安全入口，不靠工具名）")
+            ok(len(hits) == 1, "被拦的 sqli 请求零触网（Mock Server 计数不变）")
+            ok(det.policy_blocked == 1 and det.policy_notes, "拦截计数与原因可观测")
+            # 拦截事件必须写进策略审计（探测器路径不得只活在内存计数里）
+            audit_path = Path(td) / "policy" / "audit.jsonl"
+            ok(audit_path.exists() and '"event": "deny"' in audit_path.read_text(encoding="utf-8"),
+               "Detector 拦截事件写入 policy/audit.jsonl（可追溯）")
+            # 跨主机出界 → 拦截
+            det._current_kind = ""
+            ev = asyncio.run(det.send_request("http://10.9.9.9/api/list"))
+            ok(ev.error and "超出" in ev.error, "Detector 跨主机请求 → 范围拦截")
+            # 非法协议 → 拦截
+            ev = asyncio.run(det.send_request("ftp://127.0.0.1/x"))
+            ok(ev.error and "非法" in ev.error, "Detector ftp:// 目标 → 拦截")
+            # unknown 环境：POST 写语义 → 拦截
+            det_u = HttpDetector(cfg_u.scan)
+            ev = asyncio.run(det_u.send_request(f"{srv_base}/api/items",
+                                                method="POST", body="a=1"))
+            ok(ev.error and "【策略拦截】" in ev.error,
+               "Detector unknown 环境 POST → 拦截（unknown 仅明确只读）")
+            # 上传类：dedicated 环境 + 探测器审批通道 → policy_approved 通路
+            det_d = HttpDetector(
+                _cfg_with(environments={"127.0.0.*": Environment.DEDICATED_TEST}).scan
+            )
+            before = len(hits)
+            ev = asyncio.run(det_d.send_request(f"{srv_base}/upload", method="POST",
+                                                body="--b\r\ncontent-disposition: form-data"))
+            ok(ev.error and "【策略拦截】" in ev.error,
+               "Detector 上传（L2 REVIEW）无逐请求审批 → 拦截")
+            ev = asyncio.run(det_d.send_request(f"{srv_base}/upload", method="POST",
+                                                body="--b\r\ncontent-disposition: form-data",
+                                                policy_approved=True))
+            ok(not ev.error, "Detector 上传（L2 REVIEW）+ 逐请求审批标记 → 放行")
+            ok(len(hits) == before + 1, "审批放行的上传真实到达目标（仅 1 次触网）")
+        finally:
+            srv.shutdown()
 
         # ── P2：CLI / MCP / Agent / 后台任务的策略入口一致性（静态回归）──
         root = Path(__file__).resolve().parent.parent
@@ -1430,8 +1455,10 @@ def test_round6() -> None:
             if kw not in (root / rel).read_text(encoding="utf-8", errors="ignore")
         ]
         ok(not missing, f"CLI/MCP/Agent/子域入口全部走 active_scan_check：{missing}")
-        ok("build_client_kwargs" in (root / "detectors/base.py").read_text(encoding="utf-8"),
+        ok("gateway_client" in (root / "detectors/base.py").read_text(encoding="utf-8"),
            "Detector HTTP 客户端走统一代理出口（覆盖率）")
+        ok("httpx.AsyncClient(" not in (root / "detectors/base.py").read_text(encoding="utf-8"),
+           "Detector 不再直接构造 httpx 客户端（构造点收敛到 core.gateway）")
         # 内置工具闸门接线（Agent 路径）：_POLICY_TOOLS 覆盖全部目标请求工具
         from core.tools.runner.base import _ToolRunnerBase
 
