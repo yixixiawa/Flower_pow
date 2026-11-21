@@ -299,6 +299,12 @@ class Detector(ABC):
             environment=guard.environment_for(url_n),
             identity_bound=bool(bound),
             identity=f"detector|{bound or '-'}",
+            # 频率计数责任（guardschedule5 第三章第 6 条）：检测器是**批量
+            # 打点**，它发出的凭证提交与 Runner/Planner 的一次登录不是同一
+            # 个请求，因此用自己的桶（``detector|<目标>``）计数——不共享、
+            # 也不占用会话的登录配额，避免"探测器把登录预算烧掉"或同一
+            # 请求被两处各扣一次。计数点仍在 AuthBootstrap.check 里，
+            # 没有被关闭（第 7 条：不得靠关闭 Detector 策略检查来省计数）。
             session_id=f"detector|{bound or '-'}",
             auth_entries=auth_registry.entries_for(self.cfg, bound),
             credentials_present=False,

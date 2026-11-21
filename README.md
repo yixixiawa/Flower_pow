@@ -196,7 +196,7 @@ flower_pow ask "shiro deserialization"         # retrieval only, no network traf
 
 #### In-session commands
 
-All 26 are tab-completable.
+All 36 are tab-completable.
 
 ```
 /target [URL]     set or show the target      /status          current state
@@ -208,6 +208,7 @@ All 26 are tab-completable.
 /next  /run       advance / one more round    /poll            run until exhausted
 /backfill         backfill raw traffic        /auto            fully automatic
 /resume [id]      load a session              /sessions        list resumable sessions (space+Tab for all)
+/history [sub]    event-log archive           /history list|show|export|search|summary|resume|prune
 /reset            wipe and start over         /clean           drop empty sessions
 /key              reset the API key           /title           rename the session
 /chats            conversation history         /kickoff         model introduces itself
@@ -218,6 +219,27 @@ Two rules worth remembering:
 
 - Setting a **different** target clears the previous target's assets, findings, credentials, conversation history and runtime caches. Report cross-contamination almost always comes from here; re-setting the same target leaves data untouched.
 - `/reset` discards the old session and deletes its snapshot — there is no half-measure that keeps assets and drops the conversation.
+
+#### Conversation archive: event log + Markdown retrospective
+
+Every session also writes an append-only event log next to its snapshot — the snapshot stores *state*, the log stores *what happened*:
+
+```
+data/conversations/YYYY/MM/session_<id>/
+  events.jsonl     结构化事件（USER_MESSAGE / TOOL_CALL / TOOL_RESULT / POLICY_DECISION /
+                   TASK_* / FINDING_CREATED / REPORT_CREATED / SESSION_RESUMED）
+  conversation.md  从事件流重渲染的完整对话（八章：背景 / 对话 / 工具 / 策略 / 发现 / 失败 / 结论 / 后续）
+  summary.md       复盘摘要（统计得出，与原始记录分开存放）
+  artifacts/       超过 4000 字符的工具结果（Markdown 里只留路径 + SHA256 + 大小 + 摘要）
+  meta.json        目标 / 环境 / 状态 / 计数
+```
+
+Four properties that matter:
+
+- **Idempotent**: `event_id` is the key. Re-running a save, resuming a task or restarting the process never duplicates an event.
+- **Crash-safe**: each event is appended with `flush + fsync`; a half-written line is reported by `verify()` instead of silently swallowing the next event.
+- **Redacted before it hits disk**: passwords, tokens, cookies and `Authorization` headers are masked *before* persistence (JSON, form-encoded and Chinese prose forms).
+- **Resume restores knowledge, never authority**: `/history resume` injects visible dialogue, confirmed findings and artifact references as **read-only context**. Targets, environments, approval tickets and credentials are deliberately **not** restored — they must be re-confirmed.
 
 #### Playbooks
 
@@ -393,6 +415,10 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 硬约束：
 
 * **目标范围**：请求 URL 必须落在绑定目标的授权范围内——scheme、hostname、**端口**规范化比较，绑定目标带路径前缀时请求路径不得越出；出界按"未绑定"拒绝。
+* **空环境 = unknown**：`decide(environment="")` 不会再被当成"环境已绑定"——空串与 `unknown` 同一结论，L0 的"仅明确只读"照旧生效。
+* **分类只加严不加宽**：URL / Method / 参数 / 请求体 / POC 声明 / 历史行为任一维度识别出更高风险就按更高风险判（GET 打 `drop table` 也是 L3）；未知 Method、未识别分类一律 UNKNOWN，**不降级成 READ**；EXPORT / AUTH 保持独立分类且**没有矩阵授权行**（映射空串 → UNKNOWN）。
+* **单一权威映射**：分类→命令只有 `COMMAND_FOR_CATEGORY` 一份，命令→等级只查矩阵（`command_level` / `worst_command`）；`check_request` / `check_tool` / `check_builtin` / `check_probe` 四个入口全部复用它，不各写一套"哪个更严"。
+* **审批只解锁 L2**：`_review_or_allow` 是 ALLOW / REVIEW / DENY 的唯一收口，**DENY / UNKNOWN / L3 永不进入审批**。
 * **没有配置级审批**：`policy.approvals` 不再生效。审批只存在于运行期，**逐请求、绑定具体对象 URL**——参数一变就必须重新审批。
 * **对象台账**：只有**执行成功并从响应取得对象标识**的创建/上传才会登记，按 目标 + 轮次 + 账号身份 + 对象标识 四元组匹配；未登记的对象**一律删不掉**——审批是第二道门，不能替代对象身份验证。
 * **审计是写操作的先决条件**：审计 JSONL 无法持久化时，写操作与审批**拒绝执行**；只读操作放行但状态行可见告警。
@@ -410,17 +436,19 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 | ④ 入口 | URL 必须命中**已登记**的认证入口——登记只来自两个地方：接口清单（`recon_openapi`）与登记表（`config.yaml` 的 `policy.auth_endpoints` / REPL `/auth register`）。路径关键词（末段含 `login`）只产生**候选提示，不构成授权**（guardschedule3.md） |
 | ⑤ 方法 | 以登记为准：清单条目取接口定义；登记表条目 login / refresh / logout 固定 POST、captcha 固定 GET（语义方法不开放配置） |
 | ⑥ 参数 | 字段 ⊆ 接口声明 ∪ 认证字段词表，且必须带凭证字段；越界字段直接拒 |
-| ⑦ 频率 | 滑动窗口 + 最小间隔（默认 5 次 / 60s） |
+| ⑥b 用途 | **AUTH 是用途分类，不是风险豁免**：本次请求带删除 / 批量删除 / 上传 / 命令执行 / SQL 注入 / 定时任务 / 导出信号 → 回矩阵按更高风险判（多半 L3）。反向同理：删除类端点**不能**登记成认证入口（写入前就拒） |
+| ⑦ 频率 | 滑动窗口 + 最小间隔（默认 5 次 / 60s）；**一次真正发出的凭证提交只计一次配额**（工具级意图判定不计，Detector 用自己的桶） |
 | ⑧ 凭证 | 不进工具输出、不进审计明文（统一脱敏） |
 | ⑨ 登录成功 | **不产生任何"已登录"放行状态**（纯函数判定，无会话级开关） |
 | ⑩ 后续请求 | 照旧走 API Policy + GUARD（导出/写/删除该拒还是拒） |
 
-两级判定：**工具级**（`check_intent`：会话/环境/背景/入口存在/频率）+ **请求级**（`check`：URL 匹配 + 方法 + 参数结构）。`Authenticator` 发出的每一个请求（含验证码 GET）都要过 `precheck`，剧本路径（Planner）与 Agent 路径（`login` 工具）同一结论。
+两级判定：**工具级**（`check_intent`：会话/环境/背景/入口存在，不消耗配额）+ **请求级**（`check`：URL 匹配 + 方法 + 参数结构 + 用途复核 + 计一次频率）。`Authenticator` 发出的每一个请求（含验证码 GET）都要过 `precheck`，剧本路径（Planner）与 Agent 路径（`login` 工具）同一结论。
 
 想让登录通过：先在 `policy.environments` 里把目标绑到 `isolated_test`，然后让端点**进入登记**——授权是配置驱动的，不是关键词驱动的：
 
 * **接口清单**：`recon_openapi` 拿到清单，清单里的认证端点自动算已登记；
-* **登记表**：在 `config.yaml` 的 `policy.auth_endpoints` 里加一条 `{target, kind, url, method}`，或 REPL 里 `/auth register <url> [kind]` 逐条确认（持久化到 `data/policy/auth_endpoints.yaml`）；
+* **登记表**：在 `config.yaml` 的 `policy.auth_endpoints` 里加一条 `{target, kind, url, method}`，或 REPL 里 `/auth register <url> [kind] [用途说明]` 逐条确认（持久化到 `data/policy/auth_endpoints.yaml`，每次登记/注销都写一条 `registry` 审计）；
+* **非标准登录路径照样可登记**：`/api/v2/ticket` 这类不含 `login/auth/token` 关键词的端点，只要显式登记就能走 AUTH_BOOTSTRAP——关键词识别**不参与**授权，登记事实只决定"走哪条通道"，能不能放行仍由十条前置条件决定；
 * 未登记的端点即使路径含 `login` 也**拒绝**，拒绝文本给出候选提示与登记方法——提示本身不产生任何放行。
 
 缺任何一条条件，拒绝文本会说清是哪一条。
@@ -534,7 +562,7 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 
 #### 会话内命令
 
-32 个，全部 Tab 可补全。
+36 个，全部 Tab 可补全。
 
 ```
 /target [URL]    设定或查看目标              /status          当前状态
@@ -546,6 +574,7 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 /next  /run      推进 / 再跑一轮             /poll            跑到穷尽
 /backfill        从历史回填原始报文           /auto            一键全自动
 /resume [id]     载入会话                    /sessions        可恢复会话列表（空格+Tab 出全部会话名）
+/history [子命令] 事件流归档（list/show/export/search/summary/resume/prune/save）
 /read <路径>     授权并读取一个本地文件      /files           已授权文件清单（--drop / --clear）
 /plan <目标>     只读分析 → 生成执行计划     /approve y|n     确认这份计划（一次性票据）
 /work            执行已确认的计划            /reject          拒绝当前计划（终态）
@@ -559,6 +588,38 @@ flower_pow ask "shiro 反序列化"                 # 只做检索，不发请�
 
 - `/target` 换成**不同**目标时，上一目标的资产、发现、凭证、对话历史、运行期缓存**整体清空**。报告串线的根源大多在这里；同一目标重复设定不动数据。
 - `/reset` 是彻底换一个新的，连盘上快照一起删——不做「清对话保留资产」这种半吊子。
+
+#### 历史会话归档：事件流 + Markdown 复盘
+
+快照存的是**状态**，归档存的是**过程**。每个会话一边写 `session.json`，一边往
+`data/conversations/YYYY/MM/session_<id>/` 追加事件流：
+
+```
+events.jsonl     结构化事件（USER_MESSAGE / TOOL_CALL / TOOL_RESULT / POLICY_DECISION /
+                 TASK_STARTED|COMPLETED|FAILED / FINDING_CREATED / REPORT_CREATED / SESSION_RESUMED）
+conversation.md  从事件流重渲染的完整对话（八章：背景 / 对话 / 工具 / 策略 / 发现 / 失败 / 结论 / 后续）
+summary.md       复盘摘要（只做统计与归类，与原始记录分开存放，不覆盖原始记录）
+artifacts/       超过 4000 字符的工具结果（Markdown 只留路径 + SHA256 + 大小 + 摘要）
+meta.json        目标 / 环境 / 状态 / 计数
+```
+
+四条硬性质：
+
+- **幂等**：`event_id` 是主键。重复 `/history save`、任务恢复、进程重启都不会把同一件事记两遍。
+- **崩溃可读**：每条事件 `flush + fsync` 落盘；写到一半被杀的坏行由 `verify()` 报出来，且**不会吞掉后续事件**（追加前自动补换行）。
+- **先脱敏后落盘**：密码 / Token / Cookie / Authorization 在写 JSONL **之前**就替换（JSON、表单、中文口语三种形态），不是导出时才遮。
+- **恢复只给知识，不给权限**：`/history resume` 注入的是可见对话、已确认发现与 artifact 引用，作为**只读上下文**；目标、环境、审批票据、凭证一律不还原，必须重新确认。
+
+```
+› /history                 当前会话归档状态（事件数 / 损坏行 / 写入错误）
+› /history list            全部历史会话（Tab 可补出真实目录名）
+› /history show 3          摘要：目标 / 环境 / 事件构成 / 最近对话 / 发现
+› /history export 3        导出完整 Markdown（含工具调用与策略拦截明细）
+› /history search 越权     跨会话检索事件，带命中片段
+› /history summary 3       生成复盘摘要（结论 + 后续工作）
+› /history resume 3        历史当只读知识注入（**不恢复目标与授权**）
+› /history prune 90 200    保留策略：删 90 天前的，且只留最近 200 个
+```
 
 #### 常用打法（照抄即可）
 

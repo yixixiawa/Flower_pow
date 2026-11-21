@@ -293,7 +293,13 @@ def decide(
     绑定，操作为只读"：环境未绑定（unknown）时只放行明确只读操作，
     带任何写语义/注入 payload/批量特征的请求一律拒绝——unknown 不是
     "什么都行"，而是"只放行一眼就能确认无害的请求"。
+
+    ``environment=""``（guardschedule5 第二章）：**空串与 unknown 同义**。
+    空串此前会让 L0 分支的 unknown 检查整段跳过——调用方漏填环境就等于
+    拿到"环境已绑定"，这是纯粹的旁路。归一化成 UNKNOWN 后再判，
+    "没说环境"与"环境未知"是同一个结论：不猜。
     """
+    env = (environment or "").strip() or Environment.UNKNOWN
     rule = rule_for_command(command)
     if rule is None:
         return PolicyDecision(
@@ -333,7 +339,7 @@ def decide(
         # P1-1（第六轮整改）：L0 的环境绑定是真实条件——unknown 环境
         # 只放行**明确只读**操作（方法只读且七维度分类无更高风险信号）。
         # 带写语义或 payload 特征的请求在 unknown 环境一律拒绝。
-        if environment == Environment.UNKNOWN and not clearly_read_only:
+        if env == Environment.UNKNOWN and not clearly_read_only:
             base.reason = (
                 f"{rule.command}（L0）目标环境未绑定（unknown），"
                 "仅明确只读操作放行；本次请求带非只读语义/特征，拒绝执行"
@@ -346,11 +352,11 @@ def decide(
     if rule.command == "删除测试数据":
         # 单独审批 + 仅测试环境（测试环境允许删测试用户，
         # 不得推导为生产环境允许删除）
-        if environment == Environment.PRODUCTION:
+        if env == Environment.PRODUCTION:
             base.reason = f"{rule.command}（L2）目标为生产环境：测试环境的删除权限不得推导到生产"
             return base
-        if environment not in Environment.TEST_ENVS:
-            base.reason = f"{rule.command}（L2）目标环境未知（{environment}），视为不满足测试环境条件"
+        if env not in Environment.TEST_ENVS:
+            base.reason = f"{rule.command}（L2）目标环境未知（{env}），视为不满足测试环境条件"
             return base
         if not approved:
             base.decision = Decision.REVIEW
@@ -365,9 +371,9 @@ def decide(
         # 不满足"专门"条件，不得因 TEST_ENVS 包含 isolated_test 而放行）。
         # 且上传必须**逐请求审批**：dedicated_test 也先给 REVIEW，交
         # 运行期审批通道（绑 URL 的逐请求审批），审批通过才放行。
-        if environment != Environment.DEDICATED_TEST:
+        if env != Environment.DEDICATED_TEST:
             base.reason = (
-                f"{rule.command}（L2）目标环境为 {environment or '未知'}，"
+                f"{rule.command}（L2）目标环境为 {env}，"
                 "上传仅允许专门测试环境（dedicated_test），拒绝执行"
             )
             return base
@@ -380,12 +386,12 @@ def decide(
         return base
 
     # L1：仅隔离测试环境
-    if environment == Environment.ISOLATED_TEST:
+    if env == Environment.ISOLATED_TEST:
         base.decision = Decision.ALLOW
         base.reason = f"{rule.command}（L1）目标为隔离测试环境"
     else:
         base.reason = (
-            f"{rule.command}（L1）目标环境为 {environment or '未知'}，"
+            f"{rule.command}（L1）目标环境为 {env}，"
             "仅隔离测试环境允许，拒绝执行"
         )
     return base

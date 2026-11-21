@@ -38,7 +38,12 @@
 * ``url`` 必须是 http(s) 绝对 URL 或以 ``/`` 开头的路径，拒绝
   ``..`` / 控制字符 / 非 http 协议；
 * ``target`` 不能为空，且登记进 data 文件时要求与当前会话目标
-  匹配（REPL 层校验，防"登记到别的目标上"）。
+  匹配（REPL 层校验，防"登记到别的目标上"）；
+* **用途复核**（guardschedule5 第二章）：路径被判为删除/批量删除/上传/
+  命令执行/导出类的端点**不允许**登记成认证入口——错误登记在写入前就被
+  拒绝（执行期还会用同一套信号表再复核一次，双保险）；
+* 登记（放宽授权）**必须先写审计**：审计无法持久化就不登记；
+  注销（收紧授权）不因审计失败而阻止。
 
 本模块不做任何网络请求、不写任何放行状态——它只是把**人工确认过
 的授权事实**变成机器可读的表。
@@ -54,6 +59,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from policy.auth_bootstrap import AuthEndpoint, AuthKind
+from policy.request_guard import auth_risk_review
 
 __all__ = [
     "AUTH_ENTRY_FIELDS",
@@ -159,6 +165,20 @@ def validate_entry(raw: dict[str, Any], *, source: str) -> Entry:
             f"{kind} 入口的方法固定为 {want}（语义方法不开放配置），实际：{method}"
         )
 
+    # 用途复核（guardschedule5 第二章第 6-7 条）：登记只回答"谁认定它是
+    # 认证入口"，不能把一个删除/上传/命令执行/导出接口**变成**认证动作。
+    # 用与执行期复核同一套信号表（不另写规则）：命中即拒登，并说明该端点
+    # 本来应按哪条矩阵命令处理——错误登记在写入之前就拦住，不留到运行期。
+    # 注意：这里**不**看 URL 像不像登录（关键词不参与授权判定），只看
+    # "这个端点干的事是不是比认证初始化更危险"。
+    risk_cmd, risk_sigs = auth_risk_review(url)
+    if risk_cmd:
+        raise AuthRegistryError(
+            f"登记用途与端点语义冲突：{url} 的路径/参数被判为「{risk_cmd}」，"
+            "不是认证初始化端点（登录/刷新/登出/验证码），拒绝登记"
+            f"（命中信号：{'；'.join(risk_sigs[:2]) or risk_cmd}）"
+        )
+
     fields_raw = raw.get("fields") or []
     if not isinstance(fields_raw, (list, tuple)):
         raise AuthRegistryError("fields 必须是字段名列表")
@@ -260,10 +280,10 @@ def entries_for(cfg: Any, bound_target: str) -> tuple[AuthEndpoint, ...]:
                 url=_join_url(bound_target, ent.url),
                 method=ent.method,
                 fields=frozenset(ent.fields),
+                source=ent.source,
             )
-            # AuthEndpoint 没有 source 字段（frozen slots，动它要动全部
-            # 构造点）——来源进 url 的比对无关紧要，登记来源在注册表
-            # 文件与 config 里本身就是事实来源。
+            # source 随条目带进 AuthEndpoint（guardschedule5）：执行期
+            # 审计要能说明"这条入口是 config 写的还是用户 run 的时候确认的"。
             key = f"{ent.method} {ep.url}".lower()
             if key in seen:
                 continue
@@ -273,6 +293,45 @@ def entries_for(cfg: Any, bound_target: str) -> tuple[AuthEndpoint, ...]:
 
 
 # ── 登记 / 注销（REPL 用户确认通道） ───────────────────────────────
+
+
+def _audit_registry(
+    cfg: Any, *, action: str, ent: Entry | None = None,
+    url: str = "", kind: str = "", extra: dict[str, Any] | None = None,
+) -> bool:
+    """把"谁在什么时候登记/注销了哪条认证入口"写进审计（JSONL）。
+
+    返回是否**成功持久化**。授权类操作（登记 = 放宽 AUTH 入口）要求
+    可审计：调用方据此决定是否继续——审计写不进去就不登记
+    （与 P1-⑤"审批事件必须可持久化"同一口径）。注销是收紧动作，
+    调用方不因审计失败而阻止它。
+    """
+    try:
+        from policy.audit_logger import PolicyAudit
+        from policy.auth_bootstrap import AUTH_LEVEL
+
+        au = PolicyAudit(getattr(cfg, "data_dir", "") or "data")
+        payload: dict[str, Any] = {"action": action, "source": (ent.source if ent else "user")}
+        if ent is not None:
+            payload.update({
+                "target": ent.target, "kind": ent.kind, "method": ent.method,
+                "url": ent.url, "fields": list(ent.fields), "note": ent.note,
+            })
+        if extra:
+            payload.update(extra)
+        return au.log(
+            "registry",
+            command="认证入口登记",
+            level=AUTH_LEVEL,
+            decision=action.upper(),
+            category="AUTH",
+            url=(ent.url if ent else url),
+            target_id=(ent.target if ent else ""),
+            reason=f"{action} 认证入口：{(ent.kind + ' ' if ent else '')}{kind or ''}".strip(),
+            extra=payload,
+        )
+    except Exception:      # noqa: BLE001 —— 审计异常按"未持久化"处理
+        return False
 
 
 def register(
@@ -308,6 +367,14 @@ def register(
             return f"已登记过（target={old.target}），无需重复登记：{old.method} {old.url}"
     data.append(norm)
 
+    # 先审计后落盘：登记是"放宽认证入口"的授权动作，审计写不进去就不登记。
+    audited = _audit_registry(cfg, action="register", ent=ent)
+    if not audited:
+        raise AuthRegistryError(
+            "登记未生效：审计无法持久化（data/policy/audit.jsonl）。"
+            "授权类操作必须可审计——请检查数据目录写权限后重试"
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     import yaml
 
@@ -321,7 +388,7 @@ def register(
     fields_note = f"，fields={list(ent.fields)}" if ent.fields else ""
     return (
         f"已登记：{ent.kind} {ent.method} {ent.url}"
-        f"（target={ent.target}{fields_note}）→ {path}"
+        f"（target={ent.target}{fields_note}，来源 user）→ {path}"
     )
 
 
@@ -355,6 +422,10 @@ def unregister(cfg: Any, *, url: str, kind: str = "") -> str:
         )
     except OSError as exc:
         raise AuthRegistryError(f"登记文件写入失败（{path}）：{exc}") from exc
+    # 注销是收紧动作：审计写不进去也照样注销（不能因为日志问题留着授权）。
+    for item in removed:
+        _audit_registry(cfg, action="unregister", url=url, kind=kind,
+                        extra={"removed": item})
     return "已注销：" + "；".join(removed)
 
 

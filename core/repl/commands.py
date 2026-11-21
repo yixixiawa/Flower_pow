@@ -126,6 +126,8 @@ class _CommandMixin(_Base):
         self._plan_token = ""
         # 文件授权与目标无关（是用户给的输入），换目标时**保留**：
         # 同一份接口文档常常要对着几个目标看。只有 /reset 才清空。
+        # 归档跟着换身份：新 session_id = 新目录，旧会话的事件留在原地。
+        self._rebind_journal()
 
     def _reset(self, args: str = "") -> None:
         """彻底重置：销毁当前所有数据，开启全新会话。
@@ -161,7 +163,16 @@ class _CommandMixin(_Base):
             self.agent.reset()
         if self.runner is not None:
             self.runner.reset_target_scope()
+        # 新会话 = 新的归档目录。旧归档**不删**（那是历史记录，不是会话状态），
+        # 要清理用 /history prune 显式指定保留策略。
+        try:
+            self.session.bind_journal(
+                self._journal_root(), environment=self._policy_env()
+            )
+        except Exception:  # noqa: BLE001
+            pass
         print("✓ 已彻底重置。所有目标、资产、发现与上下文均已销毁。")
+        print("  （历史归档保留在 data/conversations/，需要清理用 /history prune）")
         self._refresh_completer()
 
     def _set_target(self, url: str) -> None:
@@ -416,7 +427,8 @@ class _CommandMixin(_Base):
             print(f"\n{target} 已登记 {len(eps)} 个认证入口：")
             for e in eps:
                 fields = f" fields={sorted(e.fields)}" if e.fields else ""
-                print(f"  {e.kind:8} {e.method:6} {e.url}{fields}")
+                print(f"  {e.kind:8} {e.method:6} {e.url}{fields}"
+                      f"  来源 {e.source or '未标注'}")
             return
 
         if sub == "raw":
@@ -448,12 +460,17 @@ class _CommandMixin(_Base):
 
         if sub == "register":
             if len(parts) < 2 or not target:
-                print("用法：/auth register <url> [kind]（kind 默认 login）")
+                print("用法：/auth register <url> [kind] [用途说明]（kind 默认 login）")
                 return
             url = parts[1]
             kind = (parts[2].lower() if len(parts) > 2 else "login")
+            # 用途说明随登记一起落盘（guardschedule5：登记要记录用途与来源）。
+            # 不写也行——默认记一条"REPL 用户确认登记"，来源永远是 user。
+            note = " ".join(parts[3:]).strip() or "REPL 用户确认登记"
             try:
-                print(auth_registry.register(self.cfg, target=target, url=url, kind=kind))
+                print(auth_registry.register(
+                    self.cfg, target=target, url=url, kind=kind, note=note,
+                ))
             except auth_registry.AuthRegistryError as exc:
                 print(f"[!] 登记被拒：{exc}")
             return

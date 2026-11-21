@@ -270,8 +270,10 @@ class Planner:
             )
 
         def precheck(url: str, method: str, body: str = "") -> str:
+            # 频率在**真正发请求的这一枪**计一次（guardschedule5 第三章）：
+            # 工具级意图判定（下面 auth_operation_allowed）不计配额。
             d = guard.check_auth(
-                url, method=method, body=body, ctx=ctx_for(url), count_rate=False,
+                url, method=method, body=body, ctx=ctx_for(url),
             )
             return "" if d.allowed else d.reason
 

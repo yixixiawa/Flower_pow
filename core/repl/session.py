@@ -33,6 +33,49 @@ class _SessionMixin(_Base):
         """
         return Path(self.cfg.data_dir) / "sessions"
 
+    def _journal_root(self) -> Path:
+        """历史归档根目录（``data/conversations``）。单点定义，同 ``_sessions_dir``。"""
+        from core.session import journal_root
+
+        return journal_root(self.cfg.data_dir)
+
+    def _policy_env(self) -> str:
+        """当前目标的测试环境（归档 meta 用）。
+
+        取策略层**现算**的结果，不在归档里另立一套判定——否则同一目标在
+        审计与归档里会显示成两个环境。判不出来就是 unknown，不猜。
+        """
+        try:
+            if self.runner is not None and self.session.target:
+                return str(self.runner.policy_guard.environment_for(self.session.target))
+        except Exception:  # noqa: BLE001 - 环境判定失败按未知处理
+            pass
+        return str(getattr(self.cfg.policy, "default_environment", "") or "unknown")
+
+    def _journal_event(self, event_type: str, **kw):
+        """给本会话记一条归档事件（归档未绑定时什么都不做）。"""
+        j = getattr(self.session, "journal", None)
+        if j is None:
+            return None
+        return j.record(event_type, **kw)
+
+    def _rebind_journal(self) -> None:
+        """会话身份变了（换目标 / 彻底重置）之后，把归档指到新目录。
+
+        ``session_id`` 就是归档目录名的一部分——不重绑的话，新会话的事件
+        会继续写进**旧会话的目录**，两个目标的过程记录混成一份。
+        """
+        if getattr(self.session, "journal", None) is None:
+            return
+        try:
+            self.session.bind_journal(
+                self._journal_root(),
+                environment=self._policy_env(),
+                phase=self.session.phase.value,
+            )
+        except Exception:  # noqa: BLE001 - 归档失败不影响会话切换
+            pass
+
     def _turns(self) -> None:
         if not self.session.turns:
             print("（还没有完成的轮次）")
@@ -107,6 +150,17 @@ class _SessionMixin(_Base):
         paths = [write_json(s.result, outdir, ai_body)]
         paths.append(write_markdown(s.result, outdir, ai_body))
         paths.append(write_html(s.result, outdir, ai_body))
+        # 归档：报告产出也是一条事件（第五章"发现与证据"旁边的交付凭证）
+        try:
+            self._journal_event(
+                "REPORT_CREATED",
+                content=f"导出报告 {len(paths)} 份：" + "、".join(p.name for p in paths),
+                execution_status="ok",
+                extra={"paths": [str(p) for p in paths],
+                       "findings": len(s.result.findings)},
+            )
+        except Exception:  # noqa: BLE001 - 归档失败不影响报告导出
+            pass
         print("\n报告已导出：")
         for p in paths:
             print(f"  {p}")
@@ -182,6 +236,24 @@ class _SessionMixin(_Base):
         self.session = prev
         self._planner = None
         print(f"已载入会话 {prev.session_id}：{prev.status_line()}")
+        # 归档：换会话就换事件流（按 session_id 定位同一个目录），
+        # 并记一条 SESSION_RESUMED。幂等键取快照的 updated_at——
+        # 同一份快照反复恢复只留一条，之后又聊了几句再恢复会记新的。
+        try:
+            prev.bind_journal(
+                self._journal_root(),
+                environment=self._policy_env(),
+                phase=prev.phase.value,
+            )
+            prev.journal.record(
+                "SESSION_RESUMED",
+                content=f"从快照恢复会话（{len(prev.history)} 条历史消息）",
+                execution_status="ok",
+                idem=f"resume:{prev.session_id}:{round(prev.updated_at, 3)}",
+                extra={"history": len(prev.history)},
+            )
+        except Exception:  # noqa: BLE001 - 归档失败不影响恢复本身
+            pass
         # Agent 持有 session 引用，恢复后必须换掉，否则模型看到的还是旧状态
         if self.agent is not None:
             self.agent.session = prev
@@ -339,6 +411,11 @@ class _SessionMixin(_Base):
             self.session.sync_history(self.agent.history)
         if self.session.is_empty():
             return None
+        # 归档的"环境"是策略层现算的（不进快照、不跨会话继承）
+        try:
+            self.session._journal_env = self._policy_env()
+        except Exception:  # noqa: BLE001
+            pass
         return self.session.save(self._sessions_dir())
 
 

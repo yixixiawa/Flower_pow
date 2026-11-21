@@ -7,6 +7,7 @@
 ``models``            阶段 / 轮次 / 对话轮 / 业务模型（纯数据，可单独测）
 ``session``           ``Session`` 本体：轮次推进、发现台账、快照读写
 ``tasks``             后台任务台账（``TaskManager`` / ``BackgroundTask``，状态唯一事实来源）
+``journal``           历史归档：事件流（events.jsonl）+ Markdown 导出 + 知识恢复
 ``store``             磁盘存取：列出 / 取最近 / 清扫空壳（``purge`` 会删目录）
 =====================  ==========================================================
 
@@ -22,6 +23,16 @@ from core.session.models import (
     Turn,
 )
 from core.session.redact import redact, redact_messages
+from core.session.journal import (
+    EventJournal,
+    JournalEvent,
+    JournalError,
+    journal_root,
+    list_journals,
+    open_journal,
+    prune,
+    search_all,
+)
 from core.session.session import Session
 from core.session.store import latest_session, list_sessions, purge_empty_sessions
 from core.session.tasks import BackgroundTask, TaskManager
@@ -31,4 +42,6 @@ __all__ = [
     "TaskManager", "BackgroundTask",
     "redact", "redact_messages",
     "list_sessions", "latest_session", "purge_empty_sessions",
+    "EventJournal", "JournalEvent", "JournalError",
+    "journal_root", "list_journals", "open_journal", "prune", "search_all",
 ]

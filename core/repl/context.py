@@ -39,6 +39,22 @@ class _ContextMixin(_Base):
         except Exception:  # noqa: BLE001
             return []
 
+    def _journal_ids(self, limit: int | None = 30) -> list[str]:
+        """归档会话名——用于 ``/history show|export|summary|resume <Tab>``。
+
+        与 ``_session_ids`` 分开：归档目录名带 ``session_`` 前缀且按年月分层，
+        快照列表里看不到它们。补全失败一律返回空（补全不该报错）。
+        """
+        try:
+            from core.session import list_journals
+
+            root = Path(self.cfg.data_dir) / "conversations"
+            items = list_journals(root)
+            names = [it["name"] for it in items]
+            return names if limit is None else names[:limit]
+        except Exception:  # noqa: BLE001
+            return []
+
     def _completer(self) -> Completer:
         """构建补全器：命令 + 各命令的参数候选。
 
@@ -46,6 +62,7 @@ class _ContextMixin(_Base):
         补全是给手不用离开键盘的人用的。
         """
         ids = self._session_ids()
+        history_ids = self._journal_ids()
         args: dict[str, list[str]] = {
             "report": ["md", "html", "json", "all"],
             "assets": ["port", "path", "api", "endpoint", "secret", "internal", "js"],
@@ -66,6 +83,9 @@ class _ContextMixin(_Base):
             "sessions": ["all", *ids],
             # 标题编号只列已存在的 + 下一个（避免补出一堆不存在的编号）
             "title": [str(i) for i in range(1, len(self.session.conversations) + 2)],
+            # /history 子命令 + 归档会话名（Tab 能补出真实存在的归档）
+            "history": ["status", "save", "list", "show", "export", "search",
+                        "summary", "resume", "prune", "help", *history_ids[:30]],
         }
         # 目标相关的动态候选
         if self.session.target:

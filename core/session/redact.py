@@ -25,6 +25,22 @@ def _mask_kv(m: re.Match[str]) -> str:
 
 
 _REDACT_PATTERNS: list[tuple[re.Pattern[str], object]] = [
+    # JSON 形态：`"password": "abc"` / `"access_token":"xxx"`，以及它被
+    # **再包一层 JSON** 之后的转义形态 `\"password\":\"abc\"`（工具参数
+    # 序列化后的请求体就是这样）。必须单独一条：通用规则见到冒号后是
+    # 引号就停下，于是 JSON 请求体里的凭据以前是**原样落盘**的。
+    (
+        re.compile(
+            rf'(?i)(\\?["\']?{_KEY}\\?["\']?\s*:\s*)\\?["\']'
+            r"((?:[^\"'\\]|\\.)*?)\\?[\"']"
+        ),
+        r'\1"***"',
+    ),
+    # 表单/查询串形态：`password=abc&token=xyz` → `password=***&token=***`
+    (re.compile(rf"(?i)(?<![&\w])({_KEY})=([^&\s;\"']{{3,}})"), r"\1=***"),
+    # 中文口语里的口令（"密码：admin/123456"）：必须带分隔符才脱敏——
+    # 不带分隔符的"密码重置接口""密码错误"是正常表述，不能误伤。
+    (re.compile(r"(密码|口令|账号密码)\s*[:：=]\s*([^\s，。；;、]{3,})"), r"\1: ***"),
     # 形如 `Authorization: Bearer xxx` / `X-API-Key: xxx` / `token = xxx`：
     # 键名可含连字符、下划线、任意大小写，值吃到行尾或下一个分隔符。
     # 这是主力规则——覆盖 X-Api-Key、Bearer、Cookie 等各种变体。

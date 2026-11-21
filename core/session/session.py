@@ -95,6 +95,62 @@ class Session:
                 r for r in (FileRecord.from_dict(x) for x in (files or [])) if r
             ])
         )
+        # 历史归档（data/conversations/…/events.jsonl）。**不是快照的一部分**：
+        # session.json 存状态，events.jsonl 存过程，两者互不覆盖。
+        # 默认 None —— 没绑定归档的会话（脚本、一次性扫描）行为完全不变。
+        self.journal: Any = None
+        # 归档 meta 里记的"测试环境"（由交互层按策略绑定现算，不进快照）
+        self._journal_env = ""
+
+    # ── 历史归档 ──────────────────────────────────────────────────
+    def bind_journal(
+        self,
+        root: str | Path,
+        *,
+        environment: str = "",
+        phase: str = "",
+    ) -> Any:
+        """绑定事件归档（``root`` = ``data/conversations``）。
+
+        重复绑定同一会话会复用同一目录；已有事件会被载入，幂等集合随之建立，
+        所以进程重启后继续写**不会**产生重复记录。
+        """
+        from core.session.journal import EventJournal
+
+        self._journal_env = environment or self._journal_env
+        self.journal = EventJournal(
+            root,
+            self.session_id,
+            created_at=self.created_at,
+            target=self.target,
+            environment=environment,
+            phase=phase or self.phase.value,
+        )
+        return self.journal
+
+    def _sync_journal(self, status: str = "") -> None:
+        """把会话外形同步进归档 meta，并重渲染 Markdown（失败不阻断保存）。"""
+        j = self.journal
+        if j is None:
+            return
+        try:
+            if not len(j):
+                return          # 一条事件都没有：不建目录、不落空文件
+            j.sync(
+                session_id=self.session_id,
+                target=self.target,
+                phase=self.phase.value,
+                status=status or "进行中",
+                environment=self._journal_env or None,
+                created_at=self.created_at,
+                updated_at=self.updated_at,
+                turns=len(self.turns),
+                findings=len(self.result.findings),
+                assets=len(self.result.assets),
+            )
+            j.write_all()
+        except Exception:  # noqa: BLE001 - 归档是旁路，不能反过来打挂会话保存
+            pass
 
     # ── 文件上下文 ────────────────────────────────────────────────
     def attach_files(self, access: FileAccess) -> FileContext:
@@ -289,6 +345,9 @@ class Session:
         p.mkdir(parents=True, exist_ok=True)
         f = p / "session.json"
         f.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=1), encoding="utf-8")
+        # 归档跟着落一次：事件流本身已在产生时逐条落盘，这里只是刷新
+        # meta（目标/阶段/计数）与 conversation.md 的渲染结果。
+        self._sync_journal()
         return f
 
     @classmethod

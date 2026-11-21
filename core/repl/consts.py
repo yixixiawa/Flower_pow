@@ -15,7 +15,7 @@ from core.session import (
 
 COMMANDS = [
     "/help", "/status", "/assets", "/findings", "/clues", "/model",
-    "/title", "/chats", "/reset", "/report", "/sessions", "/resume",
+    "/title", "/chats", "/reset", "/report", "/sessions", "/resume", "/history",
     "/backfill", "/clean", "/agent", "/target", "/tools", "/key", "/turns",
     "/next", "/run", "/poll", "/phase", "/kickoff", "/auto", "/readonly", "/quit",
     # 本地文件 + Plan/Work 工作流
@@ -62,6 +62,16 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
                 给关键词则按 名字/标题/目标 过滤
   /resume [#编号|名字] 载入会话（不给则取最近一次），连对话历史一起恢复
                 支持 `#3`、完整目录名、id、唯一的名字片段
+  /history [子命令] 历史归档（事件流，独立于快照）
+                /history            当前会话归档状态（事件数/损坏行/错误）
+                /history save       立即保存并重渲染 conversation.md
+                /history list [N]   列出全部历史会话
+                /history show <id>  查看会话摘要
+                /history export <id> [路径]  导出完整 Markdown
+                /history search <词>  跨会话搜索事件
+                /history summary <id>  生成复盘摘要（summary.md）
+                /history resume <id>   历史当**只读知识**注入（不恢复授权）
+                /history prune [天数] [保留条数]  按保留策略清理归档
   /clean        删除所有空会话（没目标、没对话、没结果）。恢复时也会自动清
   /quit         退出（自动保存；空会话不保存）
 

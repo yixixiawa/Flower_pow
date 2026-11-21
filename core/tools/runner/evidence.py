@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from core.state import Category, Evidence, Finding, Severity
+from core.session import journal as journal_mod
 
 
 class EvidenceMixin:
@@ -304,6 +305,20 @@ class EvidenceMixin:
         if not verdict.ok:
             clue = validator.to_clue(sub, verdict, source="agent")
             stored = session.result.add_clue(clue)
+            # 归档：被质量闸门拦下的提交同样是"过程证据"——它进第六
+            # 章"失败路径和排除项"，不进第五章"发现"。
+            journal_mod.record(
+                session, "FINDING_CREATED",
+                content=str(verdict.reason or "")[:1000],
+                execution_status="clue",
+                extra={
+                    "name": name.strip(),
+                    "severity": sev.label,
+                    "matched_at": matched_at.strip(),
+                    "poc_id": getattr(stored, "clue_id", ""),
+                    "status": "线索",
+                },
+            )
             return verdict.block_message(
                 stored.clue_id,
                 headline=f"[{sev.label}] {name.strip()} @ {matched_at.strip()[:80]}",
@@ -390,6 +405,20 @@ class EvidenceMixin:
         added = self._merge_findings(session, [f])
         if not added:
             return f"该发现已存在（{poc_id} @ {matched_at[:60]}），未重复登记"
+        # 归档：一条已登记发现 + 证据 artifact 引用（大报文走引用，不进 Markdown）
+        journal_mod.record(
+            session, "FINDING_CREATED",
+            content=_clip(evidence.strip(), "说明"),
+            execution_status="registered",
+            extra={
+                "name": f.name,
+                "severity": sev.label,
+                "matched_at": f.matched_at,
+                "poc_id": poc_id,
+                "category": str(category or ""),
+                "status": "已登记",
+            },
+        )
         # 先前被拦下的同一条线索现在补齐了：销案（保留记录，标记 promoted）
         promoted = session.result.resolve_clue(validator.clue_id_for(sub), poc_id)
 

@@ -39,12 +39,13 @@ class VerifyMixin:
             )
 
         # 逐请求闸门：Authenticator 实际发出的每一个请求（验证码 GET、登录
-        # POST）都要过 AUTH_BOOTSTRAP 的请求级判定。工具级意图已在
-        # _policy_gate 里计过频率，这里 count_rate=False 避免一次登录算两次。
+        # POST）都要过 AUTH_BOOTSTRAP 的请求级判定。**频率只在这里计一次**
+        # （guardschedule5 第三章）：工具级意图判定不计配额，否则同一登录
+        # 会被扣两次。验证码 GET 不计数（只对凭证提交计数）。
         def precheck(req_url: str, method: str, body: str = "") -> str:
             ctx = self._policy_ctx(session, req_url)
             d = self.policy_guard.check_auth(
-                req_url, method=method, body=body, ctx=ctx, count_rate=False,
+                req_url, method=method, body=body, ctx=ctx,
             )
             return "" if d.allowed else d.reason
 

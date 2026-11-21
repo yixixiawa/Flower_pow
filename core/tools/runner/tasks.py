@@ -34,6 +34,7 @@ import json
 import time
 from typing import Any
 
+from core.session import journal as journal_mod
 from core.session.tasks import dedup_verdict, task_fingerprint
 
 # 前台快速探测的端口上限 / 后台大范围扫描的端口上限。
@@ -76,6 +77,16 @@ class TaskMixin:
     def _spawn(self, session, task, coro, timeout_s: float = 0.0) -> None:
         """启动一个后台协程并把结果/异常回写到任务台账。"""
         limit = float(timeout_s or 0.0)
+        # 归档：任务进入"运行中"这件事在这里统一记一次（幂等键 = task_id）。
+        # 放在 _spawn 而不是各个入口：recon_ports_bg / background_run / 以后
+        # 新增的后台入口都从这里过，少一处就会漏一种任务。
+        journal_mod.record(
+            session, "TASK_STARTED",
+            content=task.label,
+            execution_status="running",
+            idem=f"task:{task.task_id}:started",
+            extra={"task_id": task.task_id, "tool": task.tool, "status": "running"},
+        )
 
         async def run() -> None:
             try:
@@ -89,12 +100,33 @@ class TaskMixin:
                 session.tasks.timeout(
                     task.task_id, f"超过 {limit:.0f}s 未完成，已按超时结束"
                 )
+                journal_mod.record(
+                    session, "TASK_FAILED",
+                    content=f"超过 {limit:.0f}s 未完成，已按超时结束",
+                    execution_status="timeout",
+                    idem=f"task:{task.task_id}:failed",
+                    extra={"task_id": task.task_id, "status": "timeout"},
+                )
                 return
             except asyncio.CancelledError:
                 session.tasks.cancel(task.task_id, "任务被取消（用户中断或切换目标）")
+                journal_mod.record(
+                    session, "TASK_FAILED",
+                    content="任务被取消（用户中断或切换目标）",
+                    execution_status="cancelled",
+                    idem=f"task:{task.task_id}:failed",
+                    extra={"task_id": task.task_id, "status": "cancelled"},
+                )
                 raise
             except Exception as exc:  # noqa: BLE001
                 session.tasks.fail(task.task_id, f"{type(exc).__name__}: {exc}")
+                journal_mod.record(
+                    session, "TASK_FAILED",
+                    content=f"{type(exc).__name__}: {exc}",
+                    execution_status="failed",
+                    idem=f"task:{task.task_id}:failed",
+                    extra={"task_id": task.task_id, "status": "failed"},
+                )
                 return
             self._finish_task(session, task, text)
 
@@ -117,6 +149,13 @@ class TaskMixin:
                 # 落盘失败不阻断：结果仍在台账里，只是上下文会看到截断预览
                 summary = f"{summary}（完整结果 {len(body)} 字符，落盘失败）"
         session.tasks.finish(task.task_id, body, summary=summary, artifact=artifact)
+        journal_mod.record(
+            session, "TASK_COMPLETED",
+            content=summary,
+            execution_status="done",
+            idem=f"task:{task.task_id}:done",
+            extra={"task_id": task.task_id, "status": "done", "artifact": artifact},
+        )
 
     def cancel_background(self, session, reason: str = "已取消") -> int:
         """取消全部未结束（排队中/运行中）的后台任务，返回个数。

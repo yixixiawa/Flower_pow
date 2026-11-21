@@ -130,7 +130,7 @@ class ClassifiedRequest:
     category: str
     command: str            # 映射到权限矩阵的命令
     signals: list[str] = field(default_factory=list)
-    risk_level: str = PermissionLevel.L0  # 命中维度的最高风险等级提示
+    risk_level: str = ""    # 矩阵等级提示（空 = 该分类没有矩阵授权行）
 
     @property
     def batch(self) -> bool:
@@ -215,8 +215,17 @@ def classify_request(
             bump(ApiCategory.EXECUTE, f"请求体含破坏性 SQL：{hit.group(0)[:50]}")
         if _CMD_INJECTION.search(body):
             bump(ApiCategory.EXECUTE, "请求体含命令注入特征")
-        if _BATCH_DELETE_HINTS.search(body) and worst == ApiCategory.DELETE:
-            bump(ApiCategory.DELETE, "请求体含批量删除特征（ids 数组 / batch=true）")
+        if _BATCH_DELETE_HINTS.search(body):
+            # 批量删除信号只在两类请求上抬升分类：
+            #   * 已经是删除语义（DELETE 路径/方法）→ 升为批量删除（L3）；
+            #   * **AUTH 请求**——guardschedule5 第二章：AUTH 路径不得屏蔽
+            #     请求体里的更风险信号，否则一个登录端点就能夹带 ids 数组。
+            # 普通只读请求里的 `"all": true` 只是业务参数（分页取全量），
+            # 记录信号但不改变分类——否则所有"全量查询"都会被误判成 L3。
+            if worst in (ApiCategory.DELETE, ApiCategory.AUTH):
+                bump(ApiCategory.DELETE, "请求体含批量删除特征（ids 数组 / batch=true）")
+            else:
+                signals.append("请求体含 ids/batch/all 标志（非删除类请求，不抬升分类）")
         for act in _BODY_ACTION.finditer(body):
             act_low = act.group(2).lower()
             if act_low in ("delete", "remove", "drop"):
@@ -253,6 +262,9 @@ def classify_request(
         category=worst,
         command=command,
         signals=signals,
+        # 分类的**风险等级提示**取自矩阵本身（`rule_for_command`），不另设
+        # 一套等级表：审计里"识别算什么"与"按几级判"必须能对上。
+        risk_level=command_level(command),
     )
 
 
@@ -268,6 +280,103 @@ def _map_command(category: str, signals: list[str]) -> str:
     if category == ApiCategory.EXECUTE:
         return Command.EXECUTE_CMD
     return COMMAND_FOR_CATEGORY.get(category, "")
+
+
+# ── 单一权威映射层（guardschedule5 第三章）──────────────────────────
+# 分类 → 命令的数据只有一份（:data:`policy.api_policy.COMMAND_FOR_CATEGORY`），
+# 命令 → 等级只查矩阵（:func:`policy.api_policy.rule_for_command`）。下面三个
+# 函数是**其余入口唯一允许的换算方式**：check_probe / check_builtin /
+# check_tool 不再各自写一份"哪个更严"的比较逻辑。
+
+
+def command_level(command: str) -> str:
+    """命令 → 矩阵等级（L0-L3）；没有矩阵授权行返回空串。
+
+    空串不是"L0"——AUTH/EXPORT/UNKNOWN 恰恰是**没有**矩阵行的类别，
+    把它们显示成 L0 就是给"未授权"披了一件"只读"的外衣。
+    """
+    rule = rule_for_command(command)
+    return rule.level if rule is not None else ""
+
+
+def worst_command(commands: "list[str] | tuple[str, ...]") -> str:
+    """多条命令里风险最高的那条（等级按矩阵排名；无矩阵行的排最低）。"""
+    best, best_rank = "", -1
+    for c in commands or ():
+        lvl = command_level(c)
+        rank = PermissionLevel.rank(lvl) if lvl else -1
+        if rank > best_rank:
+            best, best_rank = c, rank
+    return best
+
+
+def category_for_command(command: str, default: str = ApiCategory.UNKNOWN) -> str:
+    """命令 → 分类（审计展示用）。未登记的命令返回 ``default``。"""
+    return _CATEGORY_FOR_COMMAND.get(command, default)
+
+
+#: **不能借 AUTH_BOOTSTRAP 放行**的分类。这些不是"认证动作"：一个端点
+#: 只要本次请求带这些语义（路径/参数/请求体/POC/历史任一维度），就不许
+#: 走认证初始化通道——删除/批量删除是 L3，上传是 L2，命令执行/SQL 注入
+#: 是 L3，导出没有矩阵行。EXPORT 一并列进来：登录端点不导出数据。
+AUTH_BLOCKING_CATEGORIES: tuple[str, ...] = (
+    ApiCategory.DELETE,
+    ApiCategory.UPLOAD,
+    ApiCategory.EXECUTE,
+    ApiCategory.EXPORT,
+)
+
+
+def match_auth_entry(url: str, method: str, entries: Any) -> Any | None:
+    """URL + 方法是否精确命中某条**已登记**认证入口；命中返回该入口。
+
+    这是"登记事实"的查询，**不是授权**：返回值只用来决定"这条请求该由
+    AUTH_BOOTSTRAP 通道判还是矩阵判"。真正的放行仍要过
+    :func:`policy.auth_bootstrap.check` 的十条前置 + 用途复核。
+
+    为什么需要它：非标准登录路径（``/api/v2/ticket``）不含任何认证关键词，
+    分类器只能按 ``Method POST`` 判成"创建测试数据"（L1），环境不满足时
+    会被矩阵拒掉——用户明明已显式登记，请求却过不去。登记事实在这里
+    参与"走哪条通道"，不参与"能不能放行"。
+    """
+    want = (method or "").upper()
+    for e in entries or ():
+        try:
+            if e.matches(url, want):
+                return e
+        except Exception:          # noqa: BLE001 —— 坏条目不阻断其它入口
+            continue
+    return None
+
+
+def auth_risk_review(
+    url: str,
+    *,
+    body: str = "",
+    params: dict[str, Any] | None = None,
+    poc_hint: str = "",
+    history_hint: str = "",
+) -> tuple[str, list[str]]:
+    """AUTH 端点的**用途复核**：返回 ``(应改走的矩阵命令, 命中信号)``。
+
+    只看路径 / 参数 / 请求体 / POC / 历史五个维度，**刻意不看 Method**：
+    方法维度由登记固定（login/refresh/logout 固定 POST、captcha 固定 GET），
+    再拿方法分类只会把合法登录判成"创建测试数据"。这里问的是另一个问题：
+    ——"这个端点这一次到底在干什么"。删除、批量删除、上传、命令执行、
+    SQL 注入、定时任务、导出任一命中，就说明它不是认证动作，
+    不能借 AUTH_BOOTSTRAP 放行，必须按矩阵（多半是 L3）判。
+
+    与 :func:`classify_request` 共用同一套信号表（不另写一份规则）；
+    实现上以 ``method="GET"`` 调分类器，正是为了**排除方法维度的抬升**，
+    只保留证据维度的信号。
+    """
+    cls = classify_request(
+        url, method="GET", body=body, params=params,
+        poc_hint=poc_hint, history_hint=history_hint,
+    )
+    if cls.category not in AUTH_BLOCKING_CATEGORIES:
+        return "", []
+    return _map_command(cls.category, cls.signals), list(cls.signals)
 
 
 # ── Guard 本体 ────────────────────────────────────────────────────
@@ -603,7 +712,42 @@ class RequestGuard:
         # 登出/验证码读取**不能**因此就"顺理成章"走 UNKNOWN——那会让 Agent
         # 无法完成正常登录。它们走独立的 AUTH_BOOTSTRAP 受限通道：
         # 十条前置条件全满足才放行单次请求，不放宽矩阵、不设全局开关。
-        if cls.category == ApiCategory.AUTH:
+        #
+        # 进入这条通道的条件有两条：
+        #   ① 分类器判成 AUTH（路径有认证语义）；
+        #   ② **已登记**的认证入口精确命中 URL + 方法——非标准登录路径
+        #      （/api/v2/ticket）不带认证关键词，只会被 "Method POST" 判成
+        #      "创建测试数据"（L1），在 unknown 环境被矩阵拒掉。登记事实
+        #      只决定"走哪条通道"，不决定"能不能放行"：通道里照样要过
+        #      十条前置 + 用途复核。
+        registered = match_auth_entry(url, method, ctx.auth_entries)
+        if cls.category == ApiCategory.AUTH or registered is not None:
+            # 用途复核（guardschedule5 第二章第 7 条）：AUTH 只是**接口用途
+            # 分类，不是风险豁免**。分类器已经把 DELETE/UPLOAD/EXECUTE 抬到
+            # AUTH 之上，正常情况下不会带更高风险信号走到这里；这一道是
+            # 防"以后有人调了信号表顺序"的兜底——宁可在这里按矩阵拒绝，
+            # 也不让 AUTH 分支变成风险的消音器。
+            risk_cmd, risk_sigs = auth_risk_review(
+                url, body=body, params=params,
+                poc_hint=poc_hint, history_hint=history_hint,
+            )
+            if risk_cmd:
+                d = decide(
+                    risk_cmd,
+                    environment=ctx.environment or self.environment_for(url),
+                    identity_bound=ctx.identity_bound,
+                    target_bound=(
+                        bool(ctx.bound_target) and in_scope(url, ctx.bound_target)
+                    ),
+                    approved=False,
+                    clearly_read_only=False,
+                )
+                d.category = cls.category
+                d.signals = [
+                    f"AUTH 端点携带更高风险语义 → 改按矩阵判定：{risk_cmd}",
+                    *risk_sigs[:4],
+                ]
+                return d
             d = self.check_auth(
                 url, method=method, body=body, params=params, ctx=ctx,
             )
@@ -846,14 +990,14 @@ class RequestGuard:
             return self._check_login_tool(url, ctx, payload or {})
         command = _BUILTIN_TOOL_COMMAND.get(tool_key)
         if not command:
+            # 映射为空串 = 该能力**没有**矩阵授权行（AUTH/EXPORT 都是这样），
+            # 不是"映射成 L0"，也不是"忘了填"——一律 UNKNOWN 默认拒绝。
             return PolicyDecision(
                 decision=Decision.UNKNOWN,
                 command="",
-                category=ApiCategory.AUTH if command == "" else ApiCategory.UNKNOWN,
+                category=ApiCategory.UNKNOWN,
                 reason=(
-                    f"内置工具 {tool_key} 无权限矩阵授权行"
-                    + ("（AUTH 类不映射 L0）" if command == "" else "，不在映射内")
-                    + "，默认拒绝执行"
+                    f"内置工具 {tool_key} 无权限矩阵授权行，默认拒绝执行"
                 ),
             )
         ctx = ctx or GuardContext()
@@ -869,10 +1013,12 @@ class RequestGuard:
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
             approved=False,
-            # 内置侦察/越权工具只发只读 GET——L0 的 unknown 环境放行条件
-            clearly_read_only=True,
+            # 与 check_tool 同一口径：只有映射到只读命令的内置工具才算
+            # "明确只读"。此前无条件 True，等于给所有内置工具（含未来可能
+            # 映射到写命令的）预开了 unknown 环境的 L0 放行口子。
+            clearly_read_only=command in (Command.QUERY_LIST, Command.QUERY_DETAIL),
         )
-        d.category = ApiCategory.READ if command in (Command.QUERY_LIST, Command.QUERY_DETAIL) else _CATEGORY_FOR_COMMAND.get(command, ApiCategory.UNKNOWN)
+        d.category = category_for_command(command)
         d.signals = [f"内置工具 {tool_key} → {command}"]
         return d
 
@@ -886,11 +1032,11 @@ class RequestGuard:
         不止一个候选。所以分两种情况：
 
         * url 为空或就是绑定目标根 → 走**工具级意图判定**
-          （:meth:`check_auth_intent`）：会话/环境/测试背景/入口存在/频率；
+          （:meth:`check_auth_intent`）：会话/环境/测试背景/入口存在；
           具体端点由 ``Authenticator`` 的逐请求 precheck 再校（精确命中
-          登记入口 + 参数结构）；
+          登记入口 + 参数结构 + 频率计数）；
         * url 指向具体路径 → 走**请求级判定**：必须精确命中登记入口，
-          不允许把登录指向任意地址。
+          不允许把登录指向任意地址（此处不计频率——真正的请求在 precheck）。
 
         两级都不通过就拒绝。凭证值本身**不进** reason/审计。
         """
@@ -907,8 +1053,12 @@ class RequestGuard:
             d = self.check_auth_intent(ab.AuthKind.LOGIN, ctx=ctx)
             d.signals.append("内置工具 login → AUTH_BOOTSTRAP（工具级意图）")
             return d
+        # 计数责任（guardschedule5 第三章）：**只有真正要发出去的那一枪计一次**。
+        # 这里是工具级预判，真正发请求的是 Authenticator 的 precheck——
+        # 它带着 count_rate=True 过 :meth:`check_auth`。同一登录请求若在
+        # 这里也计数，就会被扣两次配额。
         d = self.check_auth(
-            url, method="POST", params=cred, ctx=ctx,
+            url, method="POST", params=cred, ctx=ctx, count_rate=False,
         )
         d.signals.append("内置工具 login → AUTH_BOOTSTRAP（请求级精确匹配）")
         return d
@@ -938,10 +1088,7 @@ class RequestGuard:
                     f"（已知类别：{'、'.join(sorted(PROBE_KIND_COMMAND))}）"
                 ),
             )
-        worst = max(commands, key=lambda c: (
-            PermissionLevel.rank(rule_for_command(c).level)
-            if rule_for_command(c) is not None else -1
-        ))
+        worst = worst_command(commands)
         rule = rule_for_command(worst)
         ctx = ctx or GuardContext()
         # 与 check_request 完全同源的范围判定——这是"不可绕过"的保证：
@@ -954,7 +1101,7 @@ class RequestGuard:
             target_bound=target_bound,
             approved=False,
         )
-        d.category = _CATEGORY_FOR_COMMAND.get(worst, ApiCategory.READ)
+        d.category = category_for_command(worst, ApiCategory.READ)
         d.signals = [
             f"探针类别：{kinds}",
             f"最高风险命令：{worst}（{rule.level if rule else '?'}）",
@@ -976,8 +1123,9 @@ PROBE_KIND_COMMAND: dict[str, str] = {
     # "fileread" 刻意不在表内：无矩阵授权 → UNKNOWN/DENY（第六轮整改 P0-4）
 }
 
-# 命令 → 分类（check_probe 供审计展示用）
-_CATEGORY_FOR_COMMAND: dict[str, str] = {
+# 命令 → 分类（**唯一**的反向映射；check_probe / check_builtin 的审计
+# 展示与 Runner 的台账分类都从这里取，不得各自写一份 if/elif）
+CATEGORY_FOR_COMMAND: dict[str, str] = {
     "命令执行": ApiCategory.EXECUTE,
     "SQL 注入验证": ApiCategory.EXECUTE,
     "上传测试文件": ApiCategory.UPLOAD,
@@ -988,6 +1136,8 @@ _CATEGORY_FOR_COMMAND: dict[str, str] = {
     "创建测试数据": ApiCategory.CREATE,
     "修改测试数据": ApiCategory.UPDATE,
 }
+# 兼容旧名（内部与既有测试引用）
+_CATEGORY_FOR_COMMAND = CATEGORY_FOR_COMMAND
 
 
 # 外部工具语义映射：这些工具的能力本身就是矩阵里的一条命令。

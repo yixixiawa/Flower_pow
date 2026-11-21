@@ -29,6 +29,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from core.state import Asset, Finding, Severity
+from core.session import journal as journal_mod
 from core.tools.args import normalize_args
 from core.tools.external import ExternalTool
 from core.tools.probe import Probe
@@ -434,6 +435,10 @@ class _ToolRunnerBase:
         # 模型还以为链路已经打通——这种静默失效最难排查。
         if name != "context_get":
             args = self._expand_context_vars(args, session.result.context_vars)
+        # 历史归档：调用与结果各记一条，用 call_id 配对。
+        # 归档是旁路——record() 写不进去只告警，不影响工具执行。
+        call_id = len(self.calls) + 1
+        journal_mod.record_tool_call(session, call_id=call_id, tool=name, args=args)
         status = "ok"
         try:
             handler = getattr(self, f"_h_{name}", None)
@@ -513,6 +518,16 @@ class _ToolRunnerBase:
                 )
                 or "",
             }
+        )
+        # 结果事件（含状态与被拦截原因）：Markdown 的"工具调用记录"与
+        # "失败路径"两章都从这里取数。
+        journal_mod.record_tool_result(
+            session,
+            call_id=call_id,
+            tool=name,
+            result=text,
+            status=status,
+            ms=self.calls[-1]["ms"],
         )
         return text
 
@@ -724,6 +739,12 @@ class _ToolRunnerBase:
         ``req_ctx`` = 请求上下文（method/params/body/poc_id 或工具参数），
         用于计算审批绑定的请求指纹。返回拒绝文本或 None 放行。
         """
+        # L3 / DENY / UNKNOWN **永不进入审批**（guardschedule5 第三章第 5 条）：
+        # decide() 对 L3 恒 DENY，这里再钉一遍——将来若有分支把 L3 判成
+        # REVIEW，审批通道也不会成为它的出路。审批只能解锁 L2（上传/删除），
+        # 且必须逐请求、绑内容指纹。
+        if d.decision == "REVIEW" and str(getattr(d, "level", "") or "") == "L3":
+            return self._policy_deny(session, d, url)
         if d.allowed:
             audit_block = self._audit_gate_for(d, session, url)
             if audit_block is not None:
@@ -1071,6 +1092,11 @@ class _ToolRunnerBase:
             "审计不可持久化，审批通道关闭，拒绝执行（P1-⑤）",
             command=d.command, url=url, target_id=tid, run_id=rid,
         )
+        journal_mod.record_policy(
+            session, decision="DENY", command=d.command, level=d.level,
+            category=d.category, url=url,
+            reason="审批事件无法持久化审计，审批通道关闭（P1-⑤）",
+        )
         return (
             "【已拦截】（策略）审批事件无法持久化审计，按 P1-⑤ 拒绝执行"
             f"（{d.command or '未知操作'}）。\n"
@@ -1269,6 +1295,11 @@ class _ToolRunnerBase:
                 reason=f"运行期审批拒绝（审批人 {approver_label or '未声明'}）：" + d.reason,
                 extra={"approver": approver_label, "identity": ident},
             )
+            journal_mod.record_policy(
+                session, decision="APPROVAL_DENIED", command=d.command,
+                level=d.level, category=d.category, url=url,
+                reason=f"运行期审批被拒绝（审批人 {approver_label or '未声明'}）：{d.reason}",
+            )
             return False
         authenticated = bool(approver_label)
         if not authenticated:
@@ -1309,6 +1340,12 @@ class _ToolRunnerBase:
         # 审批已完成：本次调用内层探测器（Detector 再判一次）凭此标记
         # 放行同类 REVIEW（上传/删除），不再重复问人。
         self._cv_policy_approved.set(True)
+        # 归档**不写票据号**（审批票据不进历史记录，恢复时也不还原授权）
+        journal_mod.record_policy(
+            session, decision="APPROVAL", command=d.command, level=d.level,
+            category=d.category, url=url,
+            reason=f"运行期审批通过（审批人 {approver_label}，一次性票据已消费）：{d.reason}",
+        )
         return True
 
     def _guard_registry(self, session):
@@ -1356,6 +1393,11 @@ class _ToolRunnerBase:
                 "target_id": tid,
                 "identity": self._current_identity(session, url=url),
             }
+        # 归档：放行也是一次判定（"为什么这条能过"同样需要复盘）
+        journal_mod.record_policy(
+            session, decision="ALLOW", command=d.command, level=d.level,
+            category=d.category, url=url, reason=d.reason, signals=list(d.signals or []),
+        )
         return None
 
     def _policy_deny(self, session, d, url: str = "") -> str:
@@ -1380,6 +1422,11 @@ class _ToolRunnerBase:
             "deny", command=d.command, level=d.level, decision=d.decision,
             category=d.category, url=url, target_id=tid, run_id=rid,
             reason=d.reason, extra={"signals": list(d.signals)[:6]} if d.signals else None,
+        )
+        journal_mod.record_policy(
+            session, decision=str(d.decision or "DENY"), command=d.command,
+            level=d.level, category=d.category, url=url, reason=d.reason,
+            signals=list(d.signals or []),
         )
         return self._policy_deny_text(d, url)
 

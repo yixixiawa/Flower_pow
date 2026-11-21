@@ -55,5 +55,15 @@ class _ReplBase(_Base):
         # 写操作的人工审核通道：每次上传前逐条问一遍
         if self.runner is not None:
             self.runner.approver = self._approve
+        # 历史归档：本会话的事件流落在 data/conversations/YYYY/MM/session_<id>/。
+        # 绑定是**幂等**的：同一 session_id 重复绑定会接着写同一个目录。
+        try:
+            self.session.bind_journal(
+                self._journal_root(),
+                environment=self._policy_env(),
+                phase=self.session.phase.value,
+            )
+        except Exception:  # noqa: BLE001 - 归档绑定失败不该让会话起不来
+            self.session.journal = None
 
     # ── 对话标题 ──────────────────────────────────────────────────

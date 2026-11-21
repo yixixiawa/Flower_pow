@@ -193,6 +193,12 @@ class _LoopMixin(_Base):
     async def _run_agent(self, text: str) -> None:
         before = self.runner.calls if self.runner else []
         n_before = len(before)
+        # 归档：用户这一句先落盘。顺序即事实——工具事件在 send() 期间
+        # 产生，自然排在用户消息之后、助手回复之前。
+        try:
+            self._journal_event("USER_MESSAGE", role="user", content=text)
+        except Exception:  # noqa: BLE001 - 归档是旁路
+            pass
         try:
             out = await self.agent.send(text)
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -200,9 +206,29 @@ class _LoopMixin(_Base):
             uncancel()
             self._note_interrupt()
             out = ""
+            try:
+                self._journal_event(
+                    "ASSISTANT_MESSAGE", role="assistant",
+                    content="（本轮被用户中断）", execution_status="interrupted",
+                )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             print(f"\n[!] Agent 执行异常：{type(exc).__name__}: {exc}")
             out = ""
+            try:
+                self._journal_event(
+                    "ASSISTANT_MESSAGE", role="assistant",
+                    content=f"（Agent 执行异常：{type(exc).__name__}: {exc}）",
+                    execution_status="error",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if out:
+            try:
+                self._journal_event("ASSISTANT_MESSAGE", role="assistant", content=out)
+            except Exception:  # noqa: BLE001
+                pass
         # 给这一轮起标题并记录用了哪些工具（报告与回溯都需要）。
         # 这里曾经写 c["name"]，而 ToolRunner 记的是 "tool" —— 键名不一致导致
         # **每轮 Agent 跑完都 KeyError: 'name'**，而且异常被上面的 except 之外的
@@ -242,8 +268,13 @@ class _LoopMixin(_Base):
             parts = raw.split()
             self._clues(any(p.lower() in ("--all", "-a", "all") for p in parts[1:]))
             return True
-        if low in ("/turns", "/history"):
+        if low == "/turns":
             self._turns()
+            return True
+        if low == "/history" or low.startswith("/history "):
+            # /history 的语义是"归档"（事件流），/turns 是"本轮次台账"——
+            # 以前 /history 是 /turns 的别名，会把两个概念混成一个。
+            self._history(raw.partition(" ")[2] if " " in raw else "")
             return True
         if low in ("/model", "/business"):
             self._model()
@@ -365,6 +396,14 @@ class _LoopMixin(_Base):
         for name, kws in NATURAL.items():
             if any(k in raw for k in kws):
                 self.session.set_phase(PHASE_ALIAS[name])
+                # 剧本模式没有 Agent 对话对象，但"用户提了什么"照样要留档
+                try:
+                    self._journal_event(
+                        "USER_MESSAGE", role="user", content=raw,
+                        extra={"mode": "planner"},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 await self.planner.run_turn(self.session, raw)
                 self._save()
                 return True

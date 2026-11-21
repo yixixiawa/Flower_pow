@@ -20,7 +20,12 @@
 5. HTTP 方法必须与接口定义一致（登记时记下的那个方法）；
 6. 请求参数必须符合认证接口结构（字段 ⊆ 接口声明 ∪ 认证字段词表，
    且必须带凭证字段）；
-7. 登录频率受限（滑动窗口 + 最小间隔）；
+6b. 本次请求**不能带更高风险语义**（guardschedule5 第二章）：路径/参数/
+   请求体/POC/历史里出现删除、批量删除、上传、命令执行、SQL 注入、
+   定时任务或导出信号，就回矩阵按更高风险判——AUTH 是用途分类，
+   不是风险豁免；登记"这是登录端点"也不能把一个删除接口变成认证动作；
+7. 登录频率受限（滑动窗口 + 最小间隔）——**一次真正发出的凭证提交计一次**，
+   工具级意图判定不计（两处都计等于同一请求扣两次配额）；
 8. 敏感凭证不进日志/工具输出/审计明文（脱敏在调用方统一做）；
 9. **登录成功不产生任何"已登录"放行状态**——本模块没有 session 级开关；
 10. 后续请求照旧走 ``api_policy`` + ``request_guard``（本模块不参与）。
@@ -46,7 +51,7 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from policy.api_policy import Environment
-from policy.request_guard import in_scope
+from policy.request_guard import auth_risk_review, in_scope
 
 __all__ = [
     "AUTH_COMMAND",
@@ -216,12 +221,18 @@ class AuthEndpoint:
     登记入口取接口定义，自证入口取语义默认（login/refresh/logout = POST）。
     精确匹配用 :func:`policy.request_guard.in_scope` 双向比对——它不是
     字符串前缀比较，编码/点段/默认端口在比对前已摊平。
+
+    ``source`` 记录这条入口**从哪来**（``openapi`` 接口清单 / ``config``
+    静态策略配置 / ``user`` 用户确认登记）：授权事实必须可追溯，
+    审计与拒绝理由里要能一眼看出"是谁说的这是登录端点"。
+    默认空串 = 调用方没标注来源（历史构造点兼容），不影响任何判定。
     """
 
     kind: str
     url: str
     method: str
     fields: frozenset[str] = frozenset()
+    source: str = ""
 
     def matches(self, url: str, method: str) -> bool:
         if (method or "").upper() != (self.method or "").upper():
@@ -260,7 +271,8 @@ def entries_for(target: str, assets: Iterable[Any]) -> tuple[AuthEndpoint, ...]:
         fields = frozenset(
             str(f).strip().lower() for f in (meta.get("body_fields") or []) if str(f).strip()
         )
-        out.append(AuthEndpoint(kind=kind, url=url, method=method, fields=fields))
+        out.append(AuthEndpoint(kind=kind, url=url, method=method,
+                                fields=fields, source="openapi"))
     return tuple(out)
 
 
@@ -504,19 +516,23 @@ def check_intent(
     session_id: str = "",
     credentials_present: bool = False,
     limiter: AuthRateLimiter | None = None,
-    count_rate: bool = True,
+    count_rate: bool = False,
 ) -> AuthDecision:
     """**工具级**判定：这次"登录/刷新/登出"的意图本身是否被允许。
 
     与 :func:`check`（请求级）分工：
 
-    * 工具级（本函数）——会话绑定 + 环境 + 测试背景 + "该类入口已登记"
-      + 频率预算。它不指定具体 URL：``login`` 工具的入参是"目标"，真实
-      端点由接口清单解析（可能不止一个 login 入口）。
+    * 工具级（本函数）——会话绑定 + 环境 + 测试背景 + "该类入口已登记"。
+      它不指定具体 URL：``login`` 工具的入参是"目标"，真实端点由接口清单
+      解析（可能不止一个 login 入口）。**不消耗频率配额**：这里还没有任何
+      请求要发出去，计数留到真正发出的那一枪（:func:`check`）。
     * 请求级（:func:`check`）——具体 URL 必须精确命中登记入口、方法一致、
-      参数符合结构。``Authenticator`` 发出的每一个请求都要再过这一道。
+      参数符合结构，并**计一次**频率（凭证提交）。
 
     两道都必须通过，任何一道拒绝即拒绝。工具级通过**不代表**请求级会通过。
+
+    ``count_rate=True`` 只用于"单独给意图限流"的场景（本项目没有这样的
+    调用方）：工具级与请求级都计数会让同一登录扣两次配额。
     """
     pre = _preconditions(
         url=bound_target or "", target_id=target_id,
@@ -643,6 +659,24 @@ def check(
     if matched.kind not in AuthKind.ALL:
         return _deny("ENDPOINT_UNREGISTERED", f"未识别的认证入口类型：{matched.url}")
 
+    # ④b **用途复核**（guardschedule5 第二章第 6-7 条）：登记只说明"这个
+    #    URL 被谁认定成认证入口"，不说明"这次请求就是在认证"。所以执行时
+    #    再按同一套信号表复核一遍：路径/参数/请求体/POC/历史里出现删除、
+    #    批量删除、上传、命令执行、SQL 注入、定时任务、导出，就说明它干的
+    #    不是认证的事——必须回矩阵按更高风险判（多半是 L3），不能借
+    #    AUTH_BOOTSTRAP 放行。
+    #    这一道专治"把 /api/users/delete 登记成 login"这类错误登记。
+    risk_cmd, risk_sigs = auth_risk_review(url, body=body, params=params)
+    if risk_cmd:
+        return _deny(
+            "ENDPOINT_RISK_MISMATCH",
+            f"已登记入口 {matched.url} 的本次请求带更高风险语义（应按「{risk_cmd}」"
+            "由权限矩阵判定）：认证初始化只受理登录/刷新/登出/验证码，"
+            "不接受删除、批量删除、上传、命令执行、SQL 注入、定时任务或导出"
+            f"——命中信号：{'；'.join(risk_sigs[:3]) or risk_cmd}",
+            kind=matched.kind, endpoint=matched.url,
+        )
+
     # ⑤⑥ 参数结构（验证码读取是只读 GET，不做凭证结构校验）
     keys = body_keys(body, params)
     if matched.kind == AuthKind.CAPTCHA:
@@ -714,7 +748,8 @@ def check(
         signals=[
             f"会话绑定目标：{target_id}",
             f"环境：{env}",
-            f"入口：{matched.kind} {matched.url}（已登记）",
+            f"入口：{matched.kind} {matched.url}（已登记，"
+            f"来源 {matched.source or '未标注'}）",
             f"参数：{sorted(keys) if keys else '无'}",
         ],
     )

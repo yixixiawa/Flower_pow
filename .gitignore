@@ -27,6 +27,10 @@ reports/
 # data/ 下只保留 tools.local.yaml（自定义工具清单，是配置不是产物）；
 # 其余子目录全是索引 / 会话快照 / 情报缓存 / 侦察中间产物。
 data/sessions/
+# 历史会话归档（events.jsonl / conversation.md / artifacts/）：
+# 里面是完整的测试过程、目标路径与请求响应原文，属于**本地过程数据**，
+# 与 data/sessions/ 同一口径不入库。
+data/conversations/
 data/vector_db/
 data/intel/
 data/recon/
@@ -126,5 +130,6 @@ temp/
 /MD
 !/README.md
 /doc
+*.zip
 
 .env.example
