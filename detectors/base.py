@@ -245,23 +245,24 @@ class Detector(ABC):
     ) -> str:
         """逐请求策略检查。返回 "" 放行，否则返回拦截原因文本。
 
-        与 runner 闸门同一套 policy 模块（不是简化版）：
+        **直接调用 RequestGuard.check_request**（第七轮整改）——探测器的
+        判定与 Runner 是同一段代码，不是"同一套模块里的另一个简化版"：
 
         * 目标 URL 合法性（协议/端口/字符）→ 非法即拦；
         * 首请求绑定范围，后续请求必须 in_scope（跨主机/端口出界即拦）；
-        * 七维度分类（路径/方法/参数/请求体/POC 声明）→ 映射矩阵命令；
-        * ``decide()`` 判 ALLOW 才放行——L3（SQLi/RCE）任何环境都拦，
-          unknown 环境只放行明确只读，写语义请求按矩阵拒绝；
+        * 七维度分类 → 矩阵决策（L3 任何环境都拦，unknown 只放行明确只读）；
+        * AUTH 分类落 AUTH_BOOTSTRAP 受限通道（探测器没有接口清单 →
+          无登记入口 → 拒绝）；
         * REVIEW（L2 上传/删除，测试环境）→ 仅当 ``policy_approved``
           （Runner 闸门已对该次请求完成逐请求人工审批）为真才放行。
 
         **每一次拒绝都写审计**（:meth:`_audit_deny`）——探测器是批量
         打点，这里漏一条审计，事后就说不清"哪些请求被拦了"。
         """
-        from policy.api_policy import ApiCategory, Decision, decide
+        from policy.api_policy import ApiCategory, Decision
         from policy.request_guard import (
+            GuardContext,
             RequestGuard,
-            classify_request,
             in_scope,
             validate_target_url,
         )
@@ -283,26 +284,22 @@ class Detector(ABC):
                 url_n, method_u, "", ApiCategory.UNKNOWN, "DENY",
                 f"请求目标超出本检测器绑定的范围（{bound}）",
             )
-        cls = classify_request(
+        # **同一策略入口**（第七轮整改）：不再在这里复制"分类 + decide"，
+        # 直接走 RequestGuard.check_request——AUTH 分类也会落到 AUTH_BOOTSTRAP
+        # 判定（探测器没有接口清单 → 无登记入口 → 拒绝），与 Runner 一致。
+        # 范围/环境/身份/明确只读的判定全部由 guard 内部完成，探测器只提供
+        # "绑定目标"与"本次请求的 POC 声明"。
+        ctx = GuardContext(
+            target_id=bound,
+            bound_target=bound,
+            environment=guard.environment_for(url_n),
+            identity_bound=bool(bound),
+            identity=f"detector|{bound or '-'}",
+        )
+        d = guard.check_request(
             url_n, method=method_u, body=body,
             poc_hint=(poc.id if poc is not None else "") or self._current_kind,
-        )
-        if not cls.command:
-            return self._blocked(
-                url_n, method_u, "", cls.category, "UNKNOWN",
-                f"请求分类 UNKNOWN（{'；'.join(cls.signals[:3])}），默认拒绝",
-            )
-        env = guard.environment_for(url_n)
-        clearly_read_only = (
-            method_u in ("GET", "HEAD", "OPTIONS") and cls.category == ApiCategory.READ
-        )
-        d = decide(
-            cls.command,
-            environment=env,
-            identity_bound=True,   # 检测器请求按显式匿名身份计（anonymous@host）
-            target_bound=True,     # 范围已由 in_scope 确认
-            approved=False,
-            clearly_read_only=clearly_read_only,
+            ctx=ctx,
         )
         if d.decision == Decision.ALLOW:
             return ""
@@ -312,7 +309,7 @@ class Detector(ABC):
             # 不受此影响（decide 对它们根本不返回 REVIEW）。
             return ""
         return self._blocked(
-            url_n, method_u, d.command, d.category or cls.category, d.decision,
+            url_n, method_u, d.command, d.category or "", d.decision,
             f"权限矩阵拒绝：{d.command or '未知操作'} → {d.decision}（{d.reason}）",
         )
 

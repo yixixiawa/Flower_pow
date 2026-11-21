@@ -386,6 +386,10 @@ class _CommandMixin(_Base):
                 )
                 failed = sum(1 for c in calls if c["status"] in ("error", "timeout"))
                 print(f"工具调用：{len(calls)} 次（成功 {ok}、被拒绝 {refused}、失败 {failed}）")
+            # 轮次/重复/估算 token：模型不能自己统计这些，只能由执行层记账
+            print(self.agent.stats_line())
+            if s.tasks:
+                print(f"{s.tasks.summary_line()}｜已推送状态事件 {s.tasks.cursor} 条")
         if s.turns:
             last = s.turns[-1]
             print(f"上一轮：{last.phase.label}（+{last.new_assets} 资产、+{last.new_findings} 发现）")

@@ -107,6 +107,23 @@ REQUIREMENTS: list[Requirement] = [
         "照样被拦；每步落审计",
         ("core/workflow/work.py", "core/workflow/approval.py"),
     ),
+    # ── 认证初始化 + 外部工具出口（第七轮整改）──────────────────────
+    Requirement(
+        "REQ-AUTH-BOOTSTRAP", "认证初始化必须是受限通道，且不放行后续请求", "P0",
+        "登录/刷新/登出仅在：会话绑定目标、环境明确且为测试背景、精确命中已登记"
+        "认证入口、方法与接口定义一致、参数符合认证结构、未超频时放行**单次**请求；"
+        "不新增矩阵等级、不设全局开关、登录成功不放行任何后续请求",
+        ("policy/auth_bootstrap.py", "policy/request_guard.py",
+         "core/tools/runner/verify.py", "core/planner.py"),
+    ),
+    Requirement(
+        "REQ-EXT-TOOL-GATE", "外部工具的网络能力必须被统一 Gateway 覆盖", "P0",
+        "不可解析的网络工具（curl/wget）禁网；argv 目标必须被绑定目标授权"
+        "（端口扫描类按主机、其余按 scheme+host+port）；@file 引用受路径授权；"
+        "-H 普通头不得被误判为文件路径",
+        ("policy/gateway.py", "policy/request_guard.py",
+         "core/tools/runner/external.py", "core/tools/external.py"),
+    ),
 ]
 
 REQUIRED_REQ_IDS = tuple(r.id for r in REQUIREMENTS)
@@ -175,6 +192,47 @@ CASES: list[CaseSpec] = [
                 "network.count": 1},
         negative=True, min_assertions=7,
         sources=("core/workflow/work.py",),
+    ),
+    # ── 认证初始化（AUTH_BOOTSTRAP）─────────────────────────────────
+    CaseSpec(
+        "SEC-AUTH-001", "REQ-AUTH-BOOTSTRAP",
+        "合法登录放行单次；登录成功后未授权导出仍被拒且不发请求", "security",
+        "scripts.acceptance.cases_runtime:auth_bootstrap_single_use",
+        # 负向用例也要把"发了什么"写成预期：只允许 2 次认证请求
+        # （验证码 GET + 登录 POST），导出请求必须 0 次。
+        expect={"values.login_ok": True, "values.token_present": True,
+                "values.export_blocked": True, "values.export_hits": 0,
+                "http_sent": True, "network.count": 2},
+        negative=True, min_assertions=7,
+        sources=("policy/auth_bootstrap.py", "core/tools/runner/verify.py"),
+    ),
+    CaseSpec(
+        "SEC-AUTH-002", "REQ-AUTH-BOOTSTRAP",
+        "未绑定/unknown/生产/未登记入口/参数越界/方法不符 六类全部拒绝且零请求",
+        "security",
+        "scripts.acceptance.cases_runtime:auth_bootstrap_conditions_enforced",
+        expect={"values.denied": 6, "http_sent": False, "network.count": 0},
+        negative=True, min_assertions=7,
+        sources=("policy/auth_bootstrap.py", "policy/request_guard.py"),
+    ),
+    # ── 外部工具统一 Gateway ────────────────────────────────────────
+    CaseSpec(
+        "SEC-EXT-001", "REQ-EXT-TOOL-GATE",
+        "curl 网络能力禁用：不建进程、不发请求、给出 http_request 出路", "security",
+        "scripts.acceptance.cases_runtime:external_tool_curl_no_network",
+        expect={"values.blocked": True, "values.spawned": 0,
+                "http_sent": False, "network.count": 0},
+        negative=True, min_assertions=4,
+        sources=("policy/gateway.py", "policy/request_guard.py"),
+    ),
+    CaseSpec(
+        "SEC-EXT-002", "REQ-EXT-TOOL-GATE",
+        "外部工具目标出界拒绝；-H application/json 通过；@file 越界拒绝", "security",
+        "scripts.acceptance.cases_runtime:external_tool_scope_and_header",
+        expect={"values.out_of_scope_denied": 2, "values.header_ok": True,
+                "values.header_file_denied": True, "network.count": 0},
+        negative=True, min_assertions=5,
+        sources=("policy/gateway.py", "core/tools/runner/external.py"),
     ),
     # ── L3 ───────────────────────────────────────────────────────
     CaseSpec(
@@ -254,16 +312,20 @@ CASES: list[CaseSpec] = [
         negative=True, min_assertions=4,
     ),
     CaseSpec(
-        "SEC-EXP-003", "REQ-EXPORT-AUTH-DENY", "AUTH 独立分类但无命令映射 → UNKNOWN", "unit",
+        "SEC-EXP-003", "REQ-EXPORT-AUTH-DENY", "AUTH 独立分类且不走矩阵等级；无入口即 DENY", "unit",
         "scripts.acceptance.cases_policy:auth_denied",
-        expect={"values.category": "AUTH", "values.decision": "UNKNOWN", "values.command": ""},
-        negative=True, min_assertions=4,
+        # 第七轮整改：AUTH 走 AUTH_BOOTSTRAP 受限通道——命中的是 DENY（不是
+        # 静默 UNKNOWN），且 level 必须是 AUTH_BOOTSTRAP（证明没被塞进 L0/L1）。
+        expect={"values.category": "AUTH", "values.decision": "DENY",
+                "values.command": "", "values.level": "AUTH_BOOTSTRAP"},
+        negative=True, min_assertions=6,
+        sources=("policy/api_policy.py", "policy/request_guard.py"),
     ),
     CaseSpec(
-        "SEC-EXP-004", "REQ-EXPORT-AUTH-DENY", "Runner login 工具被拒且不提交凭证", "security",
+        "SEC-EXP-004", "REQ-EXPORT-AUTH-DENY", "Runner login 工具打到非认证路径被拒且不提交凭证", "security",
         "scripts.acceptance.cases_runtime:runner_login_blocked",
         expect={"values.blocked": True, "http_sent": False, "network.count": 0,
-                "audit.any": {"event": "deny", "decision": "UNKNOWN"}},
+                "audit.any": {"event": "deny", "command": "认证初始化"}},
         negative=True, min_assertions=4,
     ),
     CaseSpec(

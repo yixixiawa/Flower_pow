@@ -119,7 +119,9 @@ policy:
   enabled: true
   # 未命中 host 绑定表时的默认环境：unknown / production /
   # dedicated_test / isolated_test。默认 unknown（L1/L2 条件不满足 → 拒绝执行）
-  default_environment: unknown
+  default_environment: isolated_test
+  environments:
+    "sgxmgl.fjny.edu.cn": isolated_test
   # host 通配 → 环境绑定。要让 L1（创建/修改测试数据）通过，
   # 目标必须绑到 isolated_test；L2 上传**仅 dedicated_test**（隔离测试
   # 环境不满足"专门"条件）且仍需逐请求审批

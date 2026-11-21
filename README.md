@@ -103,6 +103,58 @@ Hard constraints:
 * **Audit is a precondition, not a side-channel**: if the audit JSONL cannot be persisted, write operations and approvals are **refused**; read-only operations proceed with a visible warning.
 * **Identity**: credentials are bound as `cred:<header>:<fingerprint>` (+ declared role), so different tokens are distinct identities; unauthenticated requests are explicit `anonymous@<host>`.
 
+#### Authentication bootstrap: a restricted channel, not "AUTH allowed"
+
+The matrix has no AUTH row (submitting credentials is not a matrix-authorized capability), yet the agent must be able to log in normally. So login / token refresh / logout / captcha reads go through a separate channel, `AUTH_BOOTSTRAP` (`policy/auth_bootstrap.py`) — **no matrix level, no global switch, no follow-up access granted**.
+
+| Condition | Requirement |
+|---|---|
+| 1. session | `target_id` bound (no credential submission without `set_target`) |
+| 2. environment | explicit; `unknown` is always refused (never guessed) |
+| 3. context | test environments only (`isolated_test` / `dedicated_test`); production never submits credentials |
+| 4. endpoint | must resolve to an auth endpoint: registered from the API inventory, **or self-evident from the path** (last segment containing `login` / `signin` / `refresh` / `logout`, e.g. `/admin-api/system/auth/login`, `/api/user/loginByPassword`, `/oauth/token`); read-only suffixes (history / logs / list / records) do not count |
+| 5. method | the interface definition when registered; `POST` for path-inferred endpoints (login / refresh / logout) |
+| 6. parameters | keys ⊆ interface-declared fields ∪ auth field vocabulary, and must include credential fields |
+| 7. rate | sliding window + minimum interval (default 5 / 60s) |
+| 8. secrets | never in tool output or audit plaintext (redacted) |
+| 9. success | produces **no "logged in" state** — the check is a pure function |
+| 10. afterwards | every later request still goes through API Policy + GUARD |
+
+Two-level decision: **tool-level** (`check_intent`: session / environment / context / endpoint exists / rate) plus **request-level** (`check`: exact endpoint + method + parameter structure). Every request `Authenticator` makes — including the captcha GET — passes a `precheck`, so the planner path and the agent `login` tool reach the same conclusion.
+
+To make a login succeed: bind the target to `isolated_test` in `policy.environments`, then either
+
+* **known standard endpoint** — call `http_request(url="https://host/admin-api/system/auth/login", method="POST", body={"username": "...", "password": "..."})` directly; **no** prior `recon_openapi` needed, because a path whose last segment contains `login` is recognized as a login endpoint;
+* **unknown endpoint** — run `recon_openapi`, then call `login` and let the inventory pick the endpoint (captcha endpoints only work this way).
+
+Missing any condition yields a rejection that names the specific condition.
+
+#### External tools: capabilities that cannot pass the gateway are disabled
+
+Requests from external CLIs are issued by **another process** — once `subprocess` starts, method, body and redirects are invisible. Hence (`policy/gateway.py`):
+
+* **curl / wget network capability disabled** — argv cannot prove they only send read-only GETs, so no guarantee every request passes the gateway. Use the built-in `http_request` (classified and gated per request). Their flag whitelists are emptied as a second lock.
+* **Every argv target is authorized**: port scanners (nmap/masscan) at **host level**; everything else at **scheme+host+port** (a different port on the same host is out of scope), bare hosts by hostname. A tool carrying a second target is refused.
+* **`@file` references** (`-H @f` / `-d @f`) are treated as file reads: absolute paths, `..`, `~` are refused; relative paths must exist inside the project root.
+* **`-H` is no longer mistaken for a path**: values are validated as `Name: value`, so `Content-Type: application/json` passes (the old code saw `/` and treated it as a file reference). `ffuf`'s `-X` / `-d` were removed from its whitelist — write-semantics requests must use `http_request`.
+* **One gate for Detector / Runner / Scheduler / MCP / background tasks**: everything funnels into `RequestGuard` (`check_request` / `check_builtin` / `check_probe` / `check_tool`); detectors no longer duplicate the classify-and-decide logic.
+
+#### Background tasks: one process per job, events instead of polling
+
+A background job is never "fire and forget" — it has a **six-state machine** (`queued → running → done | failed | cancelled | timeout`, plus `interrupted` for snapshot restore), a fingerprint, and a result artifact:
+
+* **Dedupe before the process starts.** Fingerprint = `session + target + tool + canonical args + task type` (`core/session/tasks.py`). Same fingerprint while RUNNING → the existing `bg-N` is returned; SUCCEEDED within 10 minutes → the result is reused and **nothing re-runs**; FAILED / CANCELLED / TIMEOUT → refused ("will not auto-retry"), and only an explicit `retry=true` (user asked for it) or genuinely different args starts a new job.
+* **Timeouts are terminal.** Every job carries `timeout_s` (default 900s, cap 3600s) enforced by `asyncio.wait_for`; `TaskManager.sweep()` is the same rule for jobs whose coroutine died. A job can never sit in RUNNING forever.
+* **State changes are pushed, not polled.** Each terminal transition emits exactly one `TaskEvent`; the agent drains `events_since(cursor)` once per step, so **the same state is never injected twice**. `list_tasks` supports a bounded wait (`wait ≤ 15s`, exponential backoff) and a repeat gate refuses identical-state polling (`≥3` identical queries → refused).
+* **Results are summaries plus an artifact reference.** Anything over 1500 chars is written to `tool-output/task-bg-N_*.txt`; the context only receives the summary and the path, queried on demand with `artifact_query` (keyword / line range / JSONPath, with a query cache).
+
+#### Repetition and no-progress: recorded, not remembered
+
+Context trimming eventually drops "already tried that, got 403", so the model re-proposes it. Two code-side layers prevent it:
+
+* **Exploration ledger** (`core/session/explore.py`): objective, per-call `tool + canonical-args` fingerprint, status, summary, confirmed facts, failed methods, last evidence round. A duplicate of a previous round is **not executed** — the model gets "this ran in round N with result X; explain the new evidence or the parameter difference". Dedupe keys on arguments, never on tool name, and only within the same objective (a user turn that explicitly asks to retry, or a genuinely new instruction, starts a new scope).
+* **No-progress guard**: each step's signature = call fingerprints + result digests + finding/asset/clue counts + task states. Three identical steps → stop executing tools, hand the model one last chance to conclude, then emit the summary (confirmed facts / failed methods / open questions). Rewording the same operation does not evade it — the signature carries no natural language.
+
 #### MCP server
 
 `mcp_server/` exposes the scanner to external AI clients over stdio or HTTP with **10 tools**: `doctor`, `poc_list`, `poc_show`, `kb_search`, `sessions`, `findings`, `scan_start`, `scan_status`, `scan_cancel`, `report`. Scans run as background jobs — `scan_start` returns a `job_id` immediately, `scan_status` polls, `report` exports.
@@ -344,6 +396,58 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 * **对象台账**：只有**执行成功并从响应取得对象标识**的创建/上传才会登记，按 目标 + 轮次 + 账号身份 + 对象标识 四元组匹配；未登记的对象**一律删不掉**——审批是第二道门，不能替代对象身份验证。
 * **审计是写操作的先决条件**：审计 JSONL 无法持久化时，写操作与审批**拒绝执行**；只读操作放行但状态行可见告警。
 * **账号身份**：凭证以 `cred:<头名>:<指纹>`（+ 显式声明的角色）绑定，不同 token 是不同身份；未认证请求显式记为 `anonymous@<host>`。
+
+#### 认证初始化：受限通道，不是"放宽 AUTH"
+
+矩阵没有 AUTH 授权行（提交凭证不属于矩阵授权过的能力），但 Agent 必须能完成**正常登录**。所以登录/刷新/登出/验证码读取走一条独立通道 `AUTH_BOOTSTRAP`（`policy/auth_bootstrap.py`），**不占任何矩阵等级、没有全局开关、不放行后续请求**。
+
+| 条件 | 要求 |
+|---|---|
+| ① 会话 | 已绑定 `target_id`（未 set_target 不允许提交凭证） |
+| ② 环境 | 必须明确，`unknown` 一律拒绝（不猜） |
+| ③ 背景 | 仅测试环境（`isolated_test` / `dedicated_test`）；production 不做凭证提交 |
+| ④ 入口 | URL 必须命中认证入口：接口清单登记，**或路径自证**（末段含 `login` / `signin` / `refresh` / `logout` 即认，如 `/admin-api/system/auth/login`、`/api/user/loginByPassword`、`/oauth/token`）；只读后缀（history / logs / list / records）不算 |
+| ⑤ 方法 | 清单登记时取接口定义；路径自证时固定 POST（login / refresh / logout） |
+| ⑥ 参数 | 字段 ⊆ 接口声明 ∪ 认证字段词表，且必须带凭证字段；越界字段直接拒 |
+| ⑦ 频率 | 滑动窗口 + 最小间隔（默认 5 次 / 60s） |
+| ⑧ 凭证 | 不进工具输出、不进审计明文（统一脱敏） |
+| ⑨ 登录成功 | **不产生任何"已登录"放行状态**（纯函数判定，无会话级开关） |
+| ⑩ 后续请求 | 照旧走 API Policy + GUARD（导出/写/删除该拒还是拒） |
+
+两级判定：**工具级**（`check_intent`：会话/环境/背景/入口存在/频率）+ **请求级**（`check`：URL 匹配 + 方法 + 参数结构）。`Authenticator` 发出的每一个请求（含验证码 GET）都要过 `precheck`，剧本路径（Planner）与 Agent 路径（`login` 工具）同一结论。
+
+想让登录通过：先在 `policy.environments` 里把目标绑到 `isolated_test`，然后两条路——
+
+* **已知标准端点**：直接 `http_request(url="https://host/admin-api/system/auth/login", method="POST", body={"username": "...", "password": "..."})`。**不需要**先跑 `recon_openapi`——路径末段含 `login` 就会被认成登录入口。
+* **不知道端点**：`recon_openapi` 拿接口清单后调 `login`，由清单挑选具体入口（验证码入口只能走这条）。
+
+缺任何一条条件，拒绝文本会说清是哪一条。
+
+#### 外部工具：走不了 Gateway 的能力，直接禁用
+
+外部 CLI 的请求由**另一个进程**发出，`subprocess` 一启动就看不到方法/请求体/重定向。所以（`policy/gateway.py`）：
+
+* **curl / wget 网络能力禁用**——argv 无法证明它们只发只读 GET，也就无法保证每个请求过了 Gateway。请改用内置 `http_request`（逐请求过分类与矩阵）。参数白名单同时清空（双保险）。
+* **argv 目标逐个授权**：端口扫描类（nmap/masscan）按**主机级**；其余按 **scheme+host+port**（同主机换端口也算越界），裸主机按主机名。工具自带第二个目标 → 拒绝。
+* **`@file` 引用**（`-H @f` / `-d @f`）按文件读取授权处理：绝对路径 / `..` / `~` 一律拒绝，项目内相对路径必须存在且在根目录内。
+* **`-H` 不再被当路径**：取值按 `Name: value` 校验，`Content-Type: application/json` 合法通过（旧实现因为值里有 `/` 判成文件引用）；`ffuf` 的 `-X` / `-d` 已从白名单移除，写语义请求只能走 `http_request`。
+* **Detector / Runner / Scheduler / MCP / 后台任务同一入口**：全部收敛到 `RequestGuard`（`check_request` / `check_builtin` / `check_probe` / `check_tool`），探测器不再自己复制"分类 + decide"。
+
+#### 后台任务：一个指纹一个进程，状态靠推送不靠轮询
+
+后台任务不是"扔出去就不管"：它有**六态状态机**（`queued → running → done | failed | cancelled | timeout`，快照恢复另有 `interrupted`）、任务指纹和结果 artifact：
+
+* **起进程之前先去重。** 指纹 = `会话 + 目标 + 工具 + 规范化参数 + 任务类型`（`core/session/tasks.py`）。同指纹 RUNNING → 返回原 `bg-N`；10 分钟内 SUCCEEDED → 直接复用结果、**一个进程都不起**；FAILED / CANCELLED / TIMEOUT → 拒绝并说明"不会自动重跑"，只有显式 `retry=true`（用户明确要求）或参数真的变了才新建。
+* **超时是终态。** 每个任务带 `timeout_s`（默认 900s，上限 3600s），由 `asyncio.wait_for` 到点终止；协程意外消失的情况由 `TaskManager.sweep()` 按同一规则收割。任务不可能永远停在 RUNNING。
+* **状态变更靠推送。** 每次进入终态恰好产生一条 `TaskEvent`，Agent 每步用 `events_since(cursor)` 只取增量，**同一状态不会被注入第二次**。`list_tasks` 支持有上限等待（`wait ≤ 15s`，指数退避），并对"连续查到相同状态"直接拒绝（≥3 次）。
+* **结果只给摘要 + artifact 引用。** 超过 1500 字符落 `tool-output/task-bg-N_*.txt`，上下文只留摘要和路径；需要细节用 `artifact_query`（keyword / 行范围 / JSONPath，带查询缓存）定点查。
+
+#### 重复探索与无进展：记账，不靠模型记忆
+
+上下文裁剪迟早会把"这个路径试过、403"裁掉，模型就会再提一次。两道代码层拦住它：
+
+* **探索台账**（`core/session/explore.py`）：objective、每次调用的 `工具 + 规范化参数` 指纹、状态、摘要、已确认事实、已失败方法、最近一次有效证据的轮次。跨轮重复动作**不执行**，回一句"第 N 轮做过，结果是 X；要重做请说明新证据或参数差异"。判重键是参数不是工具名，且只在**同一目标**内成立（用户明确要求重试、或给出新指令时另起一代次）。
+* **无进展守卫**：每步签名 = 动作指纹 + 结果摘要 + 发现/资产/线索计数 + 任务状态。连续 3 步完全一致 → 停止执行工具、给模型最后一次收口机会，之后由代码输出结论（已确认事实 / 已失败方法 / 未决问题）。换个说法描述同一操作绕不过去——签名里没有自然语言。
 
 #### 安全验收：不以"测试全绿"为依据
 

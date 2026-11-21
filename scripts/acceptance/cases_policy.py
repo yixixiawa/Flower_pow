@@ -109,7 +109,12 @@ def unknown_method_denied(ctx) -> None:
     guard = RequestGuard(ctx.cfg(env=""))
     d = guard.check_request(
         url, method="PROPFIND",
-        ctx=GuardContext(bound_target="http://h:8080", identity_bound=True),
+        ctx=GuardContext(
+            target_id="http://h:8080", bound_target="http://h:8080",
+            # 环境给成测试环境，才能把判定推进到"认证入口是否登记"这一步：
+            # 这条用例考的是"AUTH 没有授权依据"，不是"环境未知"。
+            environment="isolated_test", identity_bound=True,
+        ),
     )
     ctx.check(d.decision == Decision.UNKNOWN, f"决策应为 UNKNOWN，实际 {d.decision}")
     ctx.check(d.denied, "UNKNOWN 必须视为拒绝")
@@ -127,7 +132,12 @@ def export_denied(ctx) -> None:
     guard = RequestGuard(ctx.cfg(env=""))
     d = guard.check_request(
         url, method="GET",
-        ctx=GuardContext(bound_target="http://h:8080", identity_bound=True),
+        ctx=GuardContext(
+            target_id="http://h:8080", bound_target="http://h:8080",
+            # 环境给成测试环境，才能把判定推进到"认证入口是否登记"这一步：
+            # 这条用例考的是"AUTH 没有授权依据"，不是"环境未知"。
+            environment="isolated_test", identity_bound=True,
+        ),
     )
     ctx.check(d.decision == Decision.UNKNOWN, f"决策应为 UNKNOWN（默认拒绝），实际 {d.decision}")
     ctx.check(d.category == ApiCategory.EXPORT, "审计里应保留 EXPORT 识别信号")
@@ -137,6 +147,13 @@ def export_denied(ctx) -> None:
 
 
 def auth_denied(ctx) -> None:
+    """AUTH 没有矩阵授权行，但仍必须被拒——且不走 L0/L1。
+
+    第七轮整改后 AUTH 走 **AUTH_BOOTSTRAP 受限通道**：没有已登记认证入口
+    的登录请求会被 DENY（而不是静默 UNKNOWN）。安全性质不变（拒绝），
+    口径更严格：DENY 比 UNKNOWN 更明确，且 level 一定是 AUTH_BOOTSTRAP，
+    证明它没有被映射进任何矩阵等级。
+    """
     url = "http://h:8080/login"
     cls = classify_request(url, method="POST")
     ctx.check(cls.category == ApiCategory.AUTH, f"分类应为 AUTH，实际 {cls.category}")
@@ -144,12 +161,47 @@ def auth_denied(ctx) -> None:
     guard = RequestGuard(ctx.cfg(env=""))
     d = guard.check_request(
         url, method="POST",
-        ctx=GuardContext(bound_target="http://h:8080", identity_bound=True),
+        ctx=GuardContext(
+            target_id="http://h:8080", bound_target="http://h:8080",
+            # 环境给成测试环境，才能把判定推进到"认证入口是否登记"这一步：
+            # 这条用例考的是"AUTH 没有授权依据"，不是"环境未知"。
+            environment="isolated_test", identity_bound=True,
+        ),
     )
-    ctx.check(d.decision == Decision.UNKNOWN, f"决策应为 UNKNOWN，实际 {d.decision}")
-    ctx.check(d.denied, "UNKNOWN 必须视为拒绝")
+    ctx.check(d.decision == Decision.DENY, f"决策应为 DENY（受限通道拒绝），实际 {d.decision}")
+    ctx.check(d.denied, "DENY 必须视为拒绝")
+    ctx.check(not d.allowed, "AUTH 请求不得被放行")
+    ctx.check(d.level == "AUTH_BOOTSTRAP",
+              f"AUTH 必须走受限通道而不是矩阵等级，实际 level={d.level!r}")
+    # 空 body 的 POST /login：路径自证认出它是登录入口，但**缺凭证字段**，
+    # 依然拒绝（"像登录入口"不等于"就是一次登录"）。理由必须说清是哪一条。
+    ctx.check(
+        ("凭证" in d.reason) or ("未登记" in d.reason) or ("结构" in d.reason),
+        f"拒绝理由应说明未通过哪条认证条件：{d.reason[:120]}",
+    )
+    ctx.check(any(("PARAMS_INVALID" in s) or ("ENDPOINT_UNREGISTERED" in s)
+                  for s in d.signals),
+              f"判定码应是 PARAMS_INVALID / ENDPOINT_UNREGISTERED：{d.signals}")
+
+    # 反向加强：**参数是合法凭证**、但路径不是认证入口 → 认证通道仍然拒绝。
+    # 这条证明放宽的只是"入口识别"，没有变成"任意 URL 都能提交凭证"。
+    # （直接调 check_auth：这里考的是 AUTH_BOOTSTRAP 通道本身，不牵扯分类器。）
+    d2 = guard.check_auth(
+        "http://h:8080/api/users/export", method="POST",
+        body='{"username": "u", "password": "p"}',
+        ctx=GuardContext(
+            target_id="http://h:8080", bound_target="http://h:8080",
+            environment="isolated_test", identity_bound=True,
+        ),
+        count_rate=False,
+    )
+    ctx.check(d2.decision == Decision.DENY,
+              f"非认证路径即使带凭证也必须拒绝，实际 {d2.decision}")
+    ctx.check("未登记" in d2.reason or "不是认证入口" in d2.reason,
+              f"拒绝理由应说明该路径不是认证入口：{d2.reason[:120]}")
     ctx.set("category", d.category)
     ctx.set("decision", d.decision)
+    ctx.set("level", d.level)
     ctx.set("command", cls.command)
 
 
@@ -174,7 +226,12 @@ def fileread_unmapped(ctx) -> None:
     guard = RequestGuard(ctx.cfg(env=""))
     d = guard.check_probe(
         "http://h:8080/x", "fileread",
-        ctx=GuardContext(bound_target="http://h:8080", identity_bound=True),
+        ctx=GuardContext(
+            target_id="http://h:8080", bound_target="http://h:8080",
+            # 环境给成测试环境，才能把判定推进到"认证入口是否登记"这一步：
+            # 这条用例考的是"AUTH 没有授权依据"，不是"环境未知"。
+            environment="isolated_test", identity_bound=True,
+        ),
     )
     ctx.check(d.decision == Decision.UNKNOWN, f"应 UNKNOWN 拒绝，实际 {d.decision}")
     ctx.check(d.denied, "UNKNOWN 必须视为拒绝")

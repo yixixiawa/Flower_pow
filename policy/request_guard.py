@@ -16,6 +16,7 @@ Guard 自身**绝不放行**：它只产出结论，拒绝文本与审计记录�
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -101,6 +102,25 @@ class Command:
 
 
 # ── 分类结果 ──────────────────────────────────────────────────────
+
+
+def normalize_body(body: Any) -> str:
+    """请求体归一为**可解析的文本**：dict/list → JSON，其它 → str。
+
+    为什么需要：调用方（模型 / 工具 handler）常把 body 直接写成 JSON 对象，
+    ``str(dict)`` 会产出单引号 repr（``{'username': 'u'}``）——策略层
+    :func:`policy.auth_bootstrap.body_keys` 解析不出字段名，合法登录会被判
+    "缺凭证字段"；httpx 那边也发不出去。归一之后「策略看到的结构」与
+    「真正发出去的结构」是同一份，不存在两者不一致的空子。
+    """
+    if body is None:
+        return ""
+    if isinstance(body, (dict, list)):
+        try:
+            return json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(body)
+    return body if isinstance(body, str) else str(body)
 
 
 @dataclass(slots=True)
@@ -458,6 +478,10 @@ class GuardContext:
     ``environment`` 留空 = 未指定（guard 会按 URL 的 host 绑定表现算）；
     显式填 unknown / production 等值则**覆盖** URL 判定——调用方已经
     知道答案时不必再猜一遍。
+
+    ``auth_entries`` / ``session_id`` / ``credentials_present`` 只服务
+    AUTH_BOOTSTRAP（认证初始化）判定：已登记认证入口、会话隔离键、
+    当前会话是否已有可刷新凭证。缺省值 = 未登记 → 认证请求一律拒绝。
     """
 
     target_id: str = ""
@@ -467,6 +491,9 @@ class GuardContext:
     identity: str = ""              # 账号身份上下文（审计与台账用，P1-7）
     target_bound: bool = False      # 兼容字段：仅表示"会话已有目标"
     bound_target: str = ""          # **绑定的目标 URL**（P0-①：in_scope 全量校验）
+    session_id: str = ""            # 会话隔离键（AUTH_BOOTSTRAP 频率桶/审计）
+    auth_entries: tuple = ()        # 已登记认证入口（AuthEndpoint 元组）
+    credentials_present: bool = False  # 本会话是否已有可刷新凭证（Token 刷新前置）
 
 
 class RequestGuard:
@@ -567,10 +594,21 @@ class RequestGuard:
     ) -> PolicyDecision:
         """识别 + 决策。**策略恒生效**（P0-2：enabled 不再是旁路）。"""
         ctx = ctx or GuardContext()
+        body = normalize_body(body)     # dict/list → JSON（判定与发送看到同一份）
         cls = classify_request(
             url, method=method, body=body, params=params,
             poc_hint=poc_hint, history_hint=history_hint,
         )
+        # AUTH 分类没有矩阵授权行（COMMAND_FOR_CATEGORY 为空串）。登录/刷新/
+        # 登出/验证码读取**不能**因此就"顺理成章"走 UNKNOWN——那会让 Agent
+        # 无法完成正常登录。它们走独立的 AUTH_BOOTSTRAP 受限通道：
+        # 十条前置条件全满足才放行单次请求，不放宽矩阵、不设全局开关。
+        if cls.category == ApiCategory.AUTH:
+            d = self.check_auth(
+                url, method=method, body=body, params=params, ctx=ctx,
+            )
+            d.signals = list(d.signals) + list(cls.signals[:3])
+            return d
         if not cls.command:
             return PolicyDecision(
                 decision=Decision.UNKNOWN,
@@ -601,8 +639,127 @@ class RequestGuard:
         d.signals = cls.signals
         return d
 
+    # ── AUTH_BOOTSTRAP：受限认证初始化（登录 / 刷新 / 登出 / 验证码）──
+    @staticmethod
+    def _auth_decision(d0) -> PolicyDecision:
+        """把 :class:`policy.auth_bootstrap.AuthDecision` 转成统一决策对象。
+
+        ``level`` 记 ``AUTH_BOOTSTRAP``（**不是** L0–L3）：这条通道没有矩阵
+        等级，审计/拒绝文本必须能一眼区分"矩阵判定"与"认证初始化判定"。
+        """
+        from policy.auth_bootstrap import AUTH_COMMAND, AUTH_LEVEL
+
+        decision = Decision.ALLOW if d0.allowed else Decision.DENY
+        return PolicyDecision(
+            decision=decision,
+            command=AUTH_COMMAND,
+            level=AUTH_LEVEL,
+            category=ApiCategory.AUTH,
+            reason=d0.reason,
+            signals=list(d0.signals) + [f"AUTH_BOOTSTRAP 判定码：{d0.code}"],
+        )
+
+    def check_auth(
+        self,
+        url: str,
+        method: str = "POST",
+        body: str = "",
+        params: dict[str, Any] | None = None,
+        ctx: GuardContext | None = None,
+        *,
+        count_rate: bool = True,
+    ) -> PolicyDecision:
+        """认证初始化的唯一判定入口（AUTH 分类不再落入 UNKNOWN）。
+
+        判定本体在 :func:`policy.auth_bootstrap.check`（纯函数 + 频率计数），
+        这里只负责把上下文喂进去。**不放行任何后续请求**：本函数返回
+        ALLOW 只代表"这一次认证请求可以发出"，不写任何会话/全局状态。
+
+        ``count_rate=False`` 供"工具级已计过数"的复核调用（Authenticator
+        的逐请求 precheck）使用——避免一次登录被算两次配额。
+        """
+        from policy import auth_bootstrap as ab
+
+        ctx = ctx or GuardContext()
+        body = normalize_body(body)     # 同上：dict 不能变 Python repr
+        env = ctx.environment or self.environment_for(url)
+        d0 = ab.check(
+            url=url, method=method, body=body, params=params,
+            entries=tuple(getattr(ctx, "auth_entries", ()) or ()),
+            target_id=ctx.target_id,
+            bound_target=ctx.bound_target,
+            environment=env,
+            session_id=ctx.session_id,
+            credentials_present=bool(getattr(ctx, "credentials_present", False)),
+            count_rate=count_rate,
+        )
+        return self._auth_decision(d0)
+
+    def check_auth_intent(
+        self, kind: str = "login", ctx: GuardContext | None = None,
+    ) -> PolicyDecision:
+        """工具级认证意图判定（登录/刷新/登出各一次，计频率）。
+
+        与 :meth:`check_auth` 的分工见 :func:`policy.auth_bootstrap.check_intent`：
+        本函数只回答"这个意图能不能发起"，具体 URL/方法/参数仍要逐请求
+        过 :meth:`check_auth`。
+        """
+        from policy import auth_bootstrap as ab
+
+        ctx = ctx or GuardContext()
+        d0 = ab.check_intent(
+            kind=kind,
+            target_id=ctx.target_id,
+            bound_target=ctx.bound_target,
+            environment=ctx.environment
+            or self.environment_for(ctx.bound_target),
+            entries=tuple(getattr(ctx, "auth_entries", ()) or ()),
+            session_id=ctx.session_id,
+            credentials_present=bool(getattr(ctx, "credentials_present", False)),
+        )
+        return self._auth_decision(d0)
+
     def check_tool(self, tool_key: str, args: dict[str, Any], ctx: GuardContext | None = None) -> PolicyDecision:
-        """外部工具调用走这里：按工具语义直接映射命令（无需报文识别）。"""
+        """外部工具调用走这里：按工具语义直接映射命令（无需报文识别）。
+
+        **外部工具的网络能力在这里被钉死**（第七轮整改）：
+
+        * 网络行为无法被 argv 证明的工具（curl/wget）→ 禁网（DENY）；
+        * argv 里出现**非绑定主机**的目标 → 拒绝（不允许工具自带第二个目标）；
+        * ``@file`` 引用结构越界（绝对路径/``..``/``~``）→ 拒绝；
+        * 其余按矩阵命令判定（L3 一律拒绝，未映射 → UNKNOWN）。
+
+        所有判定共用 :mod:`policy.gateway` 的 argv 解析——不在这里另写一份。
+        """
+        from policy import gateway
+
+        ctx = ctx or GuardContext()
+        raw_argv = args.get("argv") or args.get("args") or []
+        if isinstance(raw_argv, str):
+            # 模型偶尔把列表写成单个字符串：按单 token 处理（不丢目标，
+            # 不因类型错就当成"没有参数"而放宽）。
+            argv = [raw_argv]
+        elif isinstance(raw_argv, (list, tuple)):
+            argv = [str(a) for a in raw_argv]
+        else:
+            argv = []
+        explicit = str(args.get("target") or args.get("url") or "")
+
+        # ① 不可解析的网络能力 → 禁用（不放宽限制，改用内置 http_request）
+        if gateway.is_unverifiable(tool_key):
+            return PolicyDecision(
+                decision=Decision.DENY,
+                command="",
+                level="",
+                category=ApiCategory.EXECUTE,
+                reason=gateway.unverifiable_reason(tool_key),
+                signals=[
+                    f"外部工具：{tool_key}",
+                    "argv 无法证明其请求方法/请求体/重定向",
+                    "出路：内置 http_request（逐请求过分类与矩阵）",
+                ],
+            )
+
         command = _TOOL_COMMAND.get(tool_key, "")
         if not command:
             # 未知外部工具 → UNKNOWN 默认拒绝（不得自动放行未知接口）
@@ -611,32 +768,67 @@ class RequestGuard:
                 command="",
                 reason=f"外部工具 {tool_key} 不在权限矩阵映射内，默认拒绝执行",
             )
-        ctx = ctx or GuardContext()
-        url = str(args.get("target") or args.get("url") or "")
-        # 工具未显式给目标时默认作用于绑定目标本身（与 runner 的回退一致）
-        if not url and ctx.bound_target:
-            url = ctx.bound_target
-        # P0-①：与 check_request 同一统一入口（scheme+host+port+路径前缀）。
-        # 显式给了不同目标的工具调用按出界处理；未给目标且会话已绑定 → 视为在范围内。
-        target_bound = bool(ctx.bound_target) and (
-            not str(args.get("target") or args.get("url") or "")
-            or in_scope(url, ctx.bound_target)
-        )
-        # P1-1（第六轮整改）：映射为只读语义的外部工具（nmap/curl/dirsearch
-        # 等枚举与取回事实类）构成"明确只读"——unknown 环境照旧放行；
+
+        # ② 目标：显式目标 + argv 里的所有目标，逐个做**主机级**授权比对
+        targets = ([explicit] if explicit else []) + gateway.argv_targets(argv)
+        if not targets and ctx.bound_target:
+            # 工具未显式给目标时默认作用于绑定目标本身（与 runner 的回退一致）
+            targets = [ctx.bound_target]
+        outside = [
+            t for t in targets
+            if not gateway.target_allowed(tool_key, t, ctx.bound_target)
+        ]
+        if outside:
+            level = rule_for_command(command).level if rule_for_command(command) else ""
+            return PolicyDecision(
+                decision=Decision.DENY,
+                command=command,
+                level=level,
+                category=ApiCategory.EXECUTE,
+                reason=(
+                    f"外部工具禁止访问未绑定目标：{outside[:3]}"
+                    f"（绑定目标主机 {ctx.bound_target or '未绑定'}）"
+                ),
+                signals=[f"外部工具：{tool_key}", f"argv 目标：{outside[:3]}"],
+            )
+
+        # ③ 文件引用：结构上越界的 @file 直接拒绝（存在性/根目录由 runner 再校）
+        bad_refs = [r for r in gateway.file_refs(argv) if gateway.unsafe_file_ref(r)]
+        if bad_refs:
+            level = rule_for_command(command).level if rule_for_command(command) else ""
+            return PolicyDecision(
+                decision=Decision.DENY,
+                command=command,
+                level=level,
+                category=ApiCategory.EXECUTE,
+                reason=(
+                    f"外部工具的文件引用越界：{bad_refs[:3]}"
+                    "（不允许绝对路径/项目目录外文件/未授权读取）"
+                ),
+                signals=[f"外部工具：{tool_key}", f"@file 引用：{bad_refs[:3]}"],
+            )
+
+        url = explicit or (targets[0] if targets else "")
+        target_bound = bool(ctx.bound_target) and bool(targets)
+        # P1-1（第六轮整改）：映射为只读语义的外部工具（nmap/dirsearch 等
+        # 枚举与取回事实类）构成"明确只读"——unknown 环境照旧放行；
         # L3 类映射（sqlmap/nuclei/hydra）不受此影响（矩阵一律拒绝）。
         d = decide(
             command,
-            environment=ctx.environment or self.environment_for(url),
+            environment=ctx.environment or self.environment_for(url or ctx.bound_target),
             identity_bound=ctx.identity_bound,
             target_bound=target_bound,
             approved=False,  # P0-②：审批只在运行期逐请求发生
             clearly_read_only=command in (Command.QUERY_LIST, Command.QUERY_DETAIL),
         )
         d.category = ApiCategory.EXECUTE
+        d.signals = [f"外部工具：{tool_key}", f"目标：{targets[:3] or '（绑定目标）'}"]
         return d
 
-    def check_builtin(self, tool_key: str, url: str, ctx: GuardContext | None = None) -> PolicyDecision:
+    def check_builtin(
+        self, tool_key: str, url: str, ctx: GuardContext | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> PolicyDecision:
         """Runner 内置目标请求工具的统一决策入口（第六轮整改 P0-1）。
 
         sqli_probe / login / authz_probe / recon_* 全部走这里——与
@@ -645,8 +837,13 @@ class RequestGuard:
         审批恒 False（L3 无出路；L2 的逐请求审批在运行期通道）。
 
         映射表 :data:`_BUILTIN_TOOL_COMMAND`；映射为空串（如 login——
-        AUTH 无矩阵授权）或缺席 → UNKNOWN 默认拒绝。
+        AUTH 无矩阵授权）或缺席 → UNKNOWN 默认拒绝。**例外**：``login``
+        走 AUTH_BOOTSTRAP 受限通道（条件全满足才放行单次登录），不放宽
+        矩阵、不设全局开关。
         """
+        ctx = ctx or GuardContext()
+        if tool_key == "login":
+            return self._check_login_tool(url, ctx, payload or {})
         command = _BUILTIN_TOOL_COMMAND.get(tool_key)
         if not command:
             return PolicyDecision(
@@ -677,6 +874,43 @@ class RequestGuard:
         )
         d.category = ApiCategory.READ if command in (Command.QUERY_LIST, Command.QUERY_DETAIL) else _CATEGORY_FOR_COMMAND.get(command, ApiCategory.UNKNOWN)
         d.signals = [f"内置工具 {tool_key} → {command}"]
+        return d
+
+    def _check_login_tool(
+        self, url: str, ctx: GuardContext, payload: dict[str, Any],
+    ) -> PolicyDecision:
+        """``login`` 工具 → AUTH_BOOTSTRAP 受限通道（不是矩阵放行）。
+
+        ``login`` 的 URL 参数语义是"目标"，真正的登录端点是
+        :func:`core.auth.pick_login_endpoint` 从接口清单里挑出来的，可能
+        不止一个候选。所以分两种情况：
+
+        * url 为空或就是绑定目标根 → 走**工具级意图判定**
+          （:meth:`check_auth_intent`）：会话/环境/测试背景/入口存在/频率；
+          具体端点由 ``Authenticator`` 的逐请求 precheck 再校（精确命中
+          登记入口 + 参数结构）；
+        * url 指向具体路径 → 走**请求级判定**：必须精确命中登记入口，
+          不允许把登录指向任意地址。
+
+        两级都不通过就拒绝。凭证值本身**不进** reason/审计。
+        """
+        from policy import auth_bootstrap as ab
+
+        entries = tuple(getattr(ctx, "auth_entries", ()) or ())
+        target = ctx.bound_target or url
+        at_root = bool(url) and in_scope(url, target) and in_scope(target, url)
+        cred = {
+            str(k).lower(): v for k, v in (payload or {}).items()
+            if str(k).lower() in ab.AUTH_FIELD_VOCAB
+        }
+        if not url or at_root:
+            d = self.check_auth_intent(ab.AuthKind.LOGIN, ctx=ctx)
+            d.signals.append("内置工具 login → AUTH_BOOTSTRAP（工具级意图）")
+            return d
+        d = self.check_auth(
+            url, method="POST", params=cred, ctx=ctx,
+        )
+        d.signals.append("内置工具 login → AUTH_BOOTSTRAP（请求级精确匹配）")
         return d
 
     def check_probe(self, url: str, kinds: str, ctx: GuardContext | None = None) -> PolicyDecision:
@@ -761,6 +995,11 @@ _CATEGORY_FOR_COMMAND: dict[str, str] = {
 # 映射按工具的**主要能力**归类，不是按它"通常拿来干什么"：
 # curl 能发任意请求，但本工具链里它承担的是取回事实（L0 语义），
 # 写语义请求应走 http_request（那里有逐请求的分类与判定）。
+#
+# 第七轮整改：**curl / wget 的网络能力已禁用**（见 policy.gateway）。
+# 它们的请求由外部进程发出，argv 无法证明方法/请求体/重定向——
+# 无法保证"每个请求都过 Gateway"，因此不放行；这里的映射保留只为
+# 历史审计口径，判定在 check_tool 里先被 UNVERIFIABLE 分支短路。
 _TOOL_COMMAND: dict[str, str] = {
     "nmap": Command.QUERY_LIST,       # 端口探测 = 只读列举
     "masscan": Command.QUERY_LIST,
@@ -770,7 +1009,7 @@ _TOOL_COMMAND: dict[str, str] = {
     "nikto": Command.QUERY_LIST,      # 已知漏洞指纹比对（只读取证）
     "whatweb": Command.QUERY_LIST,    # 指纹识别
     "wpscan": Command.QUERY_LIST,     # CMS 枚举（默认无 --password 攻击）
-    "curl": Command.QUERY_DETAIL,     # 取回事实：JS/接口响应
+    "curl": Command.QUERY_DETAIL,     # 取回事实：JS/接口响应（网络能力已禁用）
     "sqlmap": Command.SQLI_VERIFY,    # SQL 注入验证（L3）
     "nuclei": Command.SQLI_VERIFY,    # 模板扫可能带利用 payload（L3）
     "hydra": Command.EXECUTE_CMD,     # 攻击性爆破，按 L3 攻击命令归类
@@ -781,13 +1020,14 @@ _TOOL_COMMAND: dict[str, str] = {
 # sqli_probe / login / authz_probe / recon_* 全部纳入策略执行）。
 # 权威表在本模块，runner 只引用；映射缺席的内置工具一律 UNKNOWN 拒绝。
 # * sqli_probe 的唯一能力就是 SQL 注入验证 → L3 一律拒绝；
-# * login 提交凭证建立会话——矩阵没有 AUTH 授权行 → 空串 UNKNOWN 拒绝
-#   （与 http_request 打 /login 端点的判定同口径，不得映射 L0）；
+# * login 提交凭证建立会话——矩阵没有 AUTH 授权行，**不走矩阵**：
+#   它在 check_builtin 里转交 AUTH_BOOTSTRAP 受限通道（十条前置条件，
+#   单次生效）。这里的空串仍表示"矩阵无授权行"，防止被误映射成 L0；
 # * authz_probe / recon_* 只发只读 GET 侦察 → 查询列表（L0，
 #   环境绑定条件由 decide() 的 L0 分支把关）。
 _BUILTIN_TOOL_COMMAND: dict[str, str] = {
     "sqli_probe": Command.SQLI_VERIFY,      # L3：一律拒绝
-    "login": "",                            # AUTH 无矩阵授权 → UNKNOWN
+    "login": "",                            # AUTH 无矩阵授权 → AUTH_BOOTSTRAP 通道
     "authz_probe": Command.QUERY_LIST,      # L0：只读 GET 对比
     "recon_fingerprint": Command.QUERY_LIST,
     "recon_ports": Command.QUERY_LIST,
@@ -805,8 +1045,10 @@ BUILTIN_POLICY_TOOLS: frozenset[str] = frozenset(_BUILTIN_TOOL_COMMAND)
 
 # ── AUTH 操作的唯一授权入口 ───────────────────────────────────────
 # 权限矩阵**没有 AUTH 授权行**（提交凭证/登录不属于矩阵授权过的能力）。
-# 运行期唯一合法的 AUTH 途径是"人改代码加白名单"——与 L3 同一纪律：
-# 不存在配置旁路，也不存在"测试环境就自动允许登录"。
+# 运行期唯一合法的 AUTH 途径是 AUTH_BOOTSTRAP 受限通道
+# （:func:`policy.auth_bootstrap.check`）+ L3 式的"人改代码加白名单"纪律：
+# 不存在配置旁路，也不存在"测试环境就自动允许登录"——AUTH_BOOTSTRAP 的
+# 十条前置条件全部满足才放行单次请求。
 #
 # 为什么需要这个入口：Planner（固定剧本）会直接调 core.auth.Authenticator
 # 登录，不经过 Runner 的 login 工具闸门。如果不在 Planner 自己这里拦一道，
@@ -815,21 +1057,58 @@ BUILTIN_POLICY_TOOLS: frozenset[str] = frozenset(_BUILTIN_TOOL_COMMAND)
 AUTH_OPERATION_WHITELIST: frozenset[str] = frozenset()
 
 
-def auth_operation_allowed(target: str) -> tuple[bool, str]:
-    """AUTH 类操作（登录/提交凭证）的授权判定。
+def auth_operation_allowed(
+    target: str,
+    *,
+    intent: str = "",
+    entries: Any = (),
+    environment: str = "",
+    method: str = "POST",
+    body: str = "",
+    params: dict[str, Any] | None = None,
+    target_id: str | None = None,
+    session_id: str = "",
+    credentials_present: bool = False,
+) -> tuple[bool, str]:
+    """AUTH 类操作（登录/刷新/登出）的授权判定。
 
-    返回 ``(是否允许, 理由)``。默认拒绝；唯一放行方式是在
-    :data:`AUTH_OPERATION_WHITELIST` 里显式写入目标主机——那是代码级
-    变更，需要评审，不是改配置文件能开的口子。
+    返回 ``(是否允许, 理由)``。判定本体是
+    :func:`policy.auth_bootstrap.check` / :func:`~policy.auth_bootstrap.check_intent`
+    ——**默认拒绝**，只有十条前置条件全部满足（会话绑定目标、环境明确且在
+    测试背景、精确命中已登记认证入口、方法与接口定义一致、参数符合认证结构、
+    未超频）才放行**这一次**请求。
+
+    ``intent`` 非空表示"工具级意图判定"（URL 是目标根、真实端点由接口清单
+    解析）；为空表示"请求级判定"（target 就是具体端点 URL）。
+
+    ``AUTH_OPERATION_WHITELIST`` 保留为代码级白名单：写入目标主机是
+    代码变更、需评审；它**不**绕过 AUTH_BOOTSTRAP 的条件（默认空集合）。
     """
-    try:
-        host = (urlparse(target or "").hostname or "").lower()
-    except ValueError:
-        host = ""
-    if host and host in AUTH_OPERATION_WHITELIST:
-        return True, f"AUTH 操作目标 {host} 在代码级白名单内"
-    return False, (
-        "AUTH 操作（提交凭证/登录）没有权限矩阵授权行，默认拒绝执行。"
-        "确有需要请在 policy.request_guard.AUTH_OPERATION_WHITELIST 中"
-        "显式登记目标主机（代码级变更，需评审）。"
-    )
+    from policy import auth_bootstrap as ab
+
+    tid = target if target_id is None else target_id
+    if not tid:
+        try:
+            host = (urlparse(target or "").hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host and host in AUTH_OPERATION_WHITELIST:
+            return True, f"AUTH 操作目标 {host} 在代码级白名单内（仍需逐次记录）"
+        return False, (
+            "AUTH 操作缺少会话目标绑定：认证初始化必须在已绑定目标的会话内进行。"
+        )
+    if intent:
+        d0 = ab.check_intent(
+            kind=intent, target_id=tid, bound_target=target,
+            environment=environment, entries=tuple(entries or ()),
+            session_id=session_id, credentials_present=credentials_present,
+        )
+    else:
+        d0 = ab.check(
+            url=target, method=method, body=body, params=params,
+            entries=tuple(entries or ()),
+            target_id=tid, bound_target=target,
+            environment=environment, session_id=session_id,
+            credentials_present=credentials_present,
+        )
+    return d0.allowed, d0.reason

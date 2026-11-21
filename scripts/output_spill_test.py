@@ -63,6 +63,10 @@ def main() -> int:
     runner = ToolRunner(FakeCfg(root), [], str(tmp))
 
     print("场景1 external_tool 超长 → 完整落盘 + 出路提示")
+    # 注意：这里用 nmap 而不是 curl——curl 的网络能力已按策略禁用
+    # （policy.gateway.UNVERIFIABLE_NETWORK_TOOLS），闸门会在 handler 之前
+    # 就截断，落盘逻辑根本不会执行。本用例考的是"超长输出如何落盘"，
+    # 与具体哪个工具无关，换一个能过闸门的工具名即可，断言一字未改。
     # 模拟 curl 拉回 101KB：多行 + 一条超长行（库文件常见形态）
     big = "\n".join(f"line {i} " + "x" * 50 for i in range(200))
     big += "\n" + ("PAYLOAD_" + "y" * 30000 + "_TAIL_FLAG")
@@ -71,7 +75,7 @@ def main() -> int:
         return big
 
     runner._h_external_tool = fake_ext  # 实例属性盖掉类方法
-    out = asyncio.run(runner.execute("external_tool", {"tool": "curl", "args": []}, sess))
+    out = asyncio.run(runner.execute("external_tool", {"tool": "nmap", "args": []}, sess))
     check("完整输出已保存到" in out, "截断提示给出了落盘路径")
     check("read_file" in out and "start_line" in out, "提示里给了 read_file 分页用法")
     check("curl -w" in out, "明确劝阻再用 -w 碰运气")
@@ -134,12 +138,12 @@ def main() -> int:
         return "w" * (MAX_TOOL_OUTPUT + 100)
 
     bad._h_external_tool = fake_ext2
-    out = asyncio.run(bad.execute("external_tool", {"tool": "curl", "args": []}, sess))
+    out = asyncio.run(bad.execute("external_tool", {"tool": "nmap", "args": []}, sess))
     check("结果过长已截断" in out, "落盘失败仍返回截断文本")
     check("落盘失败" in out, "如实说明落盘失败", f"实={out[-40:]!r}")
 
     print("场景7 连续 spill 文件名不撞")
-    out2 = asyncio.run(runner.execute("external_tool", {"tool": "curl", "args": []}, sess))
+    out2 = asyncio.run(runner.execute("external_tool", {"tool": "nmap", "args": []}, sess))
     check("完整输出已保存到" in out2, "第二次 spill 成功")
     spills = list((root / "tool-output").glob("*.txt"))
     check(len(spills) == 2, f"两次 spill 两个文件，实={len(spills)}")

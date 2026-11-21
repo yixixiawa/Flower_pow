@@ -116,15 +116,19 @@ EXTERNAL_TOOLS: list[ExternalTool] = [
             "发单个 HTTP 请求看原始响应。适合验证某个具体猜测"
             "（例如未授权访问、响应头缺失）时抓一次完整报文。"
         ),
-        flags=(
-            "-I", "-i", "-s", "-S", "-k", "-L", "-X", "-H", "-d", "--data-raw",
-            "--max-time", "--connect-timeout", "-A", "-b", "-u", "--compressed",
-            "-v", "--http1.1", "--http2", "-w",
-        ),
+        # 第七轮整改：**网络能力已被策略禁用**（policy.gateway）。
+        # 原因：curl 由外部进程发请求，方法/请求体/重定向/多 URL 都无法被
+        # 统一 Gateway 逐请求解析——AUTH、L3、UNKNOWN 都可能在 argv 之外发生。
+        # 参数白名单同时清空（双保险）：即使策略层被改坏，也只能拿到
+        # 被参数校验拒绝的结果，而不是一条可行的旁路。
+        flags=(),
         version_args=("--version",),
         timeout=60,
-        example="curl -i -s -k -X GET https://example.com/api/health -H 'Accept: application/json'",
-        note="-o/-O（写文件）与 -T/-F（上传）已被禁用。",
+        example="（已禁用）需要发请求请用内置 http_request，它逐请求过分类与权限矩阵",
+        note=(
+            "网络请求能力已按策略禁用：curl 的请求无法被统一 Gateway 逐请求"
+            "解析/分类（-X/-d/-L 均可绕过分类）。请改用 http_request。"
+        ),
     ),
     ExternalTool(
         key="gobuster",
@@ -146,12 +150,16 @@ EXTERNAL_TOOLS: list[ExternalTool] = [
         category="模糊测试",
         desc="高速 Web 模糊测试。需要 -w 指定字典，FUZZ 关键字替换。",
         flags=(
-            "-u", "-w", "-t", "-mc", "-fc", "-fs", "-H", "-X", "-d", "-k",
+            "-u", "-w", "-t", "-mc", "-fc", "-fs", "-H", "-k",
             "-s", "-timeout", "-rate", "-ac", "-recursion", "-recursion-depth",
         ),
         version_args=("-V",),
         timeout=240,
         example="ffuf -u https://example.com/FUZZ -w data/wordlists/builtin.txt -mc 200,301,403 -s",
+        note=(
+            "只允许只读模糊测试：-X（改方法）与 -d（请求体）已从白名单移除——"
+            "带请求体的写语义请求必须走 http_request（逐请求过分类与矩阵）。"
+        ),
     ),
     ExternalTool(
         key="nikto",

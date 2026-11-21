@@ -83,7 +83,9 @@ BUILTINS: list[BuiltinTool] = [
             "**预计单个调用超过 30 秒就必须走这里**（dirsearch 大字典、nmap 全端口、"
             "子域批量探测、大批量发包等）；端口扫描也可以直接用 recon_ports_bg。"
             "不接受 background_run / list_tasks / 任何 *_bg 工具（禁止嵌套）。"
-            "后台结果不会自动弹回来——需要时主动调用 list_tasks 取；"
+            "**同会话+同目标+同工具+同参数的任务只会存在一个**：还在跑就复用原任务号，"
+            "刚成功过就直接复用结果，失败过的不会自动重跑（要重跑必须 retry=true）。"
+            "状态变化（完成/失败/超时）会自动推送到你的上下文，不需要轮询；"
             "完成时资产/发现会自动并入会话。"
         ),
         params=_obj(
@@ -100,6 +102,14 @@ BUILTINS: list[BuiltinTool] = [
                     "type": "string",
                     "description": "一句话说明这个后台任务在干什么（会显示在任务列表里）",
                 },
+                "retry": {
+                    "type": "boolean",
+                    "description": "仅当用户明确要求重试、或你判断上次失败原因已改变时才置 true；默认 false（禁止无理由重试）",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "超时秒数（默认 900，上限 3600）。到点进入「已超时」终态，不会自动重跑",
+                },
             },
             ["tool"],
         ),
@@ -109,9 +119,11 @@ BUILTINS: list[BuiltinTool] = [
         group="编排",
         desc=(
             "查看后台任务：谁还在跑、谁已完成、结果是什么。"
-            "不传参数=列全部任务（已完成任务附带结果首行）；"
-            "传 task_id=该任务的**完整结果**；传 status 可按状态过滤。"
-            "后台任务不会自己把结果塞回来，必须主动查询。"
+            "不传参数=列全部任务（已完成任务附带结果摘要）；"
+            "传 task_id=该任务的摘要与 **artifact 引用**（完整结果在文件里，用 artifact_query 定点查）；"
+            "传 status 可按状态过滤。"
+            "**状态变化会自动推送给你的上下文**——不要用本工具轮询等待；"
+            "连续查到相同状态会被拒绝。"
         ),
         params=_obj(
             {
@@ -121,10 +133,54 @@ BUILTINS: list[BuiltinTool] = [
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["running", "done", "failed", "cancelled", "interrupted"],
+                    "enum": [
+                        "queued", "running", "done", "failed",
+                        "cancelled", "timeout", "interrupted",
+                    ],
                     "description": "只看某种状态的任务",
                 },
+                "wait": {
+                    "type": "number",
+                    "description": "有上限的等待秒数（≤15，指数退避）。只用于「这一步就必须拿到结果」，不是轮询手段",
+                },
             }
+        ),
+    ),
+    BuiltinTool(
+        name="artifact_query",
+        group="编排",
+        desc=(
+            "在已落盘的产物文件里**定点查询**，替代逐页通读。"
+            "支持三种方式：keyword（命中行±context 行）、start_line/end_line（精确范围）、"
+            "jsonpath（$.a.b / $..key）。同一 artifact + 同一查询会命中缓存。"
+            "只接受产物目录内的相对路径（如 tool-output/xxx.txt）。"
+        ),
+        params=_obj(
+            {
+                "path": {
+                    "type": "string",
+                    "description": "产物相对路径，如 tool-output/1712345678_1_curl.txt",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "要定位的关键字（函数名、字段名、URL 片段）",
+                },
+                "start_line": {"type": "integer", "description": "起始行（1 起）"},
+                "end_line": {"type": "integer", "description": "结束行"},
+                "jsonpath": {
+                    "type": "string",
+                    "description": "JSONPath 子集：$.data.list、$.items[0].id、$..token",
+                },
+                "context": {
+                    "type": "integer",
+                    "description": "keyword 命中时前后各取几行，默认 3",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "返回字符上限，默认 6000",
+                },
+            },
+            ["path"],
         ),
     ),
     BuiltinTool(
@@ -190,8 +246,8 @@ BUILTINS: list[BuiltinTool] = [
         desc=(
             "端口扫描的**后台版本**，用于大范围扫描（端口数可达 2000）。"
             "调用后**立即**返回「已在后台启动，先干别的」+ 任务号，不阻塞你的思考流程；"
-            "期间去做别的事，之后用 list_tasks 查进度和结果。"
-            "任务完成时资产会自动并入会话。"
+            "期间去做别的事。**同目标同主机同端口数的扫描只会存在一个**（重复调用复用原任务号）；"
+            "状态变化会自动推送，不用轮询；任务完成时资产会自动并入会话。"
         ),
         params=_obj(
             {
@@ -199,6 +255,14 @@ BUILTINS: list[BuiltinTool] = [
                 "top": {
                     "type": "integer",
                     "description": "探测端口数，默认用配置值（通常 100），上限 2000",
+                },
+                "retry": {
+                    "type": "boolean",
+                    "description": "上次失败/取消/超时后，仅在用户明确要求时置 true 才会重跑",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "超时秒数（默认 900，上限 3600）；到点进入「已超时」终态",
                 },
             }
         ),

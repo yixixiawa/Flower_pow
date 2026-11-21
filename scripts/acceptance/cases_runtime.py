@@ -124,20 +124,28 @@ def runner_export_blocked(ctx) -> None:
 
 
 def runner_login_blocked(ctx) -> None:
+    """AUTH 类工具受 AUTH_BOOTSTRAP 约束——不是"分类是 AUTH 就放行"。
+
+    登录放行只针对**认证入口**（清单登记或路径含 login/signin/refresh/
+    logout）。这条用例盯的是反向：把 login 指向一个普通业务端点（/export）
+    必须被拒、零网络、留审计——AUTH 通道不能变成"任意 URL 提交凭证"。
+    """
     cfg, runner, session = _runner_pair(ctx)
     out = asyncio.run(
         runner.execute(
             "login",
             {
-                "url": ctx.net.target + "/login",
+                "url": ctx.net.target + "/export",
                 "username": "u", "password": "p",
             },
             session,
         )
     )
-    ctx.check(out.startswith("【已拦截】"), f"login 必须被拒：{out[:160]}")
-    ctx.check("AUTH" in out or "授权行" in out, "拒绝文本应说明 AUTH 无矩阵授权")
-    ctx.check("默认拒绝" in out or "拒绝执行" in out, "应明确拒绝执行")
+    ctx.check(out.startswith("【已拦截】"), f"login 打到非认证路径必须被拒：{out[:160]}")
+    ctx.check("未登记" in out or "不是认证入口" in out,
+              "拒绝文本应说明该 URL 不是认证入口")
+    ctx.check("认证初始化" in out and "拒绝" in out, "应明确拒绝执行")
+    ctx.check(not session.credentials.get("token"), "被拒的登录不得产生 Token")
     denies = [e for e in ctx.events(cfg) if e.get("event") == "deny"]
     ctx.check(bool(denies), "登录拒绝必须写入审计")
     ctx.set("blocked", out.startswith("【已拦截】"))
@@ -977,6 +985,184 @@ def detector_block_audited(ctx) -> None:
     ctx.set("blocked", bool(ev.error))
 
 
+# ── AUTH_BOOTSTRAP：受限认证初始化 ───────────────────────────────
+
+
+def _seed_auth_assets(session) -> None:
+    """往会话接口清单里登记四条认证入口（Agent 侦察后的等价状态）。"""
+    from core.state import Asset
+
+    session.result.assets.extend([
+        Asset(kind="api", value="/api/auth/login", meta={
+            "method": "POST", "path": "/api/auth/login",
+            "body_fields": ["username", "password"],
+        }),
+        Asset(kind="api", value="/api/auth/captcha", meta={
+            "method": "GET", "path": "/api/auth/captcha",
+        }),
+        Asset(kind="api", value="/api/auth/logout", meta={
+            "method": "POST", "path": "/api/auth/logout",
+        }),
+    ])
+
+
+def auth_bootstrap_single_use(ctx) -> None:
+    """合法登录放行**单次**，登录成功后未授权请求照样拒绝。"""
+    cfg = ctx.cfg(env="isolated_test")
+    runner = ctx.runner(cfg)
+    session = ctx.session(cfg)
+    _seed_auth_assets(session)
+    secret = "Sup3r-Secret-Pwd!"
+    mark = ctx.mark()
+    out = asyncio.run(runner.execute(
+        "login",
+        {"url": ctx.net.target, "username": "tester", "password": secret},
+        session,
+    ))
+    login_hits = ctx.hits(mark)
+    ctx.check(not out.startswith("【已拦截】"), f"合法登录不应被拦：{out[:160]}")
+    ctx.check("登录成功" in out, f"应真实登录成功：{out[:200]}")
+    ctx.check(bool(session.credentials.get("token")), "登录成功应写入 Token")
+    ctx.check(secret not in out, "工具输出不得回显明文凭证")
+    ctx.check(any(r.path == "/api/auth/login" and r.method == "POST" for r in login_hits),
+              f"登录请求应真实发出（实际 {[r.line() for r in login_hits]}）")
+
+    mark2 = ctx.mark()
+    out2 = asyncio.run(runner.execute(
+        "http_request", {"url": ctx.net.target + "/api/users/export", "method": "GET"}, session,
+    ))
+    export_hits = [r for r in ctx.hits(mark2) if "export" in r.path]
+    ctx.check(out2.startswith("【已拦截】"), f"登录后导出仍须被拒：{out2[:200]}")
+    ctx.check(not export_hits, "登录成功不得放行后续请求（导出请求不得发出）")
+    ctx.set("login_ok", "登录成功" in out)
+    ctx.set("token_present", bool(session.credentials.get("token")))
+    ctx.set("export_blocked", out2.startswith("【已拦截】"))
+    ctx.set("export_hits", len(export_hits))
+
+
+def auth_bootstrap_conditions_enforced(ctx) -> None:
+    """十条前置条件逐条验证：任一不满足即拒绝，且零请求。"""
+    from policy.auth_bootstrap import entries_for
+    from policy.request_guard import GuardContext as Ctx
+    from policy.request_guard import RequestGuard
+
+    cfg = ctx.cfg(env="isolated_test")
+    guard = RequestGuard(cfg)
+    # 入口清单直接构造（不依赖会话），保证 URL 与目标一致
+    from core.state import Asset
+
+    entries = entries_for(ctx.net.target, [
+        Asset(kind="api", value="/api/auth/login", meta={
+            "method": "POST", "path": "/api/auth/login",
+            "body_fields": ["username", "password"],
+        }),
+    ])
+    url = ctx.net.target + "/api/auth/login"
+    creds = {"username": "u", "password": "p"}
+
+    def mk(env: str, *, tid: str | None = None, bound: str | None = None) -> Ctx:
+        return Ctx(
+            target_id=ctx.net.target if tid is None else tid,
+            bound_target=ctx.net.target if bound is None else bound,
+            environment=env, identity_bound=True, auth_entries=entries,
+        )
+
+    cases = [
+        ("会话未绑定目标", guard.check_auth(url, method="POST", params=creds,
+                                            ctx=mk("isolated_test", tid="", bound=""))),
+        ("未知环境", guard.check_auth(url, method="POST", params=creds, ctx=mk("unknown"))),
+        ("非测试背景", guard.check_auth(url, method="POST", params=creds, ctx=mk("production"))),
+        ("认证管理路径（未登记入口）", guard.check_auth(
+            ctx.net.target + "/api/auth/users/create", method="POST", params=creds,
+            ctx=mk("isolated_test"))),
+        ("参数越界", guard.check_auth(url, method="POST",
+                                      params={**creds, "role": "admin"}, ctx=mk("isolated_test"))),
+        ("方法不符", guard.check_auth(url, method="GET", ctx=mk("isolated_test"))),
+    ]
+    for name, d in cases:
+        ctx.check(not d.allowed, f"{name} 必须拒绝（实际 {d.decision}）：{d.reason[:100]}")
+    denied = sum(1 for _, d in cases if not d.allowed)
+    ctx.check(denied == len(cases), f"六种不满足条件必须全部拒绝，实际 {denied}")
+    ctx.set("denied", denied)
+
+
+# ── 外部工具：统一 Gateway ───────────────────────────────────────
+
+
+def external_tool_curl_no_network(ctx) -> None:
+    """curl 的网络能力被禁用：不建进程、不发请求、给出合法出路。"""
+    import subprocess
+
+    cfg = ctx.cfg(env="isolated_test")
+    runner = ctx.runner(cfg)
+    session = ctx.session(cfg)
+    mark = ctx.mark()
+    real = subprocess.run
+    spawned: list[tuple] = []
+
+    def fake(*a, **k):
+        spawned.append(a)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    subprocess.run = fake
+    try:
+        out = asyncio.run(runner.execute(
+            "external_tool",
+            {"tool": "curl",
+             "args": ["-X", "POST", ctx.net.target + "/api/auth/login", "-d", "a=1"]},
+            session,
+        ))
+    finally:
+        subprocess.run = real
+    hits = ctx.hits(mark)
+    ctx.check(out.startswith("【已拦截】"), f"curl POST 必须被拦：{out[:200]}")
+    ctx.check(not spawned, f"被拒的 curl 不得启动外部进程（实际 {len(spawned)}）")
+    ctx.check(not hits, f"被拒的 curl 不得发网络请求（实际 {len(hits)}）")
+    ctx.check("http_request" in out, "拒绝文本应给出合法出路（http_request）")
+    ctx.set("blocked", out.startswith("【已拦截】"))
+    ctx.set("spawned", len(spawned))
+
+
+def external_tool_scope_and_header(ctx) -> None:
+    """外部工具目标出界拒绝；-H 普通头不再被当路径；-H @file 仍受限。"""
+    from core.tools.external import ExternalTool
+    from policy.request_guard import GuardContext as Ctx
+    from policy.request_guard import RequestGuard
+
+    cfg = ctx.cfg(env="isolated_test")
+    guard = RequestGuard(cfg)
+    gctx = Ctx(
+        target_id=ctx.net.target, bound_target=ctx.net.target,
+        environment="isolated_test", identity_bound=True,
+    )
+    d1 = guard.check_tool("nmap", {"args": ["-sT", "-Pn", "http://127.0.0.2:9"]}, ctx=gctx)
+    d2 = guard.check_tool("ffuf", {"args": ["-u", ctx.net.outsider + "/FUZZ", "-w", "x.txt"]},
+                          ctx=gctx)
+    ctx.check(not d1.allowed and "未绑定目标" in d1.reason,
+              f"nmap 指向外部主机必须拒绝：{d1.reason[:120]}")
+    ctx.check(not d2.allowed and "未绑定目标" in d2.reason,
+              f"ffuf 指向其它端口/主机必须拒绝：{d2.reason[:120]}")
+
+    runner = ctx.runner(cfg)
+    spec = ExternalTool(key="probe-http", name="probe-http", bins=("x",), category="t",
+                        desc="", flags=("-H",))
+    _, err_ok = runner._validate_argv(
+        spec, ["-H", "Content-Type: application/json", ctx.net.target + "/api"],
+    )
+    _, err_file = runner._validate_argv(
+        spec, ["-H", "@" + str(PROJECT / "config.yaml"), ctx.net.target + "/api"],
+    )
+    _, err_traversal = runner._validate_argv(
+        spec, ["-H", "@../../etc/passwd", ctx.net.target + "/api"],
+    )
+    ctx.check(err_ok == "", f"Header application/json 不得被误判为路径：{err_ok}")
+    ctx.check(err_file != "", "项目内绝对路径的 @file 仍受路径白名单控制")
+    ctx.check(err_traversal != "", "路径穿越的 @file 必须拒绝")
+    ctx.set("out_of_scope_denied", int(not d1.allowed) + int(not d2.allowed))
+    ctx.set("header_ok", err_ok == "")
+    ctx.set("header_file_denied", err_file != "" and err_traversal != "")
+
+
 __all__ = [
     "runner_sqli_probe_blocked", "runner_exploit_sqli_blocked",
     "runner_fileread_blocked", "runner_unknown_method_blocked",
@@ -994,4 +1180,6 @@ __all__ = [
     "approver_identity_recorded", "bare_true_approver_unauthenticated",
     "approval_not_reused_after_change", "deny_event_persisted",
     "audit_disabled_blocks_write", "detector_block_audited",
+    "auth_bootstrap_single_use", "auth_bootstrap_conditions_enforced",
+    "external_tool_curl_no_network", "external_tool_scope_and_header",
 ]

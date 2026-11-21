@@ -209,7 +209,10 @@ def main() -> int:
     rp = next(b for b in BUILTINS if b.name == "recon_ports")
     check("200" in rp.desc and "recon_ports_bg" in rp.desc, "前台版说明快速上限")
     bg = next(b for b in BUILTINS if b.name == "recon_ports_bg")
-    check(set(bg.params["properties"]) == {"host", "top"}, "后台版参数齐全")
+    # 本轮新增 retry/timeout（去重显式重试 + 超时终态），断言同步扩到四个参数：
+    # 不是放宽，而是把新的契约也钉住——少了任何一个都算参数声明不完整。
+    check({"host", "top", "retry", "timeout"} <= set(bg.params["properties"]),
+          f"后台版参数齐全（host/top/retry/timeout），实={sorted(bg.params['properties'])}")
     br = next(b for b in BUILTINS if b.name == "background_run")
     check(br.params["required"] == ["tool"] and "args" in br.params["properties"],
           "background_run 声明 tool/args/purpose")

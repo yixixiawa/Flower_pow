@@ -33,6 +33,7 @@ r"""工具执行器——把模型的 tool_call 变成真实动作。
 ``files``               文件操作 handler（read_file、write_file...）
 ``external``            外部 CLI 执行与 argv 闸门
 ``tasks``               后台任务 handler（recon_ports_bg / background_run / list_tasks）
+``artifacts``           产物定点查询 handler（artifact_query：keyword / 行范围 / JSONPath）
 ======================  ==========================================================
 
 :class:`ToolRunner` 由上述 mixin 多继承组装。对外只需要知道这一个名字：
@@ -41,6 +42,7 @@ r"""工具执行器——把模型的 tool_call 变成真实动作。
 
 from __future__ import annotations
 
+from core.tools.runner.artifacts import ArtifactMixin
 from core.tools.runner.base import MAX_TOOL_OUTPUT, ToolBlocked, _ToolRunnerBase
 from core.tools.runner.chain import ChainMixin
 from core.tools.runner.evidence import EvidenceMixin
@@ -64,6 +66,7 @@ class ToolRunner(
     ExportMixin,
     FileMixin,
     ExternalMixin,
+    ArtifactMixin,
     TaskMixin,
     _ToolRunnerBase,
 ):

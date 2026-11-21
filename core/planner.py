@@ -239,29 +239,77 @@ class Planner:
         t.actions.append("业务流程走查")
         await self._walk_business_flow(session, t)
 
+    def _auth_operation_allowed(self, session: Session, api_assets: list[Asset]):
+        """AUTH_BOOTSTRAP 的**工具级**判定 + 逐请求 precheck 构造。
+
+        剧本路径（Planner 直接调 Authenticator）与 Agent 路径（Runner 的
+        login 工具）必须同一结论——所以这里用的就是 ``RequestGuard`` 的
+        同两个入口：``auth_operation_allowed(intent=...)``（意图 + 频率）与
+        ``check_auth``（具体请求精确命中登记入口 + 参数结构）。
+
+        返回 ``(是否允许, 理由, precheck)``。``precheck`` 直接注入
+        ``Authenticator``——它发出的验证码 GET / 登录 POST 每一个都要过闸。
+        """
+        from policy import auth_bootstrap as ab
+        from policy.request_guard import GuardContext, RequestGuard, auth_operation_allowed
+
+        guard = RequestGuard(self.cfg)
+        entries = ab.entries_for(session.target, api_assets)
+        bound = session.target
+
+        def ctx_for(url: str) -> GuardContext:
+            return GuardContext(
+                target_id=bound,
+                bound_target=bound,
+                environment=guard.environment_for(url),
+                identity_bound=bool(bound),
+                identity=f"planner|sess={session.session_id}|tgt={bound}",
+                session_id=session.session_id,
+                auth_entries=entries,
+                credentials_present=bool(session.credentials.get("token")),
+            )
+
+        def precheck(url: str, method: str, body: str = "") -> str:
+            d = guard.check_auth(
+                url, method=method, body=body, ctx=ctx_for(url), count_rate=False,
+            )
+            return "" if d.allowed else d.reason
+
+        ok, why = auth_operation_allowed(
+            bound,
+            intent=ab.AuthKind.LOGIN,
+            entries=entries,
+            environment=guard.environment_for(bound),
+            target_id=bound,
+            session_id=session.session_id,
+            credentials_present=bool(session.credentials.get("token")),
+        )
+        return ok, why, precheck
+
     async def _walk_business_flow(self, session: Session, t: Turn) -> None:
         """登录 → 取自身信息 → 访问核心资源。全程只读 GET。"""
         base = session.target.rstrip("/") + "/"
         api_assets = [a for a in session.result.assets if a.kind == "api"]
-        auth = Authenticator(self.cfg.scan, verbose=False)
+        auth_ok, auth_why, precheck = self._auth_operation_allowed(session, api_assets)
+        auth = Authenticator(self.cfg.scan, verbose=False, precheck=precheck)
         try:
             user = session.credentials.get("username", "")
             pwd = session.credentials.get("password", "")
             if user and pwd:
                 # AUTH 操作（登录）没有矩阵授权行：与 Runner 的 login 工具
-                # 同一结论。不在这里拦，剧本模式就是一条绕过闸门的登录路径。
-                from policy.request_guard import auth_operation_allowed
-
-                auth_ok, auth_why = auth_operation_allowed(base)
+                # 同一结论——走 AUTH_BOOTSTRAP 受限通道，条件不满足就不登录。
                 if not auth_ok:
                     t.notes.append(auth_why)
                     self.log(f"   [!] {auth_why}")
                     return
                 t.actions.append("登录取凭证")
                 res = auth.login(base, api_assets, user, pwd)
+                from core.session.redact import redact
+
                 for n in res.notes:
-                    t.notes.append(n)
-                    self.log(f"   {n}")
+                    safe = redact(n)
+                    t.notes.append(safe)
+                    self.log(f"   {safe}")
                 if res.ok:
                     session.credentials["token"] = res.token
                     self.log(f"   登录成功（{res.endpoint}），已取得凭证")
@@ -355,16 +403,16 @@ class Planner:
             return
 
         if not token:
-            # AUTH 无矩阵授权：与 Runner 的 login 工具同口径，默认不发起登录。
-            from policy.request_guard import auth_operation_allowed
-
-            auth_ok, auth_why = auth_operation_allowed(base)
+            # AUTH 无矩阵授权：与 Runner 的 login 工具同口径——走
+            # AUTH_BOOTSTRAP 受限通道（会话绑定/环境/测试背景/入口/频率 +
+            # 逐请求精确匹配），不满足就只做免鉴权侧测试。
+            auth_ok, auth_why, precheck = self._auth_operation_allowed(session, api)
             if not auth_ok:
                 t.notes.append(auth_why)
                 self.log(f"   [!] {auth_why}（仅做免鉴权侧测试）")
             else:
                 t.actions.append("补取凭证")
-                auth = Authenticator(self.cfg.scan, verbose=False)
+                auth = Authenticator(self.cfg.scan, verbose=False, precheck=precheck)
                 try:
                     res = auth.login(
                         base, api,

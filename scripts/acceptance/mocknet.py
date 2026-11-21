@@ -97,6 +97,23 @@ class _Handler(BaseHTTPRequestHandler):
             return 200, {}, "exported-data-should-never-be-fetched"
         if path == "/login":
             return 200, {}, "login-page"
+        # ── 认证初始化（AUTH_BOOTSTRAP）用例专用 ────────────────────
+        # 只新增**具体路径**路由，不改动任何既有路径的行为：认证用例需要
+        # 一个"真的能登录成功"的目标，才能验证"登录成功不放行后续请求"。
+        if path == "/api/auth/captcha" and self.command == "GET":
+            return 200, {"Content-Type": "application/json"}, '{"uuid":"mock-uuid-1"}'
+        if path == "/api/auth/login" and self.command == "POST":
+            return 200, {"Content-Type": "application/json"}, (
+                # 三段式 JWT（alg=none，中段是 {"sub":"1001"}）：core.auth
+                # 只认真 JWT 形态，假 token 会让登录被判定为失败。
+                '{"access_token":"eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMDAxIn0.x","uid":"1001"}'
+            )
+        if path == "/api/auth/refresh" and self.command == "POST":
+            return 200, {"Content-Type": "application/json"}, (
+                '{"access_token":"eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMDAxIn0.y"}'
+            )
+        if path == "/api/auth/logout" and self.command == "POST":
+            return 200, {"Content-Type": "application/json"}, '{"ok":true}'
         if path == "/redirect-same":
             return 302, {"Location": "/ok"}, ""
         if path == "/redirect-chain":

@@ -35,6 +35,7 @@ from core.tools.probe import Probe
 from policy.request_guard import (
     BUILTIN_POLICY_TOOLS as _BUILTIN_POLICY_TOOLS_SHARED,
     PROBE_KIND_COMMAND as _PROBE_KIND_COMMAND_SHARED,
+    normalize_body,
 )
 
 
@@ -57,8 +58,9 @@ HOST_SIGNAL_LIMIT = 15
 # 这里决定"切多少"，那里决定"怎么读回截断标记"，改了要同步。
 _BODY_PREVIEW = 1500
 
-# 这些选项的取值是"文件路径"，需要限制在项目目录内
-_FILE_FLAGS = {"-w", "--wordlist", "-t"}
+# 选项取值语义（哪个值是文件、哪个是 Header、哪个是目标）的唯一权威是
+# ``policy.gateway.VALUE_FLAGS``——参数校验与策略判定共用同一张表，不再
+# 在这里维护第二份 ``_FILE_FLAGS``（两份表漂移过：Header 值被当路径拒）。
 # 端口/数字类取值，不做 host 解析尝试
 _NUMERIC_RE = re.compile(r"^[\d,\-./]+$")
 _PATH_EXT_RE = re.compile(r"\.(txt|list|lst|dic|wordlist|json|ya?ml|conf|cfg|csv)$", re.I)
@@ -264,6 +266,42 @@ class _ToolRunnerBase:
         if not raw:
             raise ToolBlocked("缺少目标参数")
         return raw if "://" in raw else f"http://{raw}"
+
+    @staticmethod
+    def _inherit_bound_endpoint(raw: str, url: str, session) -> str:
+        """裸主机且与绑定目标同主机 → 继承绑定目标的 scheme 与端口。
+
+        真实故障：目标是 ``https://demo.example.com``（443），模型按工具说明
+        传 ``host="demo.example.com"``，补默认协议后变成 ``http://demo.example.com``
+        （80）——**同主机不同端口**被范围校验判成越界，端口扫描直接被拒。
+        这不是越权，是"裸主机没有端口信息"的解析问题。
+
+        只在三个条件同时成立时才改写：① 原始值没有 ``://``；② 原始值没有显式
+        端口；③ 主机与绑定目标完全相同。任一不成立就原样返回——**范围一点没放宽**，
+        只是把"同一个主机"补成"同一个端点"。
+        """
+        text = (raw or "").strip()
+        if not text or "://" in text:
+            return url
+        bound = str(getattr(session, "target", "") or "").strip()
+        if not bound or "://" not in bound:
+            return url
+        try:
+            from urllib.parse import urlparse
+
+            plain = text.split("/", 1)[0]
+            if ":" in plain:            # 显式端口 → 尊重模型的输入
+                return url
+            if urlparse(bound).hostname != plain.lower():
+                return url
+            b = urlparse(bound)
+        except ValueError:
+            return url
+        if not b.scheme or not b.hostname:
+            return url
+        port = f":{b.port}" if b.port else ""
+        tail = "/" + text.split("/", 1)[1] if "/" in text else ""
+        return f"{b.scheme}://{b.hostname}{port}{tail}"
 
     @staticmethod
     def _validate_http_url(url: str) -> str:
@@ -622,6 +660,25 @@ class _ToolRunnerBase:
             identity_bound=bool(ident),
             identity=ident,
             bound_target=str(getattr(session, "target", "") or ""),
+            # AUTH_BOOTSTRAP：会话隔离键 + 已登记认证入口 + 是否已有可刷新凭证。
+            # 入口有两级来源：接口清单（清单登记，方法以清单为准）与 URL 路径
+            # 末段自证（login/refresh/logout 的标准约定，方法按语义 POST ——
+            # 无需先跑 recon_openapi 就能登录）。captcha 只能由清单登记。
+            session_id=str(getattr(session, "session_id", "") or ""),
+            auth_entries=self._auth_entries(session),
+            credentials_present=bool(
+                (getattr(session, "credentials", None) or {}).get("token")
+            ),
+        )
+
+    @staticmethod
+    def _auth_entries(session):
+        """已登记认证入口（接口清单 → AuthEndpoint 元组）。"""
+        from policy.auth_bootstrap import entries_for
+
+        return entries_for(
+            str(getattr(session, "target", "") or ""),
+            getattr(getattr(session, "result", None), "assets", ()) or (),
         )
 
     def _policy_scope(self, session) -> tuple[str, str]:
@@ -708,7 +765,24 @@ class _ToolRunnerBase:
                     self._normalize_target(str(args.get("url") or session.target or ""))
                 )
                 method = str(args.get("method") or "GET")
-                body = str(args.get("body") or "")
+                # body 归一：模型常把 JSON 对象直接塞进 body（schema 写的是
+                # string）。`str(dict)` 是单引号 repr —— 策略解析不出字段名，
+                # 合法登录会被判"缺凭证字段"；httpx 也发不出去。
+                # 这里把归一后的文本**写回 args**，保证「判定的 body」与
+                # 「真正发出的 body」逐字节相同。
+                body = normalize_body(args.get("body"))
+                raw_body = args.get("body")
+                if raw_body is not None and body != raw_body:
+                    args["body"] = body
+                    if isinstance(raw_body, (dict, list)):
+                        # 对象体一定是 JSON：没写 Content-Type 时补上，
+                        # 否则服务端按表单解析 → 登录"成功发送、失败解析"。
+                        hdrs = args.get("headers")
+                        if not isinstance(hdrs, dict):
+                            hdrs = {}
+                        if not any(str(k).lower() == "content-type" for k in hdrs):
+                            hdrs["Content-Type"] = "application/json"
+                            args["headers"] = hdrs
                 params = args.get("params") if isinstance(args.get("params"), dict) else None
                 poc_id = str(args.get("poc_id") or args.get("poc") or "")
                 self._observe_identity(dict(args.get("headers") or {}) if isinstance(
@@ -750,7 +824,13 @@ class _ToolRunnerBase:
                 if url:
                     # 第二轮整改 #1：给了目标的工具调用，目标同样过合法性
                     # 校验（http/https、端口合法）——堵 file:// 等协议混淆。
-                    url = self._validate_http_url(self._normalize_target(url))
+                    # 裸主机同绑定目标 → 继承 scheme/端口（否则 https 目标
+                    # 会被按 http:80 解析而判成越界）。
+                    url = self._validate_http_url(
+                        self._inherit_bound_endpoint(
+                            url, self._normalize_target(url), session
+                        )
+                    )
                 # 第四轮整改 #2：外部工具同样不继承前次实名身份（凭证由
                 # 工具自己的参数体系管理，runner 层身份按匿名解析）。
                 self._identity = ""
@@ -776,7 +856,13 @@ class _ToolRunnerBase:
                 )
                 url = ""
                 if raw:
-                    url = self._validate_http_url(self._normalize_target(raw))
+                    # 裸主机（同绑定目标）继承 scheme/端口，避免把
+                    # https:443 的目标解析成 http:80 而误判越界
+                    url = self._validate_http_url(
+                        self._inherit_bound_endpoint(
+                            raw, self._normalize_target(raw), session
+                        )
+                    )
                 else:
                     raise ToolBlocked("缺少目标参数（url/target/host）")
                 # 身份：这些工具经 session.credentials 携带凭证（login 写入、
@@ -787,7 +873,10 @@ class _ToolRunnerBase:
                     self._identity = f"cred:session:{hashlib.sha256(tok.encode('utf-8')).hexdigest()[:10]}"
                 else:
                     self._identity = ""
-                d = guard.check_builtin(name, url, ctx=self._policy_ctx(session, url))
+                d = guard.check_builtin(
+                    name, url, ctx=self._policy_ctx(session, url),
+                    payload=args if name == "login" else None,
+                )
                 return await self._review_or_allow(d, session, url, req_ctx={
                     "method": "GET", "tool": name,
                     "params": {k: str(v)[:200] for k, v in args.items()},
@@ -936,15 +1025,21 @@ class _ToolRunnerBase:
         if self.policy_audit.writable:
             return None
         tid, rid = self._policy_scope(session)
-        if self._LEDGER_ACTIONS.get(d.command):
+        # 认证初始化（AUTH_BOOTSTRAP）与写操作同一口径：提交凭证是敏感操作，
+        # 没有持久化审计就不执行——"未留痕的登录"事后无法解释。
+        sensitive = bool(self._LEDGER_ACTIONS.get(d.command)) or (
+            getattr(d, "level", "") == "AUTH_BOOTSTRAP"
+        )
+        if sensitive:
             self.policy_audit.warn(
-                "审计不可持久化，写操作拒绝执行（P1-⑤）",
+                "审计不可持久化，写操作/认证初始化拒绝执行（P1-⑤）",
                 command=d.command, url=url, target_id=tid, run_id=rid,
             )
             return (
                 "【已拦截】（策略）审计日志当前无法持久化（磁盘不可写或 audit 已关闭），"
-                f"写操作「{d.command}」按 P1-⑤ 拒绝执行。\n"
-                "  审计是写操作的先决条件，不是旁路——不能用内存记录替代持久化审计。\n"
+                f"敏感操作「{d.command}」按 P1-⑤ 拒绝执行。\n"
+                "  审计是写操作与认证初始化的先决条件，不是旁路——"
+                "不能用内存记录替代持久化审计。\n"
                 "  修复 data 目录可写性（或恢复 policy.audit: true）后重试。"
             )
         # 只读：放行 + 告警
@@ -1279,6 +1374,18 @@ class _ToolRunnerBase:
         lines.append(f"  理由：{d.reason}")
         if d.signals:
             lines.append("  识别信号：" + "；".join(d.signals[:5]))
+        if getattr(d, "level", "") == "AUTH_BOOTSTRAP":
+            # 认证初始化不是矩阵等级，拒绝理由要给出可执行的修复动作，
+            # 而不是笼统的"绑定环境"。
+            lines.append(
+                "  认证初始化（AUTH_BOOTSTRAP）只会放行**单次**登录/刷新/登出请求，"
+                "需要同时满足：会话已绑定目标、环境明确且为测试背景、"
+                "URL 命中认证入口（直连 /login、/auth/login、/oauth/token 这类"
+                "标准端点无需清单；其它端点先 recon_openapi 登记）、"
+                "方法为 POST、参数符合认证接口结构、未超频率。"
+                "登录成功**不会**放行后续请求。"
+            )
+            return "\n".join(lines)
         lines.append(
             "  条件不满足统一拒绝执行。如确属已授权的测试环境，请在 config.yaml 的"
             " policy 段绑定环境（environments: {\"<host 通配>\": \"isolated_test\"}"
@@ -1340,6 +1447,22 @@ class _ToolRunnerBase:
                 f"策略：强制生效 | 目标环境 {env or '未知'} | 身份 {self._current_identity(session)}"
                 "（L1 仅隔离测试环境、L2 需专门测试环境/审批、L3 一律拒绝）"
             )
+            # 认证入口：Agent 必须知道"能不能登录、登录打到哪"，否则它只会
+            # 反复试 login 却不知道为什么被拒（拦截文本只覆盖单次调用）。
+            entries = self._auth_entries(session)
+            if entries:
+                brief = "、".join(f"{e.kind} {e.method} {e.url}" for e in entries[:3])
+                lines.append(
+                    f"认证入口：{len(entries)} 个已登记（{brief}）"
+                    "｜AUTH_BOOTSTRAP 只放行单次登录/刷新/登出，登录成功不放行后续请求"
+                )
+            elif session.target:
+                lines.append(
+                    "认证入口：清单未登记。可直接对 /login、/auth/login、"
+                    "/admin-api/system/auth/login、/oauth/token 这类标准端点提交凭证"
+                    "（AUTH_BOOTSTRAP 按路径末段识别，方法须为 POST）；"
+                    "验证码入口仍需 recon_openapi 登记"
+                )
         api = [a for a in r.assets if a.kind == "api"]
         if api:
             no_auth = sum(1 for a in api if not a.meta.get("auth"))

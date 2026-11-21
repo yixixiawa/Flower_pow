@@ -53,16 +53,51 @@
   请求根本不发出，工具结果里返回拒绝说明。这不是次数上限（换参数、换路径、
   换工具随时可以继续），只拦"一字不差的原样重试"——同一个请求打同一个目标，
   连响应字节数都相同，重试第十一次和第一次不会有任何区别。
+
+跨轮重复与"看不出进展"
+----------------------
+上面三道都是**轮内**检测（一次 ``send`` 里连续重复）。真实问题还有两个：
+
+* **跨轮重复**：上一轮已经 ``dirsearch -w big.txt`` 失败过，这一轮模型又提一次
+  同样的命令。轮内的指纹列表在每轮开头清空，拦不到。
+* **整体无进展**：每一步都在换着花样调工具（``A,B,A,B``），单个动作看不出重复，
+  但实际上一步没往前走，发现数/资产数/任务状态全都没变。
+
+对应两层：
+
+* :class:`core.session.explore.ExplorationLedger`（探索台账）——记录 objective、
+  每次调用的**参数指纹**与状态、失败方法、已确认事实。每轮开始先看台账，
+  已成功/已失败过的同参数动作**不再执行**，回给模型一句"这个动作第 N 轮做过，
+  结果是这样；要重做请说明新证据或参数差异"。
+  判重键是「工具 + 规范化参数」，**不是工具名**——换个路径、换个字典就是新动作。
+* :class:`core.session.explore.NoProgressGuard`（无进展守卫）——按**每步签名**
+  （动作指纹集合 + 结果摘要 + 发现/资产/任务状态计数）判断，连续 3 步签名完全
+  相同即判定无进展：注入收尾指令、停止继续执行工具、把已知事实与未决问题摊开。
+  换自然语言描述同一个操作没用——签名里没有自然语言。
+
+后台任务状态推送
+----------------
+``TaskManager`` 每进入一个终态就产生一条 :class:`TaskEvent`；本模块每一步
+``events_since(cursor)`` 只取"还没见过的"注入一次，游标推进后**同一状态不会
+重复注入**。所以模型不需要 ``list_tasks`` 轮询——轮询反而会被反轮询闸门拒绝。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from core.session.explore import (
+    ST_OK,
+    ExplorationLedger,
+    NoProgressGuard,
+    classify_result,
+    result_digest,
+)
 from core.tools import ToolRunner
 from llm import prompt as P
 
@@ -82,6 +117,10 @@ LOOP_SKELETON_LIMIT = 4
 # 组合在指纹层面坍缩成同一次调用，走既有的软纠偏 + 硬拒绝链路。
 _FILLER_KEY = re.compile(r"^[a-z]{1,3}$")
 _FILLER_VAL = re.compile(r"^1$")
+
+# 台账判重的豁免名单：这类工具是**观察**而不是**动作**，同一参数反复调
+# 不会"重复劳动"（list_tasks 的反轮询由 runner 侧的闸门管）。
+_LEDGER_EXEMPT = frozenset({"list_tasks", "session_state"})
 
 
 def _refusal_text(name: str, args: dict[str, Any]) -> str:
@@ -146,6 +185,28 @@ class Agent:
         # 用户明确要求重试同一请求是合法的，不能带着上一轮的拒绝状态。
         self._refused: set[str] = set()
         self._refused_skel: set[str] = set()
+        # ── 探索台账 / 无进展守卫 / 后台事件游标 ──────────────────
+        # 台账解决"跨轮重复探索"（轮内的三道检测拦不到上一轮做过的事）
+        self.ledger = ExplorationLedger()
+        # 守卫看每步的整体签名，连续多步一致 = 一步没往前走
+        self.noprog = NoProgressGuard()
+        # 只消费新增的后台状态变更：游标之前的都已经注入过了
+        tasks = getattr(session, "tasks", None)
+        self._task_cursor = int(getattr(tasks, "cursor", 0) or 0)
+        # 判定无进展后：工具调用一律不执行，给模型最后一次机会给结论
+        self._halted = False
+        self._halt_steps = 0
+        # 连续"整步都没执行任何工具"的次数（被跳过/被拒绝），兜底防死循环
+        self._noop_steps = 0
+        # 本轮内同一动作被"跳过"的次数（防止模型换个说法反复提同一件事）
+        self._skip_counts: dict[str, int] = {}
+        # 统计：每轮一条，累计一份。token 数没有 usage 可读，按字符估算并标注
+        self.turn_stats: list[dict[str, Any]] = []
+        self.stats: dict[str, int] = {
+            "rounds": 0, "steps": 0, "tool_calls": 0, "dup_blocked": 0,
+            "refused": 0, "repeats": 0, "prompt_chars": 0, "completion_chars": 0,
+        }
+        self._turn: dict[str, int] = {}
 
     # ── 提示词 ────────────────────────────────────────────────────
 
@@ -165,6 +226,12 @@ class Agent:
         if files is not None and files.records():
             note = files.prompt_note()
             extra = f"{extra}\n{note}" if extra else note
+        # 探索台账也进 extra：模型规划下一步前先看到"哪些动作已经做过、
+        # 结果如何"。正文仍然是数据/事实，不是指令，所以放 extra 而不是
+        # 拼进 AGENT_SYSTEM 的硬约束段。
+        ledger_note = self.ledger.prompt_note()
+        if ledger_note:
+            extra = f"{extra}\n{ledger_note}" if extra else ledger_note
         return {
             "role": "system",
             "content": P.AGENT_SYSTEM
@@ -293,10 +360,13 @@ class Agent:
         self._skeletons.clear()
         self._refused.clear()
         self._refused_skel.clear()
+        self._round_start(user_text)
         final = ""
         step = 0
 
         while True:
+            # 后台任务状态变更：只注入"还没见过"的那几条，游标推进后不重复
+            self._inject_task_events()
             messages = [self._system(), *self.history]
             text_parts: list[str] = []
             tool_calls: list[dict[str, str]] = []
@@ -315,16 +385,28 @@ class Agent:
                     error = ev["message"]
 
             content = "".join(text_parts)
+            # Token 统计：流式接口不返回 usage，按"消息字符数"记账（估算见 _turn_end）
+            prompt_chars = sum(
+                len(json.dumps(m, ensure_ascii=False, default=str)) for m in messages
+            )
+            self._turn["prompt_chars"] = self._turn.get("prompt_chars", 0) + prompt_chars
+            self._turn["completion_chars"] = (
+                self._turn.get("completion_chars", 0) + len(content)
+            )
+            self.stats["prompt_chars"] += prompt_chars
+            self.stats["completion_chars"] += len(content)
 
             if error and not content and not tool_calls:
                 self.on_event(f"\n[!] 模型调用失败：{error}")
                 self.history.append({"role": "assistant", "content": f"（调用失败：{error}）"})
+                self._turn_end()
                 return f"（调用失败：{error}）"
 
             if not tool_calls:
                 if content:
                     self.on_event("")
                 self.history.append({"role": "assistant", "content": content})
+                self._turn_end()
                 return content
 
             # ── 有工具调用：先把这个 assistant 轮次按协议格式补全 ──
@@ -354,15 +436,29 @@ class Agent:
             skeleton_looped = False
             looped_fp = ""
             looped_skel = ""
+            step_pairs: list[str] = []
+            executed = False
             for c in norm_calls:
                 args, parse_note = _parse_args(c["arguments"], self.tools, c["name"])
                 fp = self._fingerprint(c["name"], args)
                 skel = self._skeleton(c["name"], args)
+                # ── 已判定无进展：工具调用一律不执行 ──────────────
+                if self._halted:
+                    self.history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": c["id"],
+                            "content": _halted_text(c["name"], args),
+                        }
+                    )
+                    continue
                 # ── 硬拒绝：警告过之后仍原样重调 → 请求根本不发出 ──
                 # 协议要求每个 tool_call 必须有结果，所以拒绝说明以 tool
                 # 消息回灌，模型能读到"为什么拒、接下来能干什么"。
                 if fp in self._refused or (skel and skel in self._refused_skel):
                     self.on_event(f"\n  ⛔ 已拒绝重复执行（无进展死循环）")
+                    self.stats["refused"] += 1
+                    self._turn["refused"] += 1
                     self.history.append(
                         {
                             "role": "tool",
@@ -370,6 +466,31 @@ class Agent:
                             "content": _refusal_text(c["name"], args),
                         }
                     )
+                    step_pairs.append(f"{fp}#refused")
+                    continue
+                # ── 跨轮判重：台账里已执行过同参数动作 → 不执行，先要理由 ──
+                dup = (
+                    None
+                    if c["name"] in _LEDGER_EXEMPT
+                    else self.ledger.duplicate_of(c["name"], fp)
+                )
+                if dup is not None:
+                    key = f"{c['name']}|{fp}"
+                    self._skip_counts[key] = self._skip_counts.get(key, 0) + 1
+                    self.stats["dup_blocked"] += 1
+                    self._turn["dup_blocked"] += 1
+                    self.on_event(
+                        f"\n  ⏸ 跳过重复动作（第 {dup.round} 轮已执行：{dup.status}）"
+                    )
+                    self.history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": c["id"],
+                            "content": _duplicate_text(c["name"], args, dup,
+                                                       self._skip_counts[key]),
+                        }
+                    )
+                    step_pairs.append(f"{fp}#dup")
                     continue
                 if self._looping(fp):
                     looped = True
@@ -382,6 +503,7 @@ class Agent:
                     # 骨架只认**连续**：中间插了别的工具调用，连击断开
                     self._skeletons.clear()
                 self.on_event(f"\n  ⚙ {_describe(c['name'], args)}{parse_note}")
+                before = self._evidence_snapshot()
                 try:
                     result = await self.runner.execute(c["name"], args, self.session)
                 except asyncio.CancelledError:
@@ -398,6 +520,20 @@ class Agent:
                     raise
                 except Exception as exc:  # noqa: BLE001
                     result = f"【工具失败】{type(exc).__name__}: {exc}"
+                self.stats["tool_calls"] += 1
+                self._turn["calls"] += 1
+                executed = True
+                status = classify_result(result)
+                self.ledger.record(c["name"], fp, status, result)
+                after = self._evidence_snapshot()
+                if after != before:
+                    # 有新发现/新资产/新线索 → 这是"真的往前走了"的一步
+                    self.ledger.note_evidence()
+                    self.ledger.note_fact(
+                        f"{c['name']} 带来新证据（发现 +{after[0] - before[0]}、"
+                        f"资产 +{after[1] - before[1]}、线索 +{after[2] - before[2]}）"
+                    )
+                step_pairs.append(f"{fp}#{status}:{result_digest(result)}")
                 self.on_event(_indent(result))
                 self.history.append(
                     {"role": "tool", "tool_call_id": c["id"], "content": result}
@@ -405,8 +541,12 @@ class Agent:
 
             final = content
             step += 1
+            self.stats["steps"] += 1
+            self._turn["steps"] += 1
 
             if looped or skeleton_looped:
+                self.stats["repeats"] += 1
+                self._turn["repeats"] = self._turn.get("repeats", 0) + 1
                 # 记下触发循环的指纹：模型若无视下面的收尾指令、
                 # 原样再调同一个，就进入硬拒绝（不再发出请求）。
                 if looped_fp:
@@ -456,6 +596,185 @@ class Agent:
                 self._call_fingerprints.clear()
                 self._skeletons.clear()
                 continue
+
+            # ── 已判定无进展：再给两步机会，仍不收敛就由代码收尾 ──
+            # 必须放在最前面：否则每步都会重新 _halt（把计数器清零），
+            # 模型一直硬调工具就会无限循环。
+            if self._halted:
+                self._halt_steps += 1
+                if self._halt_steps >= 2:
+                    text = self._halt_summary()
+                    self.history.append({"role": "assistant", "content": text})
+                    self._turn_end()
+                    return text
+                continue
+            # ── 无进展守卫：不看到单个动作，看这一步整体有没有推进 ──
+            # 签名 = 动作指纹/结果摘要 + 发现/资产/线索计数 + 后台任务状态。
+            # 连续 NO_PROGRESS_LIMIT 步完全一致 → 判定原地打转。
+            if norm_calls and not executed:
+                # 整步都是"被跳过/被拒绝"：一步没往前走，连续两次即收口。
+                # 这条兜底专门防"模型无视拒绝、反复提同一动作"的无限规划循环。
+                self._noop_steps += 1
+                if self._noop_steps >= 2:
+                    self._halt(step_pairs)
+                    continue
+            else:
+                self._noop_steps = 0
+            if self.noprog.observe(self._step_signature(step_pairs)):
+                self._halt(step_pairs)
+                continue
+
+    # ── 轮次台账 / 事件 / 统计 ────────────────────────────────────
+
+    def _round_start(self, user_text: str) -> None:
+        """一轮开始：推进台账轮次、清空轮内守卫、开新一轮统计。"""
+        self.stats["rounds"] += 1
+        self.ledger.begin(user_text)
+        self.noprog.reset()
+        self._halted = False
+        self._halt_steps = 0
+        self._noop_steps = 0
+        self._skip_counts.clear()
+        self._turn = {
+            "steps": 0, "calls": 0, "dup_blocked": 0, "refused": 0,
+            "repeats": 0, "prompt_chars": 0, "completion_chars": 0,
+        }
+
+    def _turn_end(self) -> None:
+        """收尾统计：工具调用数、字符数、重复次数、估算 token。"""
+        if not self._turn:
+            return
+        rec = dict(self._turn)
+        rec["round"] = self.stats["rounds"]
+        rec["objective"] = self.ledger.objective
+        # 没有 usage 可读（流式接口不返回），按字符估算并在文档里说明：
+        # 中文约 1.5~2 字符/token，英文约 4 字符/token，这里取 2 作折中。
+        rec["est_tokens"] = int(
+            (rec.get("prompt_chars", 0) + rec.get("completion_chars", 0)) / 2
+        )
+        self.turn_stats.append(rec)
+        if len(self.turn_stats) > 50:
+            del self.turn_stats[: len(self.turn_stats) - 50]
+
+    def stats_line(self) -> str:
+        """一行统计（/status 与调试用）：调用数 / 重复被拦 / 估算 token。"""
+        s = self.stats
+        return (
+            f"Agent：{s['rounds']} 轮 / {s['steps']} 步 / 工具 {s['tool_calls']} 次"
+            f"｜跳过重复 {s['dup_blocked']} 次、硬拒绝 {s['refused']} 次、"
+            f"死循环告警 {s['repeats']} 次"
+            f"｜字符 {s['prompt_chars'] + s['completion_chars']}"
+            f"（估算 {int((s['prompt_chars'] + s['completion_chars']) / 2)} tokens）"
+        )
+
+    def _inject_task_events(self) -> bool:
+        """把"还没见过"的后台任务状态变更注入上下文，返回是否注入。
+
+        游标之前的都在更早的步骤里注入过了——**同一状态不会被反复注入**
+        （任务书 一.5）。没有新事件时什么也不做（不产生空消息）。
+        """
+        mgr = getattr(self.session, "tasks", None)
+        if mgr is None:
+            return False
+        try:
+            mgr.sweep()                       # 超时收割：卡死的任务也要进终态
+            events, cursor = mgr.events_since(self._task_cursor)
+        except Exception:  # noqa: BLE001 — 台账异常不能把主循环带崩
+            return False
+        self._task_cursor = cursor
+        if not events:
+            return False
+        lines = [
+            "[后台任务状态变更]（系统推送，**不需要**再调用 list_tasks 查询）",
+        ]
+        lines += [f"- {e.text()}" for e in events]
+        lines.append(
+            "只处理这些变化：把已完成的结果并入判断；失败/超时的任务不要自动重跑"
+            "（改参数或明确 retry 才行）。其余工作照常继续。"
+        )
+        self.history.append({"role": "user", "content": "\n".join(lines)})
+        self.on_event(f"\n  ⤵ 后台任务状态变更 {len(events)} 条（已注入上下文）")
+        return True
+
+    def _evidence_snapshot(self) -> tuple[int, int, int]:
+        """(发现数, 资产数, 待验证线索数)——判断"这一步有没有带来新证据"。"""
+        res = getattr(self.session, "result", None)
+        if res is None:
+            return (0, 0, 0)
+        findings = len(getattr(res, "findings", []) or [])
+        assets = len(getattr(res, "assets", []) or [])
+        clues = 0
+        if hasattr(res, "active_clues"):
+            try:
+                clues = len(res.active_clues() or [])
+            except Exception:  # noqa: BLE001
+                clues = 0
+        return (findings, assets, clues)
+
+    def _step_signature(self, step_pairs: list[str]) -> str:
+        """一步的整体签名：动作+结果 + 会话进展计数 + 后台任务状态。"""
+        mgr = getattr(self.session, "tasks", None)
+        tasks_sig: list[str] = []
+        if mgr is not None:
+            try:
+                tasks_sig = sorted(f"{t.task_id}:{t.status}" for t in mgr.all())
+            except Exception:  # noqa: BLE001
+                tasks_sig = []
+        payload = json.dumps(
+            [sorted(step_pairs), self._evidence_snapshot(), tasks_sig],
+            ensure_ascii=False,
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _halt(self, step_pairs: list[str]) -> None:
+        """判定无进展：停止继续执行工具，要求模型摊开已知事实并收口。"""
+        self._halted = True
+        self._halt_steps = 0
+        # 把这一步还没被硬拒绝的指纹也拉进拒绝集：再来就是"原样重提"
+        for p in step_pairs:
+            fp = p.split("#", 1)[0]
+            if fp:
+                self._refused.add(fp)
+        self.on_event(
+            f"\n[!] 连续 {self.noprog.limit} 步动作与结果完全相同、没有新增发现，"
+            f"判定为原地打转，已停止继续执行工具。"
+        )
+        known = "；".join(self.ledger.facts[-5:]) or "（台账里没有新增事实）"
+        self.history.append(
+            {
+                "role": "user",
+                "content": (
+                    "[系统提示] 本轮已连续多步**没有任何推进**：动作相同、结果相同、"
+                    "发现/资产/任务状态都没变。工具调用已被停止执行。\n"
+                    f"已知事实：{known}\n"
+                    "现在只能做两件事之一：① 给出**真正不同**的下一步——"
+                    "必须说清它和上面已失败动作的差别（不同入口/不同认证态/"
+                    "不同参数维度），否则不要提；② 直接给结论：已确认的问题、"
+                    "未能验证的部分、建议人工跟进的方向。不再需要调用任何工具。"
+                ),
+            }
+        )
+
+    def _halt_summary(self) -> str:
+        """模型在被停止后仍硬调工具时，由代码直接给出一份收口结论。"""
+        s = self.ledger.stats()
+        facts = "；".join(self.ledger.facts[-5:]) or "（本轮没有取得新的确认事实）"
+        failed = "；".join(
+            f"{k.split('|', 1)[0]}（{v}）" for k, v in list(self.ledger.failed.items())[-5:]
+        ) or "（无）"
+        self.on_event("\n[!] 停止后仍在调用工具，直接收尾。")
+        return (
+            "【已停止重复探索】连续多步动作与结果完全相同，没有新增发现，"
+            "继续调用只会在原地打转。\n"
+            f"- 已执行 {s['calls']} 次工具调用，其中失败/被拦 {s['failed']} 个方法\n"
+            f"- 已确认事实：{facts}\n"
+            f"- 已失败方法：{failed}\n"
+            "- 未解决：上述失败方法覆盖的入口尚未拿到有效证据；"
+            "需要换一个真正不同的角度（不同认证态/不同参数维度/人工介入）\n"
+            "- 建议：先用 artifact_query / list_tasks 复核已有结果，"
+            "再决定是否换目标面或交人工跟进。"
+        )
 
     # ── 上下文管理 ────────────────────────────────────────────────
 
@@ -527,6 +846,13 @@ class Agent:
         self._skeletons.clear()
         self._refused.clear()
         self._refused_skel.clear()
+        self.ledger.reset()
+        self.noprog.reset()
+        self._halted = False
+        self._halt_steps = 0
+        self._skip_counts.clear()
+        tasks = getattr(self.session, "tasks", None)
+        self._task_cursor = int(getattr(tasks, "cursor", 0) or 0)
 
     def restore(self, history: list[dict[str, Any]]) -> int:
         """回填历史对话，返回实际载入的消息数。
@@ -542,10 +868,54 @@ class Agent:
         self._skeletons.clear()
         self._refused.clear()
         self._refused_skel.clear()
+        # 恢复后不要重放历史事件：游标对齐到当前水位，之后只消费新变化。
+        # 探索台账同理——旧会话的动作记录没有恢复（历史消息里仍在），
+        # 从头开始记，避免把"昨天失败过"当成"这一轮已经试过"。
+        self.ledger.reset()
+        self.noprog.reset()
+        self._halted = False
+        self._halt_steps = 0
+        self._skip_counts.clear()
+        tasks = getattr(self.session, "tasks", None)
+        self._task_cursor = int(getattr(tasks, "cursor", 0) or 0)
         return len(self.history)
 
     def history_len(self) -> int:
         return len(self.history)
+
+
+def _duplicate_text(name: str, args: dict[str, Any], dup, attempt: int) -> str:
+    """跨轮重复动作的回灌说明：**没有执行**，先要一个理由。
+
+    措辞必须回答"为什么没执行、上次结果是什么、要怎样才能重做"——
+    只说"重复"模型会换个说法再提一次（换说法不改参数，指纹不变）。
+    """
+    text = (
+        f"[未执行：重复动作] {_describe(name, args)} 在第 {dup.round} 轮已经执行过，"
+        f"状态「{dup.status}」"
+        + (f"，摘要：{dup.summary}" if dup.summary else "")
+        + "。相同工具 + 相同参数再执行一次，拿到的是同一个结果，不会带来新信息。\n"
+        "要继续请二选一：① 说明**新证据或参数差异**（换路径/换方法/换认证态/"
+        "换字典/换端口段），换了参数就是新动作，会正常执行；"
+        "② 若已无新角度，基于已有结果直接给结论。"
+    )
+    if attempt >= 2:
+        text += (
+            f"\n注意：这是本轮第 {attempt} 次提出同一个动作。"
+            "再次提出相同参数会被判定为原地打转，本轮工具调用将被停止。"
+        )
+    return text
+
+
+def _halted_text(name: str, args: dict[str, Any]) -> str:
+    """已判定无进展后，工具调用一律不执行的说明。"""
+    return (
+        "[已停止执行] 本轮已判定无进展（连续多步动作与结果完全相同、没有新增发现），"
+        f"{_describe(name, args)} 不会再执行。\n"
+        "现在只需要给结论：已确认的问题、未能验证的部分、建议人工跟进的方向。"
+        "如果确有**真正不同**的下一步（不同入口/认证态/参数维度），"
+        "请在文本里说明它和其它尝试的差别，由用户决定是否开始新一轮。"
+    )
 
 
 def _parse_args(raw: str, tools: list[dict[str, Any]], name: str) -> tuple[dict[str, Any], str]:

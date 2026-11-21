@@ -122,13 +122,39 @@ def pick_captcha_endpoint(assets: list[Asset]) -> Asset | None:
 
 
 class Authenticator:
-    """按接口清单元数据完成登录。"""
+    """按接口清单元数据完成登录。
 
-    def __init__(self, cfg, verbose: bool = False) -> None:
+    ``precheck`` 是本模块**唯一的网络出口闸门**：调用方（Runner /
+    Planner）注入一个 ``(url, method, body) -> 拒因文本`` 的可调用对象，
+    每个真实请求（验证码 GET、登录 POST）发出前都会过它。没有 precheck
+    就等于"绕过统一策略"——所以生产路径一律注入，测试以外不提供默认值。
+
+    为什么不在这里直接 import policy：``core.auth`` 被 runner、planner、
+    detector 多处引用，policy 又要引用 ``core.proxy``，硬绑会形成环。
+    注入式设计让"每个请求都要过闸"这件事对调用方可见、可测。
+    """
+
+    def __init__(self, cfg, verbose: bool = False, precheck=None) -> None:
         self.cfg = cfg
         self.verbose = verbose
+        self.precheck = precheck
+        self._blocked = ""      # 最近一次被策略拦下的原因（登录结果里回给模型）
         self._c: httpx.Client | None = None
         self._base_url: str = ""   # 代理决策需要知道目标主机
+
+    def _gate(self, url: str, method: str, body: str = "") -> bool:
+        """请求发出前的策略检查。返回 False = 不许发。"""
+        if self.precheck is None:
+            return True
+        try:
+            why = self.precheck(url, method, body)
+        except Exception as exc:  # noqa: BLE001 —— 闸门异常按拒绝处理
+            self._blocked = f"认证请求策略检查异常，按拒绝处理：{type(exc).__name__}: {exc}"
+            return False
+        if why:
+            self._blocked = str(why)
+            return False
+        return True
 
     def client(self) -> httpx.Client:
         if self._c is None or self._c.is_closed:
@@ -145,6 +171,8 @@ class Authenticator:
             self._c.close()
 
     def _get(self, url: str, tries: int = 4):
+        if not self._gate(url, "GET"):
+            return None
         for i in range(tries):
             try:
                 return self.client().get(url)
@@ -154,6 +182,13 @@ class Authenticator:
         return None
 
     def _post(self, url: str, payload: dict, headers: dict | None = None, tries: int = 4):
+        # 闸门看到的是**字段名与结构**，不是凭证值：body 用 json.dumps 传入，
+        # policy 只解析键名；即使进了日志也不会展开成明文密码。
+        import json as _json
+
+        body = _json.dumps(payload, ensure_ascii=False, default=str)
+        if not self._gate(url, "POST", body):
+            return None
         for i in range(tries):
             try:
                 return self.client().post(url, json=payload, headers=headers)
@@ -215,6 +250,11 @@ class Authenticator:
             out.captcha_endpoint = cap.meta.get("path", "")
             uuid_, code, kind = self.fetch_captcha(base, cap.meta["path"])
             out.captcha_kind = kind
+            if self._blocked:
+                # 验证码读取被策略拦下：不带着"没有验证码"的请求硬打登录，
+                # 直接把拦因回给模型（失败要能解释，不能表现为"网络故障"）。
+                out.notes.append(self._blocked)
+                return out
             if kind == "svg" and code:
                 out.notes.append(
                     f"验证码为纯文本 SVG，已由脚本直接还原为 {code!r}"
@@ -229,7 +269,7 @@ class Authenticator:
 
         r = self._post(join_url(base, ep.meta["path"]), payload)
         if r is None:
-            out.notes.append("登录请求失败（网络）")
+            out.notes.append(self._blocked or "登录请求失败（网络）")
             return out
         out.raw = r.text[:400]
         try:

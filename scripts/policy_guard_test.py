@@ -763,11 +763,18 @@ def test_runner_gate() -> None:
         ))
         ok(verdict is not None and "未识别" in verdict, "未知探针类别拒绝")
 
-        # ── 外部工具：curl 只读放行；sqlmap L3 拒 ────────────────────
+        # ── 外部工具：curl 网络能力被禁用；sqlmap L3 拒 ─────────────
+        # 第七轮整改：curl 由外部进程发请求，方法/请求体/重定向无法被统一
+        # Gateway 逐请求解析 → 禁网（改用 http_request）。这里断言的是
+        # **收紧后**的契约：不是"放行"，而是"必须被拒且说清原因"。
         verdict = asyncio.run(runner._policy_gate(
             "external_tool", {"tool": "curl", "args": []}, s,
         ))
-        ok(verdict is None, "curl（只读映射）放行")
+        ok(verdict is not None and "已拦截" in verdict,
+           "curl（不可验证网络工具）必须被拒")
+        ok("Gateway" in verdict or "外部进程" in verdict,
+           "curl 拒绝理由应指向统一 Gateway 无法解析其请求")
+        ok("http_request" in verdict, "curl 拒绝理由应给出合法出路（http_request）")
         verdict = asyncio.run(runner._policy_gate(
             "external_tool", {"tool": "sqlmap", "target": "http://127.0.0.1"}, s,
         ))
@@ -1278,12 +1285,29 @@ def test_round6() -> None:
         ))
         ok(v is not None and "SQL 注入验证" in v and "已拦截" in v,
            "sqli_probe 工具 → L3 一律拒绝（验收：sqli_probe L3 拒绝）")
+        # login：AUTH 分类没有矩阵授权行 → 走 AUTH_BOOTSTRAP 受限通道。
+        # 三条断言比"一律 UNKNOWN"更严：
+        #   ① 打到非认证路径照样拒（通道有入口校验，不是"login 工具全放行"）；
+        #   ② 合规上下文下的标准端点放行（登录是产品能力，不是后门）；
+        #   ③ 环境未知仍拒（UNKNOWN 永久 DENY 没有被放松）。
+        v = asyncio.run(runner._policy_gate(
+            "login", {"url": "http://127.0.0.1:8080/api/users/export",
+                      "username": "u", "password": "p"}, s,
+        ))
+        ok(v is not None and "已拦截" in v,
+           "login 工具打到非认证路径 → 拒绝（AUTH_BOOTSTRAP 不放行任意 URL）")
         v = asyncio.run(runner._policy_gate(
             "login", {"url": "http://127.0.0.1:8080/api/login",
                       "username": "u", "password": "p"}, s,
         ))
-        ok(v is not None and "已拦截" in v,
-           "login 工具 → AUTH 无矩阵授权行 → UNKNOWN 拒绝")
+        ok(v is None,
+           "login 工具 → 标准登录端点 + 隔离测试环境 → AUTH_BOOTSTRAP 放行")
+        v = asyncio.run(runner_u._policy_gate(
+            "login", {"url": "http://127.0.0.1:8080/api/login",
+                      "username": "u", "password": "p"}, s,
+        ))
+        ok(v is not None and "已拦截" in v and "unknown" in v,
+           "login 工具在 UNKNOWN 环境 → 仍然拒绝")
         # authz_probe：只读 GET 对比 → L0，隔离测试环境放行
         v = asyncio.run(runner._policy_gate(
             "authz_probe", {"url": "http://127.0.0.1:8080/", "limit": 5}, s,
