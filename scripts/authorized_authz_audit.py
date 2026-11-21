@@ -1,5 +1,4 @@
-"""授权渗透测试：三账号只读越权审计（sgxmgl.fjny.edu.cn）。
-
+"""
 用途
 ----
 在**已获得书面授权**的目标上，用普通账号 / 管理员账号交叉验证接口的
@@ -33,10 +32,6 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from detectors.api_authz import biz_ok  # noqa: E402
-
-BASE_DEFAULT = "https://sgxmgl.fjny.edu.cn"
-PREFIX = "/admin-api"
-TENANT = "166"  # 实测该站点的有效租户 ID（文档"前置的166"）
 
 
 def _client() -> httpx.Client:
