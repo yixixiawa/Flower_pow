@@ -119,13 +119,24 @@ policy:
   enabled: true
   # 未命中 host 绑定表时的默认环境：unknown / production /
   # dedicated_test / isolated_test。默认 unknown（L1/L2 条件不满足 → 拒绝执行）
-  default_environment: isolated_test
+  # guardschedule3.md：禁止把 default_environment 设为 isolated_test（全局放宽）
+  default_environment: unknown
   # host 通配 → 环境绑定。要让 L1（创建/修改测试数据）通过，
   # 目标必须绑到 isolated_test；L2 上传**仅 dedicated_test**（隔离测试
   # 环境不满足"专门"条件）且仍需逐请求审批
-  # environments:
-  #   "192.168.*": isolated_test
-  #   "10.0.2.*": dedicated_test
+  environments:
+    "sgxmgl.fjny.edu.cn": isolated_test
+  # 认证入口登记表（policy/auth_registry）：AUTH_BOOTSTRAP 只放行**已登记**
+  # 的认证端点——路径关键词不直接授权（guardschedule3.md：禁止按 URL 含
+  # login 直接授权）。每条 {target, kind, url, method?, fields?, note?}；
+  # kind ∈ login/refresh/logout/captcha；login/refresh/logout 固定 POST、
+  # captcha 固定 GET。运行期也可 REPL /auth register <url> [kind] 逐条确认。
+  auth_endpoints:
+    - target: "sgxmgl.fjny.edu.cn"
+      kind: login
+      url: /admin-api/system/auth/login
+      method: POST
+      note: "芋道 admin-api 标准登录端点（用户确认登记）"
   # 【已移除】配置级命令审批（approvals）不再生效——P0-② 整改：
   # 审批只存在于运行期，逐请求、绑定具体对象 URL，参数变化即重新审批。
   # 写在这里的任何审批表都不会被读取。

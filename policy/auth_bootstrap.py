@@ -12,9 +12,10 @@
 1. 当前会话必须已绑定 ``target_id``；
 2. 目标环境必须**明确**（``unknown`` 一律拒绝，不猜）；
 3. 必须在**测试背景**下（production 不是测试背景，不做凭证提交）；
-4. 请求 URL 必须命中认证入口：**接口清单登记**（``entries_for`` 从 OpenAPI
-   资产推导）**或路径自证**（:func:`implicit_endpoint`：末段含 login /
-   signin / refresh / logout 即认，如 ``loginByPassword``、``doLogin``）；
+4. 请求 URL 必须命中**已登记**的认证入口——登记来源只有两个：接口清单
+   （``entries_for`` 从 OpenAPI 资产推导）与登记表（config.yaml
+   ``policy.auth_endpoints`` / REPL ``/auth register``）。**路径关键词
+   识别不授权**（guardschedule3.md）：末段含 login 只产生候选提示；
    只认这四类，改密码/建用户/批量撤销令牌不算；
 5. HTTP 方法必须与接口定义一致（登记时记下的那个方法）；
 6. 请求参数必须符合认证接口结构（字段 ⊆ 接口声明 ∪ 认证字段词表，
@@ -133,29 +134,23 @@ def _join(target: str, path: str) -> str:
     return (target or "").rstrip("/") + "/" + (path or "").lstrip("/")
 
 
-# ── 路径自证：接口清单之外的认证入口识别 ────────────────────────────
+# ── 路径关键词识别：**候选识别，不授权**（guardschedule3.md） ────────
 #
-# 认证入口的唯一来源原本是 recon_openapi 的接口清单。但"能不能提交凭证"
-# 不该依赖"先枚举过接口"——真实系统里认证语义本身就写在路径上：
-#   /admin-api/system/auth/login       （芋道 yudao）
-#   /login                              （Spring Security 表单）
-#   /api/v1/user/loginByPassword        （自定义后端，末段含 login）
-#   /api/login/doLogin                  （框架常见的 action 后缀）
-#   /oauth/token                        （OAuth2 令牌端点）
-# 这些不需要 OpenAPI 也能确定"它是登录/刷新/登出入口"。
+# 第十一轮曾把"末段含 login"做成代码级自动授权（路径自证直接放行）。
+# 规范第三节明令禁止"根据 URL 包含 login 等关键词直接授权"，第 107-108
+# 行附录也写明：``implicit_endpoint() 改成只提供候选识别，不直接授权；
+# 末段含 login 自动登记 删除``。
 #
-# 识别口径（按用户要求放宽）：**末段包含认证动词即算**，不要求末段
-# 恰好等于 ``login``——``loginByPassword`` / ``doLogin`` / ``login.json``
-# 都算登录入口。另外，路径中**任一段整段等于**认证动词也算（覆盖
-# ``/api/login/do`` 这种把动作放在下一段的写法）。
+# 所以这里的函数只回答一个问题："这个 URL **看起来**像哪类认证端点？"
+# 返回值只用于两个地方：
+#   * 拒绝理由里的候选提示（告诉用户怎么登记）——
+#     :func:`policy.auth_registry.candidate_hint`；
+#   * ``check_intent`` 之外没有任何授权路径。
+# 它的返回值**永远不能**变成 ALLOW，也不能替代登记表。
 #
-# 放宽只发生在"认出这是认证入口"这一步。真正的安全防线一条没动：
-#   · 方法必须是 POST（login/refresh/logout），GET/PUT 一律拒；
-#   · 参数必须 ⊆ 认证字段词表 **且** 必须带凭证字段（username/password/
-#     email/phone/code…）——所以 ``/login-history`` 这种查询接口即使被认出，
-#     带 pageNum/pageSize 也会被参数结构挡下；
-#   · 只读后缀（history/log(s)/record(s)/list/page）直接排除，不认；
-#   · 会话绑定目标 / 环境明确且为测试背景 / 频率限制 / 单次生效 全部照旧。
+# 识别口径保持宽松（末段**包含**认证动词即认——``loginByPassword`` /
+# ``doLogin`` / ``login.json`` 都算，路径中任一段整段等于认证动词也算，
+# ``/oauth/token`` 看父段）：识别得准，提示才有用。授权交给登记表。
 IMPLICIT_SEGMENTS: dict[str, str] = {
     "login": AuthKind.LOGIN,
     "log-in": AuthKind.LOGIN,
@@ -279,23 +274,25 @@ def _kind_from_words(text: str) -> str:
 
 
 def implicit_endpoint(url: str) -> AuthEndpoint | None:
-    """从 URL 路径识别认证入口（接口清单未登记时的兜底）。
+    """从 URL 路径**识别候选**认证入口——只识别，不授权。
 
-    识别口径（用户要求的宽松版）：
+    ⚠️ 本函数的结果**不能**作为放行依据（guardschedule3.md：路径关键词
+    不直接授权）。它的唯一用途是：请求因 ENDPOINT_UNREGISTERED 被拒时，
+    在拒绝理由里告诉用户"这个 URL 看起来像哪类认证端点、怎么登记"。
+    真正的授权来源只有两个：接口清单（recon_openapi）与登记表
+    （config.yaml ``policy.auth_endpoints`` / REPL ``/auth register``）。
+
+    识别口径（保持宽松，识别得准提示才有用）：
 
     * 末段**包含**认证动词即认——``loginByPassword`` / ``doLogin`` /
-      ``login.json`` / ``adminLogin`` 都算登录入口；
+      ``login.json`` / ``adminLogin`` 都算登录候选；
     * 末段以只读后缀结尾（history/logs/list/records/page/query）不算——
       ``/auth/login-history`` 是查询接口；
     * 路径中**任一段整段等于**认证动词也算（``/api/login/do``）；
     * ``/oauth/token`` 这类令牌端点单独认（只看父段）。
 
     返回的 :class:`AuthEndpoint` 方法固定为语义默认（login/refresh/logout
-    = POST），``fields`` 为空（参数结构回落到认证字段词表）。
-
-    **放宽的只是"入口识别"，不是授权**：会话绑定目标、环境明确且为测试
-    背景、方法必须是 POST、参数 ⊆ 认证词表且必须带凭证字段、频率限制、
-    单次生效——全部由 :func:`check` 继续校验，一条都没少。
+    = POST），``fields`` 为空。
     """
     try:
         path = urlsplit(url or "").path or ""
@@ -538,21 +535,16 @@ def check_intent(
     found = [e for e in (entries or ()) if e.kind == kind]
     first_url = found[0].url if found else ""
 
-    # 条件 ④ 的"入口存在性"在意图级**不阻断**：
-    #
-    # * 请求级（:func:`check`）既认接口清单，也认 URL 路径末段自证
-    #   （``/admin-api/system/auth/login`` 这类标准约定）；
-    # * 意图级只回答"这次认证操作能不能发起"。若在这里要求清单，等于把
-    #   一个**只读枚举**（recon_openapi）变成提交凭证的硬前置——而提交凭证
-    #   本身不写业务数据，风险等级低于任何 L1 操作。
-    #
-    # 例外是 captcha：它的 HTTP 方法语义不唯一（GET 图片码 / POST 芋道
-    # ``/captcha/get``），无法路径自证，只能由接口清单登记。
-    if not found and kind == AuthKind.CAPTCHA:
+    # 条件 ④（入口存在性）在意图级**必须成立**：路径关键词自证已按
+    # guardschedule3.md 删除——授权只来自登记（接口清单 or 登记表）。
+    # 没有任何已登记的该类入口，这次认证操作就没有发起的依据。
+    # 允许用 `REPL /auth register` / config.yaml policy.auth_endpoints
+    # 或 recon_openapi 产生登记。
+    if not found:
         return _deny(
             "ENDPOINT_UNREGISTERED",
-            "验证码入口必须由接口清单登记（GET 图片码与 POST 取码语义不同，"
-            "不做路径自证）：请先 recon_openapi",
+            f"没有任何已登记的 {kind} 认证入口：请先登记（REPL /auth register、"
+            "config.yaml policy.auth_endpoints，或 recon_openapi 从接口清单推导）",
             kind=kind,
         )
     if kind == AuthKind.REFRESH and not credentials_present:
@@ -568,10 +560,7 @@ def check_intent(
         if not ok:
             return _deny("RATE_LIMITED", why, kind=kind, endpoint=first_url)
 
-    entry_note = (
-        f"{len(found)} 个已登记入口" if found
-        else "清单未登记，具体端点由请求级按路径末段自证（login/refresh/logout）"
-    )
+    entry_note = f"{len(found)} 个已登记入口"
     return AuthDecision(
         "ALLOW",
         kind=kind,
@@ -624,34 +613,33 @@ def check(
         return pre
     env = (environment or "").strip()
 
-    # ④ 必须命中认证入口：接口清单登记优先，其次是路径自证
+    # ④ 必须命中**已登记**的认证入口（接口清单 or 登记表）。
+    #    路径关键词识别（implicit_endpoint）**不授权**——未命中时它只
+    #    参与拒绝理由里的候选提示（guardschedule3.md：禁止按 URL 关键词
+    #    直接授权；授权只来自登记）。
     same_url = [e for e in eps if e.same_url(url)]
     matched = next((e for e in same_url if e.matches(url, method_u)), None)
-    source = "清单登记"
     if matched is None:
-        imp = implicit_endpoint(url)
-        if imp is not None:
-            if method_u != imp.method:
-                return _deny(
-                    "METHOD_MISMATCH",
-                    f"方法 {method_u} 与认证入口语义不符：{url} 的路径末段是 "
-                    f"{imp.kind} 入口，只允许 {imp.method}",
-                    kind=imp.kind, endpoint=url,
-                )
-            matched, source = imp, "路径自证"
-        elif same_url:
+        if same_url:
             allowed_methods = "/".join(sorted({e.method for e in same_url}))
             return _deny(
                 "METHOD_MISMATCH",
                 f"方法 {method_u} 与认证接口定义不符（{url} 只登记了 {allowed_methods}）",
             )
-        else:
-            return _deny(
-                "ENDPOINT_UNREGISTERED",
-                f"认证入口未登记：{method_u} {url} 的路径末段不是 login/refresh/logout，"
-                "也不在本次接口清单内——提交凭证请指向真正的登录端点"
-                "（标准端点无需 recon_openapi，路径末段自证即可）",
-            )
+        hint = ""
+        try:
+            from policy.auth_registry import candidate_hint
+
+            hint = candidate_hint(url=url, bound_target=bound_target)
+        except Exception:            # noqa: BLE001 —— 提示失败不影响拒绝
+            hint = ""
+        reason = (
+            f"认证入口未登记：{method_u} {url} 不在接口清单与登记表内"
+            "——提交凭证前必须先登记该端点"
+        )
+        if hint:
+            reason = f"{reason}。{hint}"
+        return _deny("ENDPOINT_UNREGISTERED", reason)
     if matched.kind not in AuthKind.ALL:
         return _deny("ENDPOINT_UNREGISTERED", f"未识别的认证入口类型：{matched.url}")
 
@@ -720,13 +708,13 @@ def check(
         code="OK",
         reason=(
             f"AUTH_BOOTSTRAP 允许：{matched.kind} {method_u} {matched.url}"
-            f"（入口来源：{source}；环境 {env}，仅本次请求有效；"
+            f"（已登记入口；环境 {env}，仅本次请求有效；"
             "后续请求仍走权限矩阵与 GUARD）"
         ),
         signals=[
             f"会话绑定目标：{target_id}",
             f"环境：{env}",
-            f"入口：{matched.kind} {matched.url}（{source}）",
+            f"入口：{matched.kind} {matched.url}（已登记）",
             f"参数：{sorted(keys) if keys else '无'}",
         ],
     )

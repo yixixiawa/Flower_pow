@@ -286,15 +286,22 @@ class Detector(ABC):
             )
         # **同一策略入口**（第七轮整改）：不再在这里复制"分类 + decide"，
         # 直接走 RequestGuard.check_request——AUTH 分类也会落到 AUTH_BOOTSTRAP
-        # 判定（探测器没有接口清单 → 无登记入口 → 拒绝），与 Runner 一致。
-        # 范围/环境/身份/明确只读的判定全部由 guard 内部完成，探测器只提供
-        # "绑定目标"与"本次请求的 POC 声明"。
+        # 判定。授权只来自登记（guardschedule3.md）：探测器没有接口清单，
+        # 但**登记表**（config policy.auth_endpoints / 用户确认）按绑定目标
+        # 匹配后同样算已登记入口——否则 Runner 闸门放行、发送层再拦一次，
+        # 会出现"同一请求两个结论"的分裂。范围/环境/身份/明确只读的判定
+        # 全部由 guard 内部完成，探测器只提供绑定目标与 POC 声明。
+        from policy import auth_registry
+
         ctx = GuardContext(
             target_id=bound,
             bound_target=bound,
             environment=guard.environment_for(url_n),
             identity_bound=bool(bound),
             identity=f"detector|{bound or '-'}",
+            session_id=f"detector|{bound or '-'}",
+            auth_entries=auth_registry.entries_for(self.cfg, bound),
+            credentials_present=False,
         )
         d = guard.check_request(
             url_n, method=method_u, body=body,

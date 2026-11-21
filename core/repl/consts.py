@@ -22,6 +22,8 @@ COMMANDS = [
     "/read", "/files", "/plan", "/approve", "/work", "/reject",
     # 分级权限管理
     "/guard",
+    # 认证入口登记表（策略配置驱动授权）
+    "/auth",
 ]
 
 BANNER = """
@@ -72,6 +74,15 @@ Ctrl+C：输入框里有文字时清空文字（不退出），空输入时退�
   /guard deny <id>      拒绝该请求
   /guard revoke <id>    撤销已签发未消费的票据
   /guard readonly on|off   运行期只读开关（退出只读**不突破权限矩阵**）
+
+认证入口登记表（授权只来自登记——路径关键词不直接授权）：
+  /auth list        当前目标已登记的认证入口（配置段 + 用户登记 + 接口清单）
+  /auth register <url> [kind]   登记一条认证入口（kind: login|refresh|logout|
+                    captcha，默认 login；login/refresh/logout 固定 POST，
+                    captcha 固定 GET），持久化到 data/policy/auth_endpoints.yaml
+  /auth remove <url> [kind]     从用户登记里注销一条（配置段请改 config.yaml）
+  /auth candidates <url>        只识别不授权：看这个 URL 的路径像哪类认证端点
+  /auth raw         查看用户登记文件的原始内容
 
 本地文件与计划（读文件 → 出计划 → 确认 → 执行）：
   /read <路径>      授权并读取一个本地文件（路径必须由你给出，不做全盘扫描）

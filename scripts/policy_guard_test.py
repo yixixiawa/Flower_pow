@@ -1286,10 +1286,12 @@ def test_round6() -> None:
         ok(v is not None and "SQL 注入验证" in v and "已拦截" in v,
            "sqli_probe 工具 → L3 一律拒绝（验收：sqli_probe L3 拒绝）")
         # login：AUTH 分类没有矩阵授权行 → 走 AUTH_BOOTSTRAP 受限通道。
-        # 三条断言比"一律 UNKNOWN"更严：
+        # 三条断言（guardschedule3.md 口径：授权只来自登记，路径关键词
+        # 不直接授权——第 11 轮的"末段含 login 即放行"已删除）：
         #   ① 打到非认证路径照样拒（通道有入口校验，不是"login 工具全放行"）；
-        #   ② 合规上下文下的标准端点放行（登录是产品能力，不是后门）；
-        #   ③ 环境未知仍拒（UNKNOWN 永久 DENY 没有被放松）。
+        #   ② 未登记的登录路径 → 拒绝且带候选提示（不授权）；
+        #   ③ 登记表里登记该端点后 → 放行（策略配置驱动，用户确认的事实）；
+        #   ④ 环境未知仍拒（UNKNOWN 永久 DENY 没有被放松）。
         v = asyncio.run(runner._policy_gate(
             "login", {"url": "http://127.0.0.1:8080/api/users/export",
                       "username": "u", "password": "p"}, s,
@@ -1300,8 +1302,18 @@ def test_round6() -> None:
             "login", {"url": "http://127.0.0.1:8080/api/login",
                       "username": "u", "password": "p"}, s,
         ))
+        ok(v is not None and "已拦截" in v and "未登记" in v and "候选识别" in v,
+           "login 工具 → 未登记登录路径 → 拒绝 + 候选提示（不直接授权）")
+        cfg.policy.auth_endpoints = [
+            {"target": "127.0.0.1", "kind": "login", "url": "/api/login", "method": "POST"},
+        ]
+        v = asyncio.run(runner._policy_gate(
+            "login", {"url": "http://127.0.0.1:8080/api/login",
+                      "username": "u", "password": "p"}, s,
+        ))
         ok(v is None,
-           "login 工具 → 标准登录端点 + 隔离测试环境 → AUTH_BOOTSTRAP 放行")
+           "login 工具 → 登记表登记该端点 + 隔离测试环境 → AUTH_BOOTSTRAP 放行")
+        cfg.policy.auth_endpoints = []
         v = asyncio.run(runner_u._policy_gate(
             "login", {"url": "http://127.0.0.1:8080/api/login",
                       "username": "u", "password": "p"}, s,

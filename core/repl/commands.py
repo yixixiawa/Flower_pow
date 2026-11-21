@@ -394,6 +394,83 @@ class _CommandMixin(_Base):
             last = s.turns[-1]
             print(f"上一轮：{last.phase.label}（+{last.new_assets} 资产、+{last.new_findings} 发现）")
 
+    def _auth(self, args: str = "") -> None:
+        """/auth：认证入口登记表（授权只来自登记，guardschedule3.md）。"""
+        import shlex
+
+        from policy import auth_registry
+
+        parts = shlex.split(args or "")
+        sub = (parts[0].lower() if parts else "list")
+        target = self.session.target or ""
+
+        if sub in ("list", ""):
+            if not target:
+                print("（未设定目标——先 /target <URL>，登记按目标主机匹配）")
+                return
+            eps = auth_registry.entries_for(self.cfg, target)
+            if not eps:
+                print(f"（{target} 没有已登记的认证入口）")
+                print("  登记：/auth register <url> [kind]  或写 config.yaml policy.auth_endpoints")
+                return
+            print(f"\n{target} 已登记 {len(eps)} 个认证入口：")
+            for e in eps:
+                fields = f" fields={sorted(e.fields)}" if e.fields else ""
+                print(f"  {e.kind:8} {e.method:6} {e.url}{fields}")
+            return
+
+        if sub == "raw":
+            raws = auth_registry.list_raw(self.cfg)
+            if not raws:
+                print("（用户登记文件为空或不存在）")
+                return
+            print(f"\n用户登记（{auth_registry.registry_path(self.cfg)}）{len(raws)} 条：")
+            for e in raws:
+                print(f"  {e}")
+            return
+
+        if sub == "candidates":
+            if len(parts) < 2:
+                print("用法：/auth candidates <url>")
+                return
+            from policy.auth_bootstrap import implicit_endpoint
+
+            imp = implicit_endpoint(parts[1])
+            if imp is None:
+                print("（候选识别：这个 URL 的路径不像任何认证端点）")
+            else:
+                print(
+                    f"候选识别：{imp.kind} {imp.method} {imp.url}\n"
+                    "  注意：这只是关键词识别结果，**不构成授权**。\n"
+                    "  登记：/auth register <url> [kind]"
+                )
+            return
+
+        if sub == "register":
+            if len(parts) < 2 or not target:
+                print("用法：/auth register <url> [kind]（kind 默认 login）")
+                return
+            url = parts[1]
+            kind = (parts[2].lower() if len(parts) > 2 else "login")
+            try:
+                print(auth_registry.register(self.cfg, target=target, url=url, kind=kind))
+            except auth_registry.AuthRegistryError as exc:
+                print(f"[!] 登记被拒：{exc}")
+            return
+
+        if sub == "remove":
+            if len(parts) < 2:
+                print("用法：/auth remove <url> [kind]")
+                return
+            try:
+                print(auth_registry.unregister(self.cfg, url=parts[1],
+                                               kind=(parts[2].lower() if len(parts) > 2 else "")))
+            except auth_registry.AuthRegistryError as exc:
+                print(f"[!] 注销失败：{exc}")
+            return
+
+        print("用法：/auth list | raw | register <url> [kind] | remove <url> [kind] | candidates <url>")
+
     def _assets(self, kind: str) -> None:
         from collections import Counter
 

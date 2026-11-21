@@ -112,8 +112,8 @@ The matrix has no AUTH row (submitting credentials is not a matrix-authorized ca
 | 1. session | `target_id` bound (no credential submission without `set_target`) |
 | 2. environment | explicit; `unknown` is always refused (never guessed) |
 | 3. context | test environments only (`isolated_test` / `dedicated_test`); production never submits credentials |
-| 4. endpoint | must resolve to an auth endpoint: registered from the API inventory, **or self-evident from the path** (last segment containing `login` / `signin` / `refresh` / `logout`, e.g. `/admin-api/system/auth/login`, `/api/user/loginByPassword`, `/oauth/token`); read-only suffixes (history / logs / list / records) do not count |
-| 5. method | the interface definition when registered; `POST` for path-inferred endpoints (login / refresh / logout) |
+| 4. endpoint | must hit a **registered** auth endpoint — registration comes only from the API inventory (`recon_openapi`) or the registry (`config.yaml` `policy.auth_endpoints` / REPL `/auth register`). Path keywords (a segment containing `login`) produce a **candidate hint only — never an authorization** (guardschedule3.md) |
+| 5. method | the registered method: interface definition for inventory entries; `POST` for login / refresh / logout and `GET` for captcha in the registry (semantic methods are not configurable) |
 | 6. parameters | keys ⊆ interface-declared fields ∪ auth field vocabulary, and must include credential fields |
 | 7. rate | sliding window + minimum interval (default 5 / 60s) |
 | 8. secrets | never in tool output or audit plaintext (redacted) |
@@ -122,10 +122,11 @@ The matrix has no AUTH row (submitting credentials is not a matrix-authorized ca
 
 Two-level decision: **tool-level** (`check_intent`: session / environment / context / endpoint exists / rate) plus **request-level** (`check`: exact endpoint + method + parameter structure). Every request `Authenticator` makes — including the captcha GET — passes a `precheck`, so the planner path and the agent `login` tool reach the same conclusion.
 
-To make a login succeed: bind the target to `isolated_test` in `policy.environments`, then either
+To make a login succeed: bind the target to `isolated_test` in `policy.environments`, then get the endpoint **registered** — authorization is configuration-driven, not keyword-driven:
 
-* **known standard endpoint** — call `http_request(url="https://host/admin-api/system/auth/login", method="POST", body={"username": "...", "password": "..."})` directly; **no** prior `recon_openapi` needed, because a path whose last segment contains `login` is recognized as a login endpoint;
-* **unknown endpoint** — run `recon_openapi`, then call `login` and let the inventory pick the endpoint (captcha endpoints only work this way).
+* **API inventory** — run `recon_openapi`; auth endpoints found there are registered automatically;
+* **registry** — add an entry to `config.yaml` `policy.auth_endpoints` (`{target, kind, url, method}`) or confirm it interactively with REPL `/auth register <url> [kind]` (persisted to `data/policy/auth_endpoints.yaml`);
+* an unregistered endpoint whose path contains `login` is **denied** with a candidate hint naming how to register it — the hint itself never grants access.
 
 Missing any condition yields a rejection that names the specific condition.
 
@@ -406,8 +407,8 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 | ① 会话 | 已绑定 `target_id`（未 set_target 不允许提交凭证） |
 | ② 环境 | 必须明确，`unknown` 一律拒绝（不猜） |
 | ③ 背景 | 仅测试环境（`isolated_test` / `dedicated_test`）；production 不做凭证提交 |
-| ④ 入口 | URL 必须命中认证入口：接口清单登记，**或路径自证**（末段含 `login` / `signin` / `refresh` / `logout` 即认，如 `/admin-api/system/auth/login`、`/api/user/loginByPassword`、`/oauth/token`）；只读后缀（history / logs / list / records）不算 |
-| ⑤ 方法 | 清单登记时取接口定义；路径自证时固定 POST（login / refresh / logout） |
+| ④ 入口 | URL 必须命中**已登记**的认证入口——登记只来自两个地方：接口清单（`recon_openapi`）与登记表（`config.yaml` 的 `policy.auth_endpoints` / REPL `/auth register`）。路径关键词（末段含 `login`）只产生**候选提示，不构成授权**（guardschedule3.md） |
+| ⑤ 方法 | 以登记为准：清单条目取接口定义；登记表条目 login / refresh / logout 固定 POST、captcha 固定 GET（语义方法不开放配置） |
 | ⑥ 参数 | 字段 ⊆ 接口声明 ∪ 认证字段词表，且必须带凭证字段；越界字段直接拒 |
 | ⑦ 频率 | 滑动窗口 + 最小间隔（默认 5 次 / 60s） |
 | ⑧ 凭证 | 不进工具输出、不进审计明文（统一脱敏） |
@@ -416,10 +417,11 @@ Agent 只能**提交**漏洞，能不能进报告由闸门定。每次 `record_f
 
 两级判定：**工具级**（`check_intent`：会话/环境/背景/入口存在/频率）+ **请求级**（`check`：URL 匹配 + 方法 + 参数结构）。`Authenticator` 发出的每一个请求（含验证码 GET）都要过 `precheck`，剧本路径（Planner）与 Agent 路径（`login` 工具）同一结论。
 
-想让登录通过：先在 `policy.environments` 里把目标绑到 `isolated_test`，然后两条路——
+想让登录通过：先在 `policy.environments` 里把目标绑到 `isolated_test`，然后让端点**进入登记**——授权是配置驱动的，不是关键词驱动的：
 
-* **已知标准端点**：直接 `http_request(url="https://host/admin-api/system/auth/login", method="POST", body={"username": "...", "password": "..."})`。**不需要**先跑 `recon_openapi`——路径末段含 `login` 就会被认成登录入口。
-* **不知道端点**：`recon_openapi` 拿接口清单后调 `login`，由清单挑选具体入口（验证码入口只能走这条）。
+* **接口清单**：`recon_openapi` 拿到清单，清单里的认证端点自动算已登记；
+* **登记表**：在 `config.yaml` 的 `policy.auth_endpoints` 里加一条 `{target, kind, url, method}`，或 REPL 里 `/auth register <url> [kind]` 逐条确认（持久化到 `data/policy/auth_endpoints.yaml`）；
+* 未登记的端点即使路径含 `login` 也**拒绝**，拒绝文本给出候选提示与登记方法——提示本身不产生任何放行。
 
 缺任何一条条件，拒绝文本会说清是哪一条。
 

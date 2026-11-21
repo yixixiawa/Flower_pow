@@ -232,6 +232,9 @@ class _LoopMixin(_Base):
             parts = raw.split()
             self._assets(parts[1] if len(parts) > 1 else "")
             return True
+        if low.startswith("/auth"):
+            self._auth(raw.split(maxsplit=1)[1] if " " in raw.strip() else "")
+            return True
         if low in ("/findings", "/f"):
             self._findings()
             return True

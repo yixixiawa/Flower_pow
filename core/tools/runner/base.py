@@ -122,6 +122,13 @@ class _ToolRunnerBase:
 
     def __init__(self, cfg, external_probes: list[Probe] | None = None, root: str | Path = ".") -> None:
         self.cfg = cfg
+        try:
+            # 登记表候选提示的默认配置来源（candidate_hint 的 cfg 缺省）
+            from policy import auth_registry
+
+            auth_registry.configure(cfg)
+        except Exception:            # noqa: BLE001 —— 注入失败不影响其它能力
+            pass
         self.root = Path(root).resolve()
         self.probes: dict[str, Probe] = {p.spec.key: p for p in (external_probes or [])}
         self.poc_map, self.poc_errors = self._load_pocs()
@@ -661,9 +668,8 @@ class _ToolRunnerBase:
             identity=ident,
             bound_target=str(getattr(session, "target", "") or ""),
             # AUTH_BOOTSTRAP：会话隔离键 + 已登记认证入口 + 是否已有可刷新凭证。
-            # 入口有两级来源：接口清单（清单登记，方法以清单为准）与 URL 路径
-            # 末段自证（login/refresh/logout 的标准约定，方法按语义 POST ——
-            # 无需先跑 recon_openapi 就能登录）。captcha 只能由清单登记。
+            # 入口来源只有登记：接口清单（方法以清单为准）与登记表
+            # （config / 用户确认，host-glob 匹配目标）。路径关键词不授权。
             session_id=str(getattr(session, "session_id", "") or ""),
             auth_entries=self._auth_entries(session),
             credentials_present=bool(
@@ -671,15 +677,24 @@ class _ToolRunnerBase:
             ),
         )
 
-    @staticmethod
-    def _auth_entries(session):
-        """已登记认证入口（接口清单 → AuthEndpoint 元组）。"""
+    def _auth_entries(self, session):
+        """已登记认证入口 = 接口清单推导 + 登记表（config / 用户确认）。
+
+        授权只来自登记（guardschedule3.md）。登记表按 host-glob 匹配
+        当前绑定目标，与接口清单合并去重后作为 AUTH_BOOTSTRAP 的入口
+        判定依据。
+        """
+        from policy import auth_registry
         from policy.auth_bootstrap import entries_for
 
-        return entries_for(
-            str(getattr(session, "target", "") or ""),
-            getattr(getattr(session, "result", None), "assets", ()) or (),
-        )
+        target = str(getattr(session, "target", "") or "")
+        assets = getattr(getattr(session, "result", None), "assets", ()) or ()
+        merged: dict[str, Any] = {}
+        for ep in entries_for(target, assets):
+            merged[f"{ep.method} {ep.url}".lower()] = ep
+        for ep in auth_registry.entries_for(self.cfg, target):
+            merged.setdefault(f"{ep.method} {ep.url}".lower(), ep)
+        return tuple(merged.values())
 
     def _policy_scope(self, session) -> tuple[str, str]:
         r = getattr(session, "result", None)
@@ -1380,8 +1395,8 @@ class _ToolRunnerBase:
             lines.append(
                 "  认证初始化（AUTH_BOOTSTRAP）只会放行**单次**登录/刷新/登出请求，"
                 "需要同时满足：会话已绑定目标、环境明确且为测试背景、"
-                "URL 命中认证入口（直连 /login、/auth/login、/oauth/token 这类"
-                "标准端点无需清单；其它端点先 recon_openapi 登记）、"
+                "URL 命中**已登记**认证入口（接口清单 or 登记表：REPL /auth register、"
+                "config.yaml policy.auth_endpoints；路径关键词不直接授权）、"
                 "方法为 POST、参数符合认证接口结构、未超频率。"
                 "登录成功**不会**放行后续请求。"
             )
@@ -1458,10 +1473,9 @@ class _ToolRunnerBase:
                 )
             elif session.target:
                 lines.append(
-                    "认证入口：清单未登记。可直接对 /login、/auth/login、"
-                    "/admin-api/system/auth/login、/oauth/token 这类标准端点提交凭证"
-                    "（AUTH_BOOTSTRAP 按路径末段识别，方法须为 POST）；"
-                    "验证码入口仍需 recon_openapi 登记"
+                    "认证入口：未登记。授权只来自登记——REPL /auth register <URL>、"
+                    "config.yaml policy.auth_endpoints，或 recon_openapi 从接口清单"
+                    "推导（路径关键词不直接授权）"
                 )
         api = [a for a in r.assets if a.kind == "api"]
         if api:

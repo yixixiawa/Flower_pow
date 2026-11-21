@@ -18,10 +18,10 @@
 14. Detector、MCP、Scheduler、后台任务均使用同一策略入口
 
 外加两条边界：登录频率限制、敏感凭证不落审计明文，以及一条产品口径：
-**6c. 清单未登记时按路径识别认证入口**——末段含 login / signin / refresh /
-logout 即认（`loginByPassword`、`doLogin` 都算），只读后缀
-（history / logs / list / records）不算；放宽的只是"入口识别"，方法、
-参数结构、凭证字段、环境、频率一条未松。
+**6c. 授权只来自登记（guardschedule3.md）**——未登记的认证路径一律拒绝，
+路径关键词只产生候选提示（不构成授权）；登记（config.yaml
+``policy.auth_endpoints`` 或 REPL ``/auth register``）后放行。
+方法、参数结构、凭证字段、环境、频率一条未松。
 
 所有"被拒绝"的用例都同时看三件事：返回值、**真实网络**（MockNet 计数）、
 **审计**（读 JSONL 文件）。只用 mock 目标，不向任何真实地址发请求。
@@ -298,11 +298,11 @@ def scenario_auth_admin_blocked(tmp: Path) -> None:
     check(d5.allowed, f"已登记登出入口应放行：{d5.reason[:120]}")
 
 
-# ── 6c. 路径自证：没有接口清单也能登录 ────────────────────────────
+# ── 6c. 授权只来自登记：路径关键词只做候选识别（guardschedule3.md）──
 
 
 def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
-    section("6c. 清单未登记时按路径末段识别认证入口（/auth/login 等标准约定）")
+    section("6c. 未登记的认证路径一律拒绝 + 候选提示；登记后放行（配置驱动授权）")
     cfg = make_cfg(tmp / "s6c", binding=net.a.binding)   # 端到端用例要真连 MockNet
     g = guard_for(cfg)
     base = "http://127.0.0.1:8080"                        # 纯判定用例用固定 URL
@@ -310,11 +310,16 @@ def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
     def judge(url: str, method: str = "POST", body: str = "",
               env: str = "isolated_test", tid: str = "t",
               bound: str = base, cred: bool = False):
+        from policy import auth_registry
+
         return g.check_auth(
             url, method=method, body=body,
             ctx=GuardContext(
                 target_id=tid, bound_target=bound, environment=env,
-                auth_entries=(), session_id="s6c",     # 关键：清单为空
+                # 真实链路：清单 + 登记表合并（这里清单为空，登记表随
+                # cfg.policy.auth_endpoints 变化）
+                auth_entries=auth_registry.entries_for(cfg, bound),
+                session_id="s6c",
                 credentials_present=cred,
             ),
             count_rate=False,
@@ -323,52 +328,76 @@ def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
     yudao = f"{base}/admin-api/system/auth/login"
     creds = '{"username": "1550", "password": "123456"}'
 
-    # 1) 用户真实场景：芋道 admin-api 登录（清单为空）
+    # 1) 用户真实场景：芋道 admin-api 登录——未登记 → 拒绝 + 候选提示。
+    #    guardschedule3.md：路径关键词不直接授权（第 11 轮的"末段含
+    #    login 即放行"已删除）。
     d = judge(yudao, body=creds)
-    check(d.allowed, f"标准登录端点无需清单即可单次放行：{d.reason[:160]}")
-    check(d.level == "AUTH_BOOTSTRAP", f"等级仍是 AUTH_BOOTSTRAP：{d.level}")
-    check(any("路径自证" in s for s in d.signals), f"信号应标明入口来源：{d.signals}")
+    check(not d.allowed, f"未登记的登录路径必须拒绝：{d.reason[:140]}")
+    check("ENDPOINT_UNREGISTERED" in " ".join(d.signals),
+          f"拒绝判定码应为 ENDPOINT_UNREGISTERED：{d.signals}")
+    check("候选识别" in d.reason and "不构成授权" in d.reason,
+          f"拒绝理由应含候选提示且声明不构成授权：{d.reason[:200]}")
+    check("/auth register" in d.reason and "auth_endpoints" in d.reason,
+          f"候选提示应给出两条登记路径：{d.reason[-160:]}")
 
-    # 2) 方法不符：GET 打登录端点
+    # 2) 登记后（策略配置驱动，用户确认的事实）→ 放行
+    cfg.policy.auth_endpoints = [
+        {"target": "127.0.0.1", "kind": "login",
+         "url": "/admin-api/system/auth/login", "method": "POST"},
+    ]
+    d = judge(yudao, body=creds)
+    check(d.allowed, f"登记后同一路径应放行：{d.reason[:160]}")
+    check(d.level == "AUTH_BOOTSTRAP", f"等级仍是 AUTH_BOOTSTRAP：{d.level}")
+    check("已登记" in "；".join(d.signals), f"信号应标明入口已登记：{d.signals}")
+
+    # 3) 方法不符：GET 打已登记的登录端点（登记方法 POST）
     d = judge(yudao, method="GET")
     check(not d.allowed and "方法" in d.reason, f"GET 登录必须拒绝：{d.reason[:120]}")
 
-    # 3) 普通接口（末段 export）不是认证入口
+    # 4) 普通接口（末段 export）不是认证入口：拒绝且**没有**候选提示
     d = judge(f"{base}/api/users/export")
     check(not d.allowed and "未登记" in d.reason, f"非认证路径必须拒绝：{d.reason[:120]}")
+    check("候选识别" not in d.reason, "export 路径不应触发候选提示")
 
-    # 4) 名字里带 login 但不是登录端点（末段 login-history）
+    # 5) 名字里带 login 但不是登录端点（末段 login-history）：拒绝且无候选
     d = judge(f"{base}/api/auth/login-history", body=creds)
     check(not d.allowed, f"login-history 不得被当登录入口：{d.reason[:120]}")
+    check("候选识别" not in d.reason, "只读后缀不应触发候选提示")
 
-    # 5) 参数不是认证结构（分页字段）
+    # 6) 参数不是认证结构（分页字段）——已登记端点上照样拒
     d = judge(yudao, body='{"pageNum": 1, "pageSize": 10}')
     check(not d.allowed and "结构" in d.reason, f"非认证参数必须拒绝：{d.reason[:120]}")
 
-    # 6) 有认证字段但没有凭证字段
+    # 7) 有认证字段但没有凭证字段
     d = judge(yudao, body='{"remember": true}')
     check(not d.allowed and "凭证" in d.reason, f"缺凭证字段必须拒绝：{d.reason[:120]}")
 
-    # 7) OAuth2 令牌端点（末段 token，父段 oauth）= 刷新
+    # 8) 登记一个 OAuth2 令牌端点（kind=refresh）→ 需要凭证才能用
+    cfg.policy.auth_endpoints.append(
+        {"target": "127.0.0.1", "kind": "refresh", "url": "/oauth/token", "method": "POST"}
+    )
     d = judge(f"{base}/oauth/token",
               body='{"grant_type": "refresh_token", "refresh_token": "r"}', cred=True)
     check(d.allowed and any("refresh" in s for s in d.signals),
-          f"oauth/token 应识别为刷新入口：{d.reason[:140]}")
-
-    # 8) 没有可刷新凭证时，刷新入口不成立
+          f"已登记的 oauth/token 应放行：{d.reason[:140]}")
     d = judge(f"{base}/oauth/token",
               body='{"grant_type": "refresh_token", "refresh_token": "r"}')
     check(not d.allowed and "凭证" in d.reason, f"无凭证刷新必须拒绝：{d.reason[:120]}")
 
-    # 9) 验证码不做路径自证（方法语义不唯一，必须清单登记）
+    # 9) 验证码入口：没有登记的 /captcha/get 仍拒（方法语义固定 GET，
+    #    但必须先登记——语义方法不开放给路径识别）
     d = judge(f"{base}/api/captcha/get")
-    check(not d.allowed, f"/captcha/get 不得路径自证：{d.reason[:120]}")
+    check(not d.allowed, f"未登记的 /captcha/get 必须拒绝：{d.reason[:120]}")
 
-    # 10) 登出（末段 logout）
+    # 10) 登出：登记后放行（仍只作用于这一次请求）
+    cfg.policy.auth_endpoints.append(
+        {"target": "127.0.0.1", "kind": "logout",
+         "url": "/admin-api/system/auth/logout", "method": "POST"}
+    )
     d = judge(f"{base}/admin-api/system/auth/logout")
-    check(d.allowed, f"标准登出端点应放行：{d.reason[:140]}")
+    check(d.allowed, f"已登记登出端点应放行：{d.reason[:140]}")
 
-    # 10b) 放宽口径：末段**包含** login 即认（不要求恰好等于 login）
+    # 10b) 候选识别口径本身不变（识别得准提示才有用），但**不授权**：
     for path in (
         "/api/v1/user/loginByPassword",
         "/api/user/doLogin",
@@ -377,14 +406,15 @@ def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
         "/sso/adminLogin",
     ):
         d = judge(f"{base}{path}", body=creds)
-        check(d.allowed, f"{path} 应识别为登录入口：{d.reason[:120]}")
+        check(not d.allowed, f"{path} 未登记必须拒绝：{d.reason[:100]}")
+        check("候选识别" in d.reason, f"{path} 应触发候选提示（只识别不授权）")
 
-    # 10c) 只读后缀（查询/列表）仍不认，避免"名字带 login 的查询接口"被当登录
+    # 10c) 只读后缀（查询/列表）连候选都不算
     for path in ("/api/auth/login-history", "/api/loginLogs", "/api/login/records"):
         d = judge(f"{base}{path}", body=creds)
         check(not d.allowed, f"{path} 是查询接口，不得当登录入口：{d.reason[:100]}")
 
-    # 11-13) 路径自证不放宽前三条件
+    # 11-13) 登记不放宽前三条件
     d = judge(yudao, body=creds, tid="", bound="")
     check(not d.allowed and "未绑定目标" in d.reason, f"未绑定目标仍拒绝：{d.reason[:120]}")
     d = judge(yudao, body=creds, env="unknown")
@@ -393,19 +423,30 @@ def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
     check(not d.allowed and ("测试背景" in d.reason or "production" in d.reason),
           f"生产环境仍拒绝：{d.reason[:120]}")
 
-    # 14) 工具级意图：清单为空也不再硬性要求 recon_openapi（captcha 除外）
+    # 14) 工具级意图：入口存在性是硬前置（登记是授权的唯一来源）
     d = g.check_auth_intent("login", ctx=GuardContext(
         target_id="t", bound_target=base, environment="isolated_test",
         auth_entries=(), session_id="s6c",
     ))
-    check(d.allowed, f"无清单时 login 意图应放行（端点由请求级自证）：{d.reason[:140]}")
+    check(not d.allowed and "ENDPOINT_UNREGISTERED" in " ".join(d.signals),
+          f"无登记时 login 意图必须拒绝：{d.reason[:140]}")
+    d = g.check_auth_intent("login", ctx=GuardContext(
+        target_id="t", bound_target=base, environment="isolated_test",
+        auth_entries=ab.entries_for(base, [Asset(kind="api", value="/api/auth/login",
+                                                 meta={"method": "POST", "path": "/api/auth/login"})]),
+        session_id="s6c",
+    ))
+    check(d.allowed, f"清单登记后 login 意图放行：{d.reason[:140]}")
     d = g.check_auth_intent("captcha", ctx=GuardContext(
         target_id="t", bound_target=base, environment="isolated_test",
         auth_entries=(), session_id="s6c",
     ))
-    check(not d.allowed, f"captcha 意图无清单仍拒绝：{d.reason[:120]}")
+    check(not d.allowed, f"captcha 意图无登记仍拒绝：{d.reason[:120]}")
 
-    # 15) 端到端：无清单 + http_request 直连 /login → 真正发出请求、不被拦截
+    # 15) 端到端：登记表登记 mock 的 /login → http_request 直连真实发出
+    cfg.policy.auth_endpoints = [
+        {"target": "127.0.0.1", "kind": "login", "url": "/login", "method": "POST"},
+    ]
     runner = ToolRunner(cfg, root=tmp)
     s = Session(target=net.target)
     s.result.target = s.target
@@ -419,9 +460,47 @@ def scenario_implicit_endpoint(tmp: Path, net: MockNet) -> None:
         s,
     ))
     hits = [r for r in net.delta(mark) if r.path == "/login"]
-    check(not out.startswith("【已拦截】"), f"无清单直连 /login 不应被拦截：{out[:160]}")
+    check(not out.startswith("【已拦截】"), f"登记后直连 /login 不应被拦截：{out[:160]}")
     check(len(hits) == 1, f"登录请求应真实发出一次（实际 {len(hits)}）")
     check(not s.credentials.get("token"), "http_request 不会产生任何\"已登录\"状态")
+
+    # 16) 登记表单元：坏条目拒登、目标匹配、用户登记文件增查删
+    from policy import auth_registry as ar
+
+    try:
+        ar.validate_entry({"target": "h", "kind": "login", "url": "/x", "method": "GET"},
+                          source="config")
+        check(False, "login 固定 POST：GET 登记必须被拒")
+    except ar.AuthRegistryError:
+        check(True, "login 固定 POST：GET 登记必须被拒")
+    try:
+        ar.validate_entry({"target": "h", "kind": "login", "url": "../x"}, source="config")
+        check(False, "路径穿越条目必须被拒")
+    except ar.AuthRegistryError:
+        check(True, "路径穿越条目必须被拒")
+    try:
+        ar.validate_entry({"target": "h", "kind": "login", "url": "/x", "unknown": 1},
+                          source="config")
+        check(False, "未知字段必须被拒（错别字不静默吞）")
+    except ar.AuthRegistryError:
+        check(True, "未知字段必须被拒（错别字不静默吞）")
+    check(ar._target_matches("127.0.0.*", "http://127.0.0.1:8080"),
+          "host-glob 目标匹配（同环境绑定语义）")
+    check(not ar._target_matches("other.com", "http://127.0.0.1:8080"),
+          "不同主机不匹配")
+    # 用户登记文件：登记 → 查询命中 → 重复幂等 → 注销 → 查询消失
+    r = ar.register(cfg, target="127.0.0.1", url="/api/one/login", kind="login")
+    check("已登记" in r, f"用户登记成功：{r[:100]}")
+    eps = ar.entries_for(cfg, "http://127.0.0.1:8080")
+    check(any(e.url.endswith("/api/one/login") for e in eps),
+          f"用户登记文件条目应出现在登记表：{[e.url for e in eps]}")
+    r = ar.register(cfg, target="127.0.0.1", url="/api/one/login", kind="login")
+    check("无需重复登记" in r, f"重复登记应幂等：{r[:80]}")
+    r = ar.unregister(cfg, url="/api/one/login")
+    check("已注销" in r, f"注销成功：{r[:80]}")
+    eps = ar.entries_for(cfg, "http://127.0.0.1:8080")
+    check(not any(e.url.endswith("/api/one/login") for e in eps),
+          "注销后条目应消失")
 
 
 def scenario_no_secrets_in_audit(tmp: Path, net: MockNet) -> None:

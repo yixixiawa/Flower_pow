@@ -24,18 +24,18 @@ class VerifyMixin:
         api = [a for a in session.result.assets if a.kind == "api"]
         if not api:
             base = target.rstrip("/")
-            # 没有接口清单**不等于**不能登录：认证语义写在路径末段时
-            # （/login、/auth/login、/admin-api/system/auth/login、/oauth/token）
-            # AUTH_BOOTSTRAP 直接识别，不需要先跑 recon_openapi。
-            # 但 login 工具本身要靠清单挑端点，所以这里给出可直接执行的两条路。
+            # 授权只来自登记（guardschedule3.md）：路径关键词不直接授权。
+            # 没有清单时给出两条**登记路径**，登记后 AUTH_BOOTSTRAP 才放行。
             return (
-                "还没有接口清单，login 工具无法自动挑选端点。两条路都不需要先 recon_openapi：\n"
-                f"1) 已知标准端点就直接发请求：http_request(url=\"{base}/login\", method=\"POST\", "
-                "body={\"username\":\"...\",\"password\":\"...\"})——AUTH_BOOTSTRAP 按 URL 路径末段"
-                "识别 login/refresh/logout（方法须为 POST，参数须是认证字段）；\n"
-                "2) 不知道端点就先 recon_openapi / recon_js 拿清单，再调用 login 自动挑选。\n"
-                "常见约定：/login、/api/login、/auth/login、/admin-api/system/auth/login、"
-                "/oauth/token、/api/v1/user/login。"
+                "还没有接口清单，且登记表里没有该目标的登录入口。授权只来自登记，两条登记路径：\n"
+                "1) REPL 里执行 /auth register <登录URL>（用户逐条确认，持久化到 "
+                "data/policy/auth_endpoints.yaml）；\n"
+                "2) 或在 config.yaml 的 policy.auth_endpoints 里加一条 "
+                "{target: <主机>, kind: login, url: <路径>}。\n"
+                f"登记后即可 http_request(url=\"{base}/<已登记路径>\", method=\"POST\", "
+                "body={\"username\":\"...\",\"password\":\"...\"})，或重新调用 login。\n"
+                "3) 不知道端点就先 recon_openapi / recon_js 拿清单——清单里的认证端点"
+                "自动算已登记。"
             )
 
         # 逐请求闸门：Authenticator 实际发出的每一个请求（验证码 GET、登录

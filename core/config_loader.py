@@ -205,6 +205,12 @@ class PolicyConfig(BaseModel):
     # 字段仅为兼容旧配置文件保留。审批只存在于运行期：逐请求、绑定具体
     # 对象 URL、参数变化即重新审批（runner 的 approver 通道）。
     approvals: dict[str, bool] = Field(default_factory=dict)
+    # 认证入口登记表（policy/auth_registry）：AUTH_BOOTSTRAP 的授权来源之一。
+    # 每条 {target, kind, url, method?, fields?, note?}——target 是 host-glob，
+    # kind ∈ login/refresh/logout/captcha，login/refresh/logout 固定 POST、
+    # captcha 固定 GET（语义方法不开放配置）。路径关键词不直接授权
+    # （guardschedule3.md），不在表里的认证端点一律 ENDPOINT_UNREGISTERED。
+    auth_endpoints: list[dict] = Field(default_factory=list)
     # 审计日志开关（policy/audit_logger）
     audit: bool = Field(default=True)
 
